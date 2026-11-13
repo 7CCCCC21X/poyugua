@@ -175,7 +175,8 @@ class FakeClob:
         o.size_matched = str(matched)
         if matched >= D(o.original_size):
             o.status = "MATCHED"
-        self.trades.append(N(market=o.condition_id, status="CONFIRMED", maker_orders=[N(order_id=oid, matched_amount=str(shares))]))
+        self.trades.append(N(market=o.condition_id, status="CONFIRMED", maker_orders=[N(order_id=oid, matched_amount=str(shares))],
+                             matched_at=dt.datetime.fromtimestamp(self.clock(), dt.timezone.utc)))
         self.balance_usd -= shares * D(o.price)
 
     def live(self) -> list[N]:
@@ -564,6 +565,8 @@ class RedeemTest(unittest.IsolatedAsyncioTestCase):
             await tick(e, 30)
         (q,) = quotes(e)
         self.assertEqual(q["redeem"], "manual")
+        (at, shares), = q["orders"]["down"]["fills_at"]           # the fill's own time, from the account's trades
+        self.assertEqual((round(start - at), shares), (1800 - 1, "10"))
         self.assertIn("Relayer", q["redeem_error"])
         self.assertEqual(fake.redeemed, [])
         s2 = settings(POLY_RELAYER_API_KEY="k", POLY_RELAYER_API_KEY_ADDRESS="0x" + "22" * 20)  # the key added, restarted

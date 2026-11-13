@@ -320,16 +320,17 @@ select { font:inherit; padding:5px 8px; border-radius:8px; border:1px solid var(
 
     <div id="tab-journal" hidden>
       <div class="cards" id="jTotals"></div>
-      <div class="ops"><button class="secondary" id="csvDetail">导出成交明细 CSV</button><button class="secondary" id="csvDaily">导出每日汇总 CSV</button></div>
+      <div class="ops"><button class="secondary" id="csvDetail">导出成交明细 CSV</button><button class="secondary" id="csvDaily">导出每日汇总 CSV</button><button class="secondary" id="csvQuotes">导出全部报价 CSV</button><button class="secondary" id="csvCancel">导出撤单时间复盘 CSV</button></div>
+      <section><h2>开场前几秒撤单最好</h2><p id="cAdvice"></p><div class="scroll"><table id="cRows"></table></div>
+        <p class="muted small" id="cNote">把每一场按「如果提前 X 秒撤单」重算：X 秒之后才成交的单当作没成交。同一批场次比较，所以各行能直接比。只能算比当时撤得更早的情况。</p></section>
+      <section><h2>什么时候成交的（按成交时刻）</h2><div class="scroll"><table id="cTimes"></table></div>
+        <p class="muted small">买的那一边最后赢的比例低于保本线（=买价），这个时段的成交就是亏的：撤单时间应该提前到它之前。</p></section>
       <section><h2>按日期（北京时间，按开场日）</h2><div class="scroll"><table id="jDay"></table></div></section>
       <div class="grid2">
         <section><h2>按币种</h2><div class="scroll"><table id="jCoin"></table></div></section>
         <section><h2>按方向</h2><div class="scroll"><table id="jSide"></table></div><p class="muted small">成交了哪一边、那一边赢了多少：两边成交的那部分是锁定利润，只成交一边的是 49¢ 买五五开</p></section>
       </div>
-      <div class="grid2">
-        <section><h2>成交时距开场</h2><div class="scroll"><table id="jLead"></table></div><p class="muted small">越靠近开场的成交越可能来自知道方向的人：这一栏的盈亏偏负，就把撤单时间提前</p></section>
-        <section><h2>按开场时段（北京时间几点）</h2><div class="scroll"><table id="jHour"></table></div></section>
-      </div>
+      <section><h2>按开场时段（北京时间几点）</h2><div class="scroll"><table id="jHour"></table></div></section>
       <section><h2>成交明细（最近 200 场）</h2><div class="scroll"><table id="jDetail"></table></div><p class="muted small" id="jMore"></p></section>
     </div>
     <p class="muted small" id="stamp"></p>
@@ -557,7 +558,13 @@ async function loadJournal() {
   $("jCoin").innerHTML = head.replace("<th></th>", "<th>币种</th>") + d.by_coin.map((x) => row(x.coin, x)).join("");
   $("jHour").innerHTML = head.replace("<th></th>", "<th>开场</th>") + d.by_hour.map((x) => row(String(x.hour).padStart(2, "0") + ":00", x)).join("");
   $("jSide").innerHTML = "<tr><th>方向</th><th>成交份数</th><th>成本</th><th>赢回</th><th>盈亏</th></tr>" + d.by_side.map((x) => `<tr><td>${x.side}</td><td>${x.shares}</td><td>${money(x.cost)}</td><td>${money(x.won)}</td><td>${signed(x.pnl)}</td></tr>`).join("");
-  $("jLead").innerHTML = "<tr><th>成交时距开场</th><th>笔数</th><th>份数</th><th>成本</th><th>盈亏</th></tr>" + (d.by_lead.map((x) => `<tr><td>${esc(x.bucket)}</td><td>${x.fills}</td><td>${x.shares}</td><td>${money(x.cost)}</td><td>${signed(x.pnl)}</td></tr>`).join("") || '<tr><td colspan="5" class="muted">还没有成交</td></tr>');
+  const C = d.cancel || {rows: [], by_fill_time: []};
+  $("cAdvice").textContent = "结论：" + (C.advice || "—");
+  $("cRows").innerHTML = "<tr><th>开场前几秒撤</th><th>有成交的场次</th><th>双边</th><th>成交份数</th><th>成本</th><th>盈亏</th><th></th></tr>" + (C.rows.map((x) =>
+    `<tr><td>${x.cancel_s} 秒</td><td>${x.filled} / ${x.windows}</td><td>${x.both}</td><td>${x.shares}</td><td>${money(x.cost)}</td><td>${signed(x.pnl)}</td><td>${x.cancel_s === C.current ? "现在" : ""}${x.cancel_s === C.best ? " ★最好" : ""}</td></tr>`).join("") || '<tr><td colspan="7" class="muted">还没有结束的场次</td></tr>');
+  $("cNote").textContent = C.rows.length ? `把每一场按「如果开场前 X 秒撤单」重算（X 秒之后的成交当作没发生），同一批 ${C.windows - C.excluded} 场比较。比开场前 ${C.base} 秒更晚撤算不出来：那时单子已经撤了。${C.excluded ? `另有 ${C.excluded} 场当时撤得更早，没算。` : ""}${C.approx ? `${C.approx} 场的成交时刻是快照看到的时间（偏晚几秒）。` : ""}` : "";
+  $("cTimes").innerHTML = "<tr><th>成交时距开场</th><th>份数</th><th>成本</th><th>盈亏</th><th>那一边赢的比例</th><th>保本线</th></tr>" + (C.by_fill_time.map((x) =>
+    `<tr><td>${esc(x.bucket)}</td><td>${x.shares}</td><td>${money(x.cost)}</td><td>${signed(x.pnl)}</td><td class="${x.win_rate >= x.breakeven ? "good" : "bad"}">${(x.win_rate * 100).toFixed(0)}%</td><td>${(x.breakeven * 100).toFixed(0)}%</td></tr>`).join("") || '<tr><td colspan="6" class="muted">还没有成交</td></tr>');
   $("jDetail").innerHTML = "<tr><th>场次</th><th>档</th><th>价格</th><th>涨</th><th>跌</th><th>成本</th><th>结果</th><th>盈亏</th><th>挂上时距开场</th><th>撤单确认</th><th>首次成交距开场</th><th>第几次</th></tr>" + (d.detail.map((x) =>
     `<tr><td>${esc(x.coin)} ${esc(x.when)}</td><td>${x.level}</td><td>${x.price}¢</td><td>${x.up || ""}</td><td>${x.down || ""}</td><td>${money(x.cost)}</td><td>${esc(x.result)}</td><td>${x.pnl == null ? "" : signed(x.pnl)}</td>` +
     `<td>${secs(x.placed_lead_s)}</td><td>${x.cancel_lead_s == null ? "—" : "开场前 " + secs(x.cancel_lead_s)}</td><td>${secs(x.first_fill_lead_s)}</td><td>${x.attempt}</td></tr>`).join("") || '<tr><td colspan="12" class="muted">还没有成交</td></tr>');
@@ -566,12 +573,14 @@ async function loadJournal() {
 async function download(kind) {
   const r = await api("/api/journal.csv?kind=" + kind); if (r.status !== 200) return toast("导出失败", true);
   const url = URL.createObjectURL(new Blob([r.data], {type: "text/csv;charset=utf-8"}));
-  const a = document.createElement("a"); a.href = url; a.download = kind === "daily" ? "preopen-daily.csv" : "preopen-fills.csv"; document.body.appendChild(a); a.click(); a.remove();
+  const a = document.createElement("a"); a.href = url; a.download = {daily: "preopen-daily.csv", quotes: "preopen-quotes.csv", cancel: "preopen-cancel-review.csv"}[kind] || "preopen-fills.csv"; document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 5000);
-  if (initData) toast("Telegram 里可能下载不了，可以在浏览器里打开控制台导出");
+  if (initData) toast("Telegram 里可能下载不了：发 /export 让机器人把文件发给你");
 }
 $("csvDetail").onclick = () => download("detail");
 $("csvDaily").onclick = () => download("daily");
+$("csvQuotes").onclick = () => download("quotes");
+$("csvCancel").onclick = () => download("cancel");
 
 // ---- 操作
 async function act(action, question, extra) {

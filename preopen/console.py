@@ -52,12 +52,16 @@ class Console:
         return journal.orders(records, tab, coin.lower().strip(), self.engine.now(), limit=max(1, min(limit, 2000)))
 
     def review(self) -> dict[str, Any]:
-        return journal.journal(self.engine.all_records(), self.engine.now())
+        return journal.journal(self.engine.all_records(), self.engine.now(), self.engine.s.cancel_s)
 
     def csv(self, kind: str) -> tuple[str, str]:
         records = self.engine.all_records()
         if kind == "daily":
             return "preopen-daily.csv", journal.daily_csv(journal.journal(records, self.engine.now()))
+        if kind == "quotes":
+            return "preopen-quotes.csv", journal.quotes_csv(records)
+        if kind == "cancel":
+            return "preopen-cancel-review.csv", journal.cancel_csv(journal.cancel_review(records, self.engine.now(), self.engine.s.cancel_s))
         return "preopen-fills.csv", journal.detail_csv(records)
 
     # ------------------------------------------------------------------ writes

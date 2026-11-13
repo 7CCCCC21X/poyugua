@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 import httpx
@@ -28,20 +28,25 @@ BUTTONS = {  # keyboard button text -> command
     "🌐 网页": "/web",
     "⏸ 暂停": "/pause",
     "▶️ 恢复": "/resume",
+    "📈 复盘": "/review",
+    "📤 导出": "/export",
 }
 COMMANDS = [("status", "状态"), ("check", "体检"), ("probe", "只读探测接下来的场次"), ("web", "打开网页控制台"),
-            ("pause", "暂停并撤掉全部挂单"), ("resume", "恢复挂单"), ("help", "说明和按钮")]
+            ("pause", "暂停并撤掉全部挂单"), ("resume", "恢复挂单"), ("review", "复盘：盈亏、开场前几秒撤单最好"),
+            ("export", "导出记录（CSV 文件）：/export 7 = 最近 7 天"), ("help", "说明和按钮")]
 CONFIRM_PAUSE = "pause!"  # callback data of the inline 确认 button: the handler is asked "/pause!"
 CANCEL = "cancel"
 
-HELP = ("按钮：📊 状态、🩺 体检、🔎 探测、🌐 网页、⏸ 暂停（会先确认）、▶️ 恢复；左下角菜单按钮打开网页控制台。\n"
-        "命令：/status 状态 /check 体检 /probe [小时] 只读探测 /web 网页 /pause 暂停并撤单 /resume 恢复 /help 本说明")
+HELP = ("按钮：📊 状态、🩺 体检、🔎 探测、🌐 网页、📈 复盘、📤 导出、⏸ 暂停（会先确认）、▶️ 恢复；左下角菜单按钮打开网页控制台。\n"
+        "命令：/status 状态 /check 体检 /probe [小时] 只读探测 /review 复盘 /export [天数] 导出 CSV /web 网页 "
+        "/pause 暂停并撤单 /resume 恢复 /help 本说明")
 
 
 @dataclass
 class Reply:
     text: str
     markup: dict | None = None    # reply_markup; None = the keyboard
+    files: list[tuple[str, bytes]] = field(default_factory=list)   # (file name, content) sent after the text
 
 
 Handler = Callable[[str, list[str]], Awaitable["Reply | str"]]
@@ -63,12 +68,13 @@ class Telegram:
         self.admins = {str(a).strip() for a in (admins if admins is not None else [self.chat_id]) if str(a).strip().isdigit()}
         self.web_url = web_url
         self.http = http or httpx.AsyncClient(timeout=40)
-        self.outbox: asyncio.Queue[tuple[str, dict | None]] = asyncio.Queue(maxsize=500)
+        self.outbox: asyncio.Queue[tuple[str, dict | None, tuple[str, bytes] | None]] = asyncio.Queue(maxsize=500)
         self.offset = 0
         self.keyboard_sent = False
 
     def keyboard(self) -> dict:
         return {"keyboard": [[{"text": "📊 状态"}, {"text": "🩺 体检"}],
+                             [{"text": "📈 复盘"}, {"text": "📤 导出"}],
                              [{"text": "🔎 探测"}, {"text": "🌐 网页"}],
                              [{"text": "⏸ 暂停"}, {"text": "▶️ 恢复"}]],
                 "resize_keyboard": True, "is_persistent": True}
@@ -79,9 +85,23 @@ class Telegram:
         if markup is None and not self.keyboard_sent:
             markup, self.keyboard_sent = self.keyboard(), True
         try:
-            self.outbox.put_nowait((text[:MAX_LEN], markup))
+            self.outbox.put_nowait((text[:MAX_LEN], markup, None))
         except asyncio.QueueFull:
             LOG.warning("Telegram 发件队列满，丢弃：%s", text[:80])
+
+    def send_file(self, name: str, data: bytes, caption: str = "") -> None:
+        """Queue a file (a document: up to 50 MB through the Bot API), sent in turn after the messages before it."""
+        try:
+            self.outbox.put_nowait((caption[:1000], None, (name, data)))
+        except asyncio.QueueFull:
+            LOG.warning("Telegram 发件队列满，丢弃文件 %s", name)
+
+    async def _send_document(self, name: str, data: bytes, caption: str) -> None:
+        r = await self.http.post(f"{API}/bot{self.token}/sendDocument", data={"chat_id": str(self.chat()), "caption": caption},
+                                 files={"document": (name, data, "text/csv")}, timeout=120)
+        result = r.json()
+        if not result.get("ok"):
+            raise RuntimeError(f"Telegram sendDocument: {result.get('description')}")
 
     async def _post(self, method: str, **payload: Any) -> Any:
         r = await self.http.post(f"{API}/bot{self.token}/{method}", json=payload)
@@ -105,13 +125,16 @@ class Telegram:
 
     async def sender(self) -> None:
         while True:
-            text, markup = await self.outbox.get()
+            text, markup, document = await self.outbox.get()
             payload: dict[str, Any] = {"chat_id": self.chat(), "text": text, "disable_web_page_preview": True}
             if markup:
                 payload["reply_markup"] = markup
             for attempt in range(3):
                 try:
-                    await self._post("sendMessage", **payload)
+                    if document is not None:
+                        await self._send_document(document[0], document[1], text)
+                    else:
+                        await self._post("sendMessage", **payload)
                     break
                 except Exception as error:
                     LOG.warning("Telegram 发送失败（第 %d 次）：%s", attempt + 1, error)
@@ -141,6 +164,8 @@ class Telegram:
             reply = Reply(reply)
         if reply and reply.text:
             self.send(reply.text, markup=reply.markup or self.keyboard())
+        for name, data in (reply.files if reply else []):
+            self.send_file(name, data)
 
     async def on_callback(self, cb: dict, handle: Handler) -> None:
         msg = cb.get("message") or {}

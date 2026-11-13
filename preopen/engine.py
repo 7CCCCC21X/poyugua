@@ -69,6 +69,7 @@ BALANCE_STALE_S = 3 * BALANCE_EVERY_S + 15   # ...and no new order is placed on 
 SETTLE_AFTER_S = 60       # a window's result is looked for this long after its end
 RESULT_RETRY_S = 30
 REDEEM_RETRY_S = 600
+FILL_LOG_TRIES = 3        # a window's trades read for the fills' exact times this many passes, then settled without them
 REDEEM_TRIES = 6
 STALE_EXTRA_S = 15
 BALANCE_HOLD_S = 60       # the CLOB refused or cancelled an order for the balance: no new order this long
@@ -1341,9 +1342,30 @@ class Engine:
             self.save(*changed.values())
 
     # ------------------------------------------------------------------ results
+    async def log_fill_times(self, q: dict, cache: dict[str, Any]) -> bool:
+        """Each filled side's fills with the moment they matched (the account's trades): the cancel-time review replays
+        the window from them. Seen-at times from the snapshots stand in when the trades cannot be read."""
+        cid = q["condition_id"]
+        if cid not in cache:
+            try:
+                cache[cid] = await self.x.trade_log(cid)
+            except Exception as error:
+                LOG.debug("成交时刻 %s：%s", q["slug"], error)
+                cache[cid] = None
+        log = cache[cid]
+        if log is None:
+            q["fill_log_tries"] = int(q.get("fill_log_tries") or 0) + 1
+            return False
+        for o in q["orders"].values():
+            if dnum(o.get("filled")) > 0 and o.get("id") in log:
+                o["fills_at"] = [[round(ts, 3), str(shares)] for ts, shares in sorted(log[o["id"]]) if ts > 0]
+        q["fills_logged"] = True
+        return True
+
     async def settle_pass(self) -> None:
         now = self.now()
         results: dict[str, str | None] = {}
+        logs: dict[str, Any] = {}
         for q in self.open_quotes():
             if q["phase"] != "closed":
                 continue
@@ -1355,6 +1377,10 @@ class Engine:
                 continue
             if now < q["start"] + mk.PERIOD_S + SETTLE_AFTER_S or now < float(q.get("result_retry") or 0):
                 continue
+            if not q.get("fills_logged") and int(q.get("fill_log_tries") or 0) < FILL_LOG_TRIES:
+                if not await self.log_fill_times(q, logs):
+                    self.save(q)
+                    continue
             slug = q["slug"]
             if slug not in results:
                 try:

@@ -171,6 +171,7 @@ class Exchange(Protocol):
     async def open_orders(self) -> list[Row]: ...
     async def order(self, order_id: str) -> Row | None: ...
     async def fills(self, condition_id: str) -> dict[str, D]: ...       # order id -> shares bought, from the trades
+    async def trade_log(self, condition_id: str) -> dict[str, list[tuple[float, D]]]: ...  # order id -> [(matched at, shares)]
     async def balance(self) -> D: ...
     async def redeem(self, condition_id: str) -> str: ...
     def redeem_problem(self) -> str: ...                                  # why winnings cannot be claimed from here ("")
@@ -576,16 +577,21 @@ class LiveExchange:
             raise
 
     async def fills(self, condition_id: str) -> dict[str, D]:
-        """What each of this account's orders bought on a market, from its trade history (order id -> shares): the
-        bot's orders are post-only, so they are the maker orders of the trades."""
-        out: dict[str, D] = {}
+        """What each of this account's orders bought on a market, from its trade history (order id -> shares)."""
+        return {oid: sum((shares for _, shares in log), D(0)) for oid, log in (await self.trade_log(condition_id)).items()}
+
+    async def trade_log(self, condition_id: str) -> dict[str, list[tuple[float, D]]]:
+        """Each fill of this account's orders on a market with the moment it matched (order id -> [(epoch s, shares)]):
+        the bot's orders are post-only, so they are the maker orders of the trades. A trade without a time has 0."""
+        out: dict[str, list[tuple[float, D]]] = {}
         async for page in self.client.list_account_trades(market=condition_id):
             for t in page.items:
                 if str(getattr(t, "status", "")).upper() == "FAILED":
                     continue  # never settled on chain: no shares came of it
+                at = getattr(t, "matched_at", None)
+                ts = at.timestamp() if hasattr(at, "timestamp") else 0.0
                 for m in t.maker_orders:
-                    oid = str(m.order_id)
-                    out[oid] = out.get(oid, D(0)) + D(str(m.matched_amount))
+                    out.setdefault(str(m.order_id), []).append((ts, D(str(m.matched_amount))))
         return out
 
     def identity(self) -> str:
@@ -638,6 +644,7 @@ class PaperExchange:
         self.fail_read: Exception | None = None      # set: every order() and fills() raises it (tests)
         self.fail_balance: Exception | None = None   # set: every balance() raises it (tests)
         self.markets: dict[str, str] = {}      # asset -> condition id (rows of the paper book carry it)
+        self.fill_log: dict[str, list[tuple[float, D]]] = {}   # order id -> [(when, shares)] of fill() (tests)
 
     async def start(self) -> None:
         return None
@@ -721,6 +728,12 @@ class PaperExchange:
         return {oid: row.matched for oid, row in {**self.gone, **self.book}.items()
                 if row.market == condition_id and row.matched > 0}
 
+    async def trade_log(self, condition_id: str) -> dict[str, list[tuple[float, D]]]:
+        if self.fail_read is not None:
+            raise self.fail_read
+        rows = {**self.gone, **self.book}
+        return {oid: list(log) for oid, log in self.fill_log.items() if oid in rows and rows[oid].market == condition_id}
+
     async def balance(self) -> D:
         if self.fail_balance is not None:
             raise self.fail_balance
@@ -758,6 +771,7 @@ class PaperExchange:
     # --- test helpers ---
     def fill(self, order_id: str, shares: D) -> None:
         row = self.book[order_id]
+        self.fill_log.setdefault(order_id, []).append((self.clock(), min(shares, row.size - row.matched)))
         row.matched = min(row.size, row.matched + shares)
         self.cash -= shares * row.price
         if row.matched >= row.size:

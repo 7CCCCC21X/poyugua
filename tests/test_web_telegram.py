@@ -1,5 +1,6 @@
 """The web console (sign-in, routes, a real socket round trip) and the Telegram buttons (keyboard, menu, the pause
 confirmation)."""
+from decimal import Decimal as D
 import asyncio
 import hashlib
 import hmac
@@ -175,10 +176,14 @@ class FakeTelegram(Telegram):
     def __init__(self, **kw):
         super().__init__(TOKEN, ADMIN, **kw)
         self.posts = []
+        self.documents = []
 
     async def _post(self, method, **payload):
         self.posts.append((method, payload))
         return True
+
+    async def _send_document(self, name, data, caption):
+        self.documents.append((name, data, caption))
 
 
 class TelegramTest(unittest.IsolatedAsyncioTestCase):
@@ -194,7 +199,7 @@ class TelegramTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen, list(BUTTONS.values()))
         await tg.on_message({"chat": {"id": 1}, "from": {"id": 1}, "text": "📊 状态"}, handle)  # not the admin: ignored
         self.assertEqual(len(seen), len(BUTTONS))
-        text, markup = tg.outbox.get_nowait()
+        text, markup, _ = tg.outbox.get_nowait()
         self.assertEqual(markup["keyboard"][0][0]["text"], "📊 状态")
 
     async def test_pause_asks_then_confirms_by_callback(self):
@@ -227,6 +232,42 @@ class TelegramTest(unittest.IsolatedAsyncioTestCase):
         plain = FakeTelegram()
         await plain.setup()
         self.assertEqual(plain.posts[1][1]["menu_button"], {"type": "commands"})
+
+    async def test_review_and_export_send_the_records_as_files(self):
+        e, clock, pub, x = make_engine()
+        starts = mk.window_starts(clock.t, e.s)[:2]
+        ma = pub.list_window("btc", starts[0])
+        pub.list_window("btc", starts[1])
+        await tick(e)
+        q = next(q for q in e.ledger.rows.values() if q["start"] == starts[0])
+        x.fill(q["orders"]["up"]["id"], D("10"))
+        clock.t = starts[0] + 400
+        pub.results[ma["slug"]] = {**ma, "closed": True, "outcomePrices": '["1", "0"]'}
+        for _ in range(4):
+            await tick(e, 30)
+        handle = main.commander(settings(), e, pub)
+        review = await handle("/review", [])
+        self.assertIn("开场前几秒撤单最好", review)
+        self.assertIn("什么时候成交的", review)
+        reply = await handle("/export", [])
+        self.assertEqual([n.split("_")[0] for n, _ in reply.files], ["全部报价", "成交明细", "每日汇总", "撤单时间复盘"])
+        fills = dict(reply.files)[next(n for n, _ in reply.files if n.startswith("成交明细"))].decode("utf-8")
+        self.assertTrue(fills.startswith("\ufeff"))
+        self.assertIn("涨成交时刻(开场前秒:份)", fills)
+        self.assertIn(",是,", fills)  # the fill's time is the trade's own
+        tg = FakeTelegram()
+        await tg.on_message({"chat": {"id": int(ADMIN)}, "from": {"id": int(ADMIN)}, "text": "📤 导出"}, handle)
+        task = asyncio.create_task(tg.sender())
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            if len(tg.documents) == 4:
+                break
+        task.cancel()
+        self.assertEqual(len(tg.documents), 4)
+        self.assertTrue(all(name.endswith(".csv") for name, _, _ in tg.documents))
+        self.assertEqual(tg.posts[0][0], "sendMessage")  # the text first, then the files
+        week = await handle("/export", ["7"])
+        self.assertIn("最近 7 天", week.text)
 
     async def test_web_command(self):
         e, clock, pub, x = make_engine()

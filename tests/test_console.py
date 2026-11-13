@@ -141,6 +141,75 @@ class ConsoleTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("撤掉", text)
 
 
+def settled(coin, start, result, fills, cancel_lead=5.0, price="0.47"):
+    """A finished record: fills = {side: [(seconds before the start, shares), ...]} at exact (trade) times."""
+    orders = {}
+    for side in ("up", "down"):
+        log = fills.get(side, [])
+        orders[side] = {"state": "final", "id": f"{coin}{start}{side}", "filled": str(sum(sh for _, sh in log)),
+                        "fills_at": [[start - lead, str(sh)] for lead, sh in log]}
+    return {"key": f"{coin}-{start}#0@0", "slug": f"{coin}-updown-5m-{start}", "coin": coin, "start": start, "level": 0,
+            "attempt": 0, "price": price, "shares": "10", "expiration": start + 50, "phase": "settled", "result": result,
+            "placed": start - 3600, "cancel_lead": cancel_lead, "orders": orders, "pnl": 0.0}
+
+
+class CancelReviewTest(unittest.TestCase):
+    def setUp(self):
+        t = T0
+        self.records = [
+            settled("btc", t, "up", {"up": [(100, 10)]}),                    # +5.30 while cancelled 100 s or less ahead
+            settled("eth", t, "up", {"down": [(8, 10)]}),                     # filled 8 s before: no candidate keeps it
+            settled("sol", t, "down", {"up": [(25, 10)], "down": [(12, 10)]}),  # both: +0.60; up alone: -4.70
+            settled("xrp", t, "up", {}),                                      # quoted, never filled
+        ]
+        self.now = T0 + 3600
+
+    def test_each_cancel_time_replays_the_same_windows(self):
+        c = journal.cancel_review(self.records, self.now, current=15)
+        rows = {r["cancel_s"]: r for r in c["rows"]}
+        self.assertEqual(c["base"], 10)                          # every window rested until 5 s before
+        self.assertEqual({r["windows"] for r in c["rows"]}, {4})
+        self.assertAlmostEqual(rows[10]["pnl"], 5.90)            # btc +5.30, sol both sides +0.60
+        self.assertAlmostEqual(rows[15]["pnl"], 0.60)            # sol keeps the up side only: -4.70
+        self.assertAlmostEqual(rows[30]["pnl"], 5.30)            # sol no fill
+        self.assertAlmostEqual(rows[90]["pnl"], 5.30)
+        self.assertAlmostEqual(rows[120]["pnl"], 0.0)            # btc's fill came 100 s before: gone too
+        self.assertEqual((rows[10]["filled"], rows[10]["both"]), (2, 1))
+        self.assertIsNone(c["best"])                             # four windows: too few to name one
+        self.assertIn("样本还少", c["advice"])
+        quick = {t["bucket"]: t for t in c["by_fill_time"]}["开场前 15 秒内"]
+        self.assertEqual((quick["shares"], quick["won"]), (20.0, 10.0))  # eth down lost, sol down won
+        self.assertAlmostEqual(quick["breakeven"], 0.47)
+
+    def test_the_best_is_named_once_there_are_enough(self):
+        old = journal.CANCEL_SAMPLE
+        journal.CANCEL_SAMPLE = 2
+        try:
+            c = journal.cancel_review(self.records, self.now, current=15)
+        finally:
+            journal.CANCEL_SAMPLE = old
+        self.assertEqual(c["best"], 10)
+        self.assertIn("开场前 10 秒撤单盈亏最好", c["advice"])
+        self.assertIn("现在的 15 秒是 +0.60", c["advice"])
+
+    def test_windows_cancelled_earlier_are_left_out_and_later_cancels_are_not_replayed(self):
+        early = [settled("doge", T0 + 300 * i, "up", {"up": [(200, 10)]}, cancel_lead=60) for i in range(9)]
+        c = journal.cancel_review(self.records + early, self.now + 3000, current=60)
+        self.assertEqual(c["base"], 60)                          # most rested only until 60 s before
+        self.assertEqual(min(r["cancel_s"] for r in c["rows"]), 60)
+        self.assertEqual(c["excluded"], 0)                       # the 5 s ones rested past 60 s: comparable too
+        csv_text = journal.cancel_csv(c)
+        self.assertTrue(csv_text.startswith("\ufeff"))
+        self.assertIn("开场前几秒撤单", csv_text)
+
+    def test_snapshot_times_stand_in_and_are_flagged(self):
+        q = settled("hype", T0, "up", {})
+        q["orders"]["up"].update(filled="10", first_fill=T0 - 40)
+        c = journal.cancel_review([q], self.now, current=15)
+        self.assertEqual(c["approx"], 1)
+        self.assertEqual(journal.fill_times_text(q, "up"), "40.0:10")
+
+
 class JournalTest(unittest.IsolatedAsyncioTestCase):
     async def test_orders_tabs_and_review(self):
         e, clock, pub, x = make_engine(settings(**ENV))

@@ -18,7 +18,10 @@ import sys
 import time
 from pathlib import Path
 
-from preopen import config, region
+from decimal import Decimal as D
+
+from preopen import config, journal, region
+from preopen import markets as mk
 from preopen.engine import Engine
 from preopen.exchange import LiveExchange, PaperExchange
 from preopen.gamma import PublicApi
@@ -73,6 +76,27 @@ def acquire_lock(ledger_path: str):
     return f
 
 
+def export(engine: Engine, args: list[str]) -> Reply:
+    """/export [days]: the records as CSV files (all quotes, the fills, by day, the cancel-time review), for a review in
+    Excel or anywhere else. Without a number, everything the ledger holds."""
+    now = engine.now()
+    try:
+        days = float(args[0]) if args else 0.0
+    except ValueError:
+        days = 0.0
+    records = engine.all_records()
+    if days > 0:
+        records = [q for q in records if q["start"] >= now - days * 86400]
+    stamp = time.strftime("%Y%m%d-%H%M", time.gmtime(now + 8 * 3600))
+    review = journal.journal(records, now, engine.s.cancel_s)
+    files = [(f"全部报价_{stamp}.csv", journal.quotes_csv(records)), (f"成交明细_{stamp}.csv", journal.detail_csv(records)),
+             (f"每日汇总_{stamp}.csv", journal.daily_csv(review)), (f"撤单时间复盘_{stamp}.csv", journal.cancel_csv(review["cancel"]))]
+    quoted = sum(1 for q in records if q.get("placed") or any(journal.filled(q).values()))
+    span = f"最近 {mk.fmt(D(str(days)))} 天" if days > 0 else "全部"
+    return Reply(f"📤 导出{span}的记录：{quoted} 条报价，{review['totals']['all']['filled']} 场有成交。4 个 CSV 文件马上发过来"
+                 "（Excel 可以直接打开；成交时刻一栏是「开场前几秒:份数」）。", files=[(name, text.encode("utf-8")) for name, text in files])
+
+
 def commander(settings: config.Settings, engine: Engine, pub: PublicApi):
     """The Telegram commands and buttons: one reply each (the pause asks first)."""
     async def handle(cmd: str, args: list[str]) -> Reply | str:
@@ -82,6 +106,10 @@ def commander(settings: config.Settings, engine: Engine, pub: PublicApi):
             return Reply(HELP)
         if cmd == "/check":
             return engine.check_text()
+        if cmd == "/review":
+            return journal.review_text(engine.all_records(), engine.now(), engine.s.cancel_s)
+        if cmd == "/export":
+            return export(engine, args)
         if cmd == "/probe":
             try:
                 hours = float(args[0]) if args else 1.0
