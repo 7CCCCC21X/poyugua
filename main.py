@@ -14,7 +14,7 @@ import logging
 import signal
 import sys
 
-from preopen import config
+from preopen import config, region
 from preopen.engine import Engine
 from preopen.exchange import LiveExchange, PaperExchange
 from preopen.gamma import PublicApi
@@ -67,6 +67,11 @@ async def run(settings: config.Settings) -> None:
     if tg:
         side_tasks.append(asyncio.create_task(tg.run(handle), name="telegram"))
     LOG.info("启动：%s，币种 %s，每边 %s，数据库 %s", settings.mode(), ",".join(settings.coins), settings.levels_text(), settings.ledger_path)
+    if settings.live:
+        allowed, line = await region.check()
+        (LOG.info if allowed else LOG.warning)(line)
+        if tg and allowed is not True:
+            tg.send(line)
     try:
         await engine.run()
     except Exception as error:

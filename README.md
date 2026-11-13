@@ -72,6 +72,9 @@ Polymarket 的挂买单**会占用 pUSD 余额**：`可下单量 = 余额 − Σ
 
 1. 把本仓库连到 Railway（Deploy from GitHub repo），使用仓库里的 `Dockerfile` 和 `railway.json`，启动命令 `python -u main.py`。
    这是常驻进程：**不要配健康检查和 Cron**。构建时会跑全部离线测试，测试不过构建失败。
+   **地区必须选 EU West（Amsterdam）**：Polymarket 对美国、新加坡、英国、法国、德国、澳大利亚等地的 IP 在 API 上也只许平仓、不许开新单
+   （Railway 的 US West / US East / Southeast Asia 区都下不了单）；荷兰只限制网页、不限制 API。Polymarket 的服务器在 AWS 伦敦（eu-west-2），
+   Amsterdam 到那里延迟最低。实盘启动时机器人会查一次 `polymarket.com/api/geoblock` 并在日志/Telegram 里报出所在国家，受限就告警。
 2. 给服务挂一个 **Volume 到 `/data`**（账本 `/data/preopen.sqlite3` 必须在持久卷上，否则重启后不认识自己挂着的单）。只运行一个副本。
 3. 先不填私钥、保持 `LIVE=off` 跑模拟盘，看日志或 Telegram `/status`：每场发布后几秒内是否「挂上」、开场前是否撤掉。
 4. 准备实盘账户（建议单独开一个账户给机器人）：
@@ -114,7 +117,7 @@ python tests/run_all.py         # 离线测试（不联网、不需要私钥）
 | `preopen/exchange.py` | 交易所适配：实盘走官方统一 SDK `polymarket-client`（签名、15 张一批下单、按单号/按市场撤单、挂单列表、余额、领取），模拟盘在内存里 |
 | `preopen/engine.py` | 控制器：发现、下单队列、到点撤单、核对、账户快照、结算与领取、接管 |
 | `preopen/ledger.py` | SQLite 账本：先落盘再发送；两天前无成交的记录归档 |
-| `preopen/telegram.py` / `preopen/probe.py` | Telegram 通知与命令、只读探测 |
+| `preopen/telegram.py` / `preopen/probe.py` / `preopen/region.py` | Telegram 通知与命令、只读探测、实盘前的所在地区检查 |
 | `tests/` | 离线测试（假 Gamma、假 SDK、可控时钟） |
 
 依赖只有 `polymarket-client`（官方统一 SDK，固定 0.18.0；它还在 0.x 阶段、接口常变，所以所有调用都集中在 `preopen/exchange.py`）和 `httpx`。
