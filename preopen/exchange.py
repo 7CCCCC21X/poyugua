@@ -478,7 +478,10 @@ class LiveExchange:
 
 
 class PaperExchange:
-    """LIVE=off: orders are kept in memory and never fill; the discovery, the timing and the bookkeeping run as live."""
+    """LIVE=off: orders are kept in memory and never fill; the discovery, the timing and the bookkeeping run as live.
+    The balance rule is Polymarket's: each market's open BUYs, a new one included, add up to at most the balance
+    (funds are not shared between markets); when fills take the balance below a market's open BUYs, that market's
+    orders are cancelled (CANCELED_NOT_ENOUGH_BALANCE)."""
     live = False
 
     def __init__(self, balance: D = D("1000"), clock=time.time):
@@ -527,8 +530,13 @@ class PaperExchange:
                 status, code = self.reject.pop(spec.ref)
                 out.append(Placed(spec.ref, status, code=code, message=code, hash=oid, salt=salt))
                 continue
+            market = spec.market or self.markets.get(spec.asset, "")
+            if self.market_open(market) + spec.price * spec.size > self.cash:  # this market's BUYs against the balance
+                out.append(Placed(spec.ref, "rejected", code="not_enough_balance", message="not enough balance / allowance",
+                                  hash=oid, salt=salt))
+                continue
             self.placed.append(spec)
-            self.book[oid] = Row(id=oid, asset=spec.asset, market=spec.market or self.markets.get(spec.asset, ""), side="BUY", price=spec.price,
+            self.book[oid] = Row(id=oid, asset=spec.asset, market=market, side="BUY", price=spec.price,
                                  size=spec.size, matched=D(0), status="LIVE", created=self.clock())
             out.append(Placed(spec.ref, "open", order_id=oid, hash=oid, salt=salt))
         return out
@@ -580,6 +588,21 @@ class PaperExchange:
     async def redeem(self, condition_id: str) -> str:
         return "paper"
 
+    def market_open(self, market: str) -> D:
+        return sum((r.price * (r.size - r.matched) for r in self.book.values() if r.market == market and r.side == "BUY"), D(0))
+
+    def enforce(self) -> list[str]:
+        """The CLOB keeps checking: a market whose open BUYs add up to more than the balance has them cancelled."""
+        gone = []
+        for market in {r.market for r in self.book.values()}:
+            if self.market_open(market) > self.cash:
+                for oid in [i for i, r in self.book.items() if r.market == market]:
+                    row = self.book.pop(oid)
+                    row.status = "CANCELED_NOT_ENOUGH_BALANCE"
+                    self.gone[oid] = row
+                    gone.append(oid)
+        return gone
+
     # --- test helpers ---
     def fill(self, order_id: str, shares: D) -> None:
         row = self.book[order_id]
@@ -588,3 +611,4 @@ class PaperExchange:
         if row.matched >= row.size:
             row.status = "MATCHED"
             self.gone[order_id] = self.book.pop(order_id)
+        self.enforce()

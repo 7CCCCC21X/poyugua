@@ -343,8 +343,9 @@ class Engine:
         self.problem(f"接口冷却 {seconds:.0f} 秒：{reason}", key="cooldown")
 
     def reserved(self) -> D:
-        """The bot's own resting money: every order that may rest, at its price, for what is not filled. Polymarket
-        holds an open BUY order's price x size against the pUSD balance, so this is what the balance must cover."""
+        """The bot's own resting money, every market together: what all its open BUYs would cost if every one filled.
+        Shown for information: Polymarket holds each market's orders against the balance on its own (funds are not
+        shared between markets), so this sum is not what the balance has to cover — see market_room()."""
         if self._reserved[0] == self.version:
             return self._reserved[1]
         total = D(0)
@@ -355,32 +356,62 @@ class Engine:
         self._reserved = (self.version, total)
         return total
 
-    def unmanaged_usd(self) -> D:
-        return sum((r.price * max(D(0), r.size - r.matched) for r in self.unmanaged if r.side == "BUY"), D(0))
+    def unmanaged_usd(self, market: str | None = None) -> D:
+        """The open BUYs on the account that are not the bot's (the website, another strategy): one market's, or all."""
+        return sum((r.price * max(D(0), r.size - r.matched) for r in self.unmanaged
+                    if r.side == "BUY" and (market is None or r.market == market)), D(0))
 
-    def room(self) -> D:
-        """What more the bot may reserve now: the cap's room and the balance's, whichever is less."""
-        mine = self.reserved()
-        room = D("Infinity")
-        if self.s.max_open_usd > 0:
-            room = self.s.max_open_usd - mine
+    def market_rests(self, slug: str) -> D:
+        """The bot's own resting money in one market (a window): its levels, and orders of an earlier attempt that are
+        not confirmed gone yet."""
+        return sum((dnum(q["price"]) * max(D(0), dnum(q["shares"]) - dnum(o.get("filled")))
+                    for q in self.quotes_of(slug) for o in q["orders"].values() if o["state"] in MAY_REST), D(0))
+
+    def market_room(self, listing: mk.Listing) -> D:
+        """What more one market (window) may take. Polymarket checks each market's BUY orders against the balance on
+        its own: an order is accepted while that market's open BUYs, its own included, add up to at most the balance.
+        Other markets' orders do not count — funds are not shared — so every window can be quoted with the balance one
+        window needs. PREOPEN_MAX_OPEN_USD, when set, caps the bot's own orders in any one market below that."""
         if self.balance is None:
             return D(0)
-        return min(room, self.balance - mine - self.unmanaged_usd())
+        mine = self.market_rests(listing.slug)
+        room = self.balance - mine - self.unmanaged_usd(listing.condition_id)
+        if self.s.max_open_usd > 0:
+            room = min(room, self.s.max_open_usd - mine)
+        return room
 
-    def budget_problem(self, need: D) -> str:
-        mine = self.reserved()
-        if self.s.max_open_usd > 0 and mine + need > self.s.max_open_usd:
-            return f"预留已到上限 PREOPEN_MAX_OPEN_USD={self.s.max_open_usd}（已挂 ${mine:.2f}，这一场要 ${need:.2f}）"
+    def fit(self, listing: mk.Listing, levels: list[int]) -> list[int]:
+        """The levels to quote that the market's room takes, the nearest first (a level's two sides together); a deeper
+        one that does not fit waits until there is room."""
+        room = self.market_room(listing)
+        out: list[int] = []
+        for i in levels:
+            need = 2 * self.s.levels[i].usd
+            if need > room:
+                break
+            out.append(i)
+            room -= need
+        return out
+
+    def budget_problem(self, listing: mk.Listing, levels: list[int]) -> str:
+        """Why not even the first of these levels fits its market ("" when it does)."""
         if self.balance is None:
             return "还没读到余额"
-        free = self.balance - mine - self.unmanaged_usd()
-        if free < need:
-            return f"可用余额不够：余额 ${self.balance:.2f}，已挂 ${mine:.2f}，这一场要 ${need:.2f}"
-        return ""
+        if not levels or self.fit(listing, levels):
+            return ""
+        need = 2 * self.s.levels[levels[0]].usd
+        mine = self.market_rests(listing.slug)
+        if self.s.max_open_usd > 0 and mine + need > self.s.max_open_usd:
+            return f"这一场到了每场上限 PREOPEN_MAX_OPEN_USD={self.s.max_open_usd}（已挂 ${mine:.2f}，再挂要 ${need:.2f}）"
+        others = self.unmanaged_usd(listing.condition_id)
+        return (f"余额不够这一场：余额 ${self.balance:.2f}，这一场已挂 ${mine:.2f}" + (f"、别的单 ${others:.2f}" if others else "")
+                + f"，再挂要 ${need:.2f}（各场分别占用余额，不共用）")
 
-    def need_of(self, levels: list[int]) -> D:
-        return sum((2 * self.s.levels[i].usd for i in levels), D(0))
+    def per_market(self) -> D:
+        """The most one window takes with every level quoted (within PREOPEN_MAX_OPEN_USD when set): the balance this
+        much covers every window, each on its own."""
+        need = self.s.window_usd
+        return min(need, self.s.max_open_usd) if self.s.max_open_usd > 0 else need
 
     # ------------------------------------------------------------------ discovery
     def frontier(self, starts: list[int]) -> dict[str, int]:
@@ -481,29 +512,29 @@ class Engine:
             del self.skipped[slug]
 
     def sweep(self) -> None:
-        """Every listed window in range with a level to quote and not queued is queued, the soonest first, as far as
-        the budget's room goes (a hold that cleared, a level withdrawn, a deeper level now near, money freed)."""
-        now = self.now()
-        held = self.hold()
-        room = self.room() if not held else D(0)
-        queued_need = sum((self.need_of(self.wanted(self.listings[s])) for s in self.queued | self.placing if s in self.listings), D(0))
-        room -= queued_need
+        """Every listed window in range with a level to quote and not queued is queued (a hold that cleared, a level
+        withdrawn, a deeper level now near, money back). Each market is budgeted on its own — funds are not shared
+        between markets — so a window waits only when its own market has no room for its first level to quote."""
+        if self.hold():
+            self.budget_note = ""  # a hold is reported on its own
+            return
         short = 0
-        for t in mk.window_starts(now, self.s):
+        for t in mk.window_starts(self.now(), self.s):
             for coin in self.s.coins:
                 slug = mk.slug_of(coin, t)
                 if slug not in self.listings or slug in self.queued or slug in self.placing or slug in self.timers:
                     continue
-                levels = self.wanted(self.listings[slug])
+                listing = self.listings[slug]
+                levels = self.wanted(listing)
                 if not levels:
                     continue
-                need = self.need_of(levels)
-                if need > room:
+                if not self.fit(listing, levels):
                     short += 1
                     continue
-                room -= need
                 self.enqueue(slug)
-        self.budget_note = f"{short} 场因资金不够没挂" if short and not held else ""  # a hold is reported on its own
+        first = 2 * self.s.first.usd
+        self.budget_note = (f"{short} 场挂不下（余额 ${self.balance or 0:.2f}，一场至少要 ${first:.2f}；各场分别占用余额，不共用）"
+                            if short else "")
 
     def priority(self, slug: str) -> tuple[int, int]:
         listing = self.listings[slug]
@@ -610,11 +641,14 @@ class Engine:
                 return None
             if why := self.hold():
                 return Hold(why, None if self.paused else HOLD_RETRY_S)
-        # from here to the records' save nothing awaits: the budget check and the reservation are one step (the seven
-        # coins' fresh listings open together and must not all pass against the same reservation)
-        need = self.need_of(levels)
-        if why := self.budget_problem(need):
-            return Hold(why, None)
+        # from here to the records' save nothing awaits: the market's budget check and its new records are one step (each
+        # market on its own budget; one worker at a time per window)
+        fitting = self.fit(listing, levels)
+        if not fitting:
+            return Hold(self.budget_problem(listing, levels), None)
+        if len(fitting) < len(levels):
+            LOG.info("%s 余额只放得下前 %d 档（共要挂 %d 档）", slug, len(fitting), len(levels))
+        levels = fitting
         now = self.now()
         if now > listing.start - self.s.entry_s:
             return None
@@ -1142,9 +1176,14 @@ class Engine:
         o.update(state="final", final_at=self.now(), status=row.status)
         if q["phase"] == "active" and row.matched < row.size and self.now() < q["start"] - self.s.cancel_s:
             state = row.state
-            if state == "CANCELED_NOT_ENOUGH_BALANCE":  # the CLOB withdrew it for the balance: not the window's doing
+            if state == "CANCELED_NOT_ENOUGH_BALANCE":  # fills elsewhere took the balance below this market's orders
                 self.close(q, f"{mk.SIDES_CN[side]}方挂单因余额不足被交易所撤掉", free=True, save=False)
-                self.hold_balance("交易所因余额不足撤掉了挂单：暂停新挂一分钟（核对 pUSD 余额）")
+                try:  # the balance as it is now: each window then waits for its own market's room, nothing else waits
+                    self.balance, self.balance_at = await self.x.balance(), self.now()
+                except Exception:
+                    self.balance_at = 0.0  # unreadable: nothing is placed until it is read again
+                self.problem("余额降到了一场的挂单合计以下，交易所撤掉了这些场次的挂单；余额回来后（结算、领取）自动重挂",
+                             key="balance-cancel")
             elif state.startswith("CANCELED_"):  # the market resolved, vanished, the order timed out or expired
                 self.close(q, f"{mk.SIDES_CN[side]}方挂单被交易所撤掉（{row.status}）", free=True, save=False)
             else:  # cancelled by someone else (the website, another program): counted, quoted again up to the cap
@@ -1656,6 +1695,8 @@ class Engine:
             "settings": {"ahead_min": self.s.ahead_s // 60, "cancel_s": self.s.cancel_s, "expiry_s": self.s.expiry_s,
                          "entry_s": self.s.entry_s, "weekend": self.s.weekend, "max_open": float(self.s.max_open_usd)},
             "reserved": float(self.reserved()), "balance": float(self.balance) if self.balance is not None else None,
+            "per_market": float(self.per_market()),
+            "buffer": float(self.balance - self.per_market()) if self.balance is not None else None,
             "unmanaged": len(self.unmanaged), "unmanaged_usd": float(self.unmanaged_usd()),
             "windows": c["windows"], "resting": c["resting"], "unknown": c["unknown"], "closing": c["closing"],
             "listed_until": mk.hm(listed_until) if listed_until else "",
@@ -1687,12 +1728,12 @@ class Engine:
         lines = [
             f"📌 Polymarket 5 分钟涨跌预挂 · {self.s.mode()}" + (" · ⏸ 已暂停" if self.paused else ""),
             f"币种：{' '.join(mk.name_of(x) for x in self.s.coins) or '无'}",
-            f"每边：{self.s.levels_text()}（post-only GTD）；每场预留 ${self.s.window_usd:.2f}",
+            f"每边：{self.s.levels_text()}（post-only GTD）；每场占用 ${self.per_market():.2f}"
+            + (f"（每场上限 ${self.s.max_open_usd}）" if self.s.max_open_usd else ""),
             f"时间：开场前 {self.s.ahead_s // 60} 分钟内的场次；开场前 {self.s.cancel_s} 秒撤单，{self.s.expiry_s} 秒到期，"
             f"{self.s.entry_s} 秒内不新挂" + ("" if self.s.weekend else "；周末不挂"),
-            f"挂着：{c['windows']} 场 {c['resting']} 张单，预留 ${self.reserved():.2f}"
-            + (f"（上限 ${self.s.max_open_usd}）" if self.s.max_open_usd else "")
-            + (f"；余额 ${self.balance:.2f}" if self.balance is not None else "；余额未读到"),
+            f"挂着：{c['windows']} 场 {c['resting']} 张单（合计 ${self.reserved():.2f}，各场分别占用余额、不共用）"
+            + (f"；余额 ${self.balance:.2f}，比一场所需多 ${self.balance - self.per_market():.2f}" if self.balance is not None else "；余额未读到"),
         ]
         if self.unmanaged:
             lines.append(f"账户里另有 {len(self.unmanaged)} 张本程序没记录的挂单（${self.unmanaged_usd():.2f}）")
@@ -1720,7 +1761,7 @@ class Engine:
         elif self.hold_note and self.queue.qsize() + len(self.timers):
             lines.append(f"等候：{len(self.timers)} 场（{self.hold_note}）")
         if self.budget_note:
-            lines.append(f"资金：{self.budget_note}（{self.budget_problem(self.s.window_usd) or '余额/上限已用完'}）")
+            lines.append(f"资金：{self.budget_note}")
         if self.errors:
             ts, text = self.errors[-1]
             lines.append(f"最近问题（{mk.hms(ts)}）：{text[:200]}")

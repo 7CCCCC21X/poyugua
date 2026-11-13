@@ -107,29 +107,74 @@ class PlacementTest(unittest.IsolatedAsyncioTestCase):
         await drain(e)
         self.assertEqual(len(x.placed), 2)
 
-    async def test_budget_cap_holds_the_later_windows(self):
-        e, clock, pub, x = make_engine(settings(PREOPEN_MAX_OPEN_USD="20"))
+    async def test_every_window_is_quoted_on_the_balance_one_window_needs(self):
+        e, clock, pub, x = make_engine(balance="15")  # one window takes $9.80: each market is checked on its own
         starts = mk.window_starts(clock.t, e.s)
-        pub.list_range(["btc"], starts)
+        pub.list_range(["btc", "eth"], starts)
         await e.account_once()
         await e.discover()
         await drain(e)
-        placed = quotes(e)
-        self.assertEqual(len(placed), 2)  # $9.80 each: two fit under $20
-        self.assertEqual([q["start"] for q in placed], starts[:2])  # the soonest
-        self.assertLessEqual(e.reserved(), D("20"))
-        e.sweep()
-        await drain(e)
-        self.assertEqual(len(quotes(e)), 2)
-        self.assertIn("资金", e.budget_note)
+        self.assertEqual(len(quotes(e, phase="active")), 2 * len(starts))
+        self.assertGreater(e.reserved(), 10 * D("15"))  # all of them together: far more than the balance, as allowed
+        self.assertEqual(e.budget_note, "")
 
-    async def test_paper_balance_limits(self):
-        e, clock, pub, x = make_engine(balance="15")
-        pub.list_range(["btc", "eth"], mk.window_starts(clock.t, e.s))
+    async def test_a_balance_below_one_window_quotes_nothing(self):
+        e, clock, pub, x = make_engine(balance="9")
+        pub.list_range(["btc", "eth"], mk.window_starts(clock.t, e.s)[:2])
         await e.account_once()
         await e.discover()
         await drain(e)
-        self.assertEqual(len(quotes(e)), 1)
+        self.assertEqual(x.placed, [])
+        await tick(e, 5)  # the next sweep says why
+        self.assertEqual(x.placed, [])
+        self.assertIn("4 场挂不下", e.budget_note)
+
+    async def test_the_per_market_cap_takes_the_levels_that_fit(self):
+        for cap, levels in (("20", {0}), ("30", {0, 1})):  # 49x10 is $9.80 a window, 48x20 another $19.20
+            with self.subTest(cap=cap):
+                e, clock, pub, x = make_engine(settings(PREOPEN_MAX_OPEN_USD=cap, PREOPEN_LEVELS="48x20"))
+                starts = mk.window_starts(clock.t, e.s)[:3]
+                pub.list_range(["btc"], starts)
+                await tick(e)
+                for t in starts:
+                    self.assertEqual({q["level"] for q in quotes(e, mk.slug_of("btc", t))}, levels)
+
+    async def test_another_strategys_orders_count_in_their_own_market_only(self):
+        e, clock, pub, x = make_engine(balance="15")
+        a, b = mk.window_starts(clock.t, e.s)[:2]
+        ma = pub.list_window("btc", a)
+        pub.list_window("btc", b)
+        token = __import__("json").loads(ma["clobTokenIds"])[0]
+        await x.place([OrderSpec("website/up", token, D("0.50"), D("20"), a + 30, market=ma["conditionId"])])  # $10 in market a
+        await tick(e)
+        await tick(e, 5)
+        self.assertEqual([q["start"] for q in quotes(e)], [b])  # a has $5 left: not enough; b has all $15
+        self.assertIn("1 场挂不下", e.budget_note)
+
+    async def test_fills_that_drain_the_balance_lose_a_markets_orders_until_it_is_back(self):
+        e, clock, pub, x = make_engine(balance="15")
+        starts = mk.window_starts(clock.t, e.s)[:3]
+        pub.list_range(["btc"], starts)
+        await tick(e)
+        a, b, c = quotes(e)
+        x.fill(a["orders"]["up"]["id"], D("10"))  # $4.90 spent: $10.10 left, still above every market's $9.80
+        self.assertEqual(len(x.book), 5)
+        x.fill(b["orders"]["up"]["id"], D("10"))  # $5.20 left: market c's $9.80 is no longer covered
+        self.assertEqual({r.market for r in x.book.values()}, {a["condition_id"], b["condition_id"]})
+        await tick(e, 10)
+        await tick(e, 6)
+        c = quotes(e, c["slug"])[0]
+        self.assertIn(c["phase"], ("closed", "settled"))  # cancelled by the exchange: withdrawn, free, not counted
+        self.assertFalse(c["counted"])
+        self.assertEqual({q["phase"] for q in (quotes(e, a["slug"])[0], quotes(e, b["slug"])[0])}, {"active"})
+        self.assertEqual(e.hold(), "")  # no blanket pause: the others keep going
+        await tick(e, 10)
+        self.assertEqual(len(quotes(e, c["slug"])), 1)  # $5.20 cannot take $9.80: c waits
+        self.assertIn("挂不下", e.budget_note)
+        x.cash += D("10")  # the winnings redeemed
+        await tick(e, 31)
+        await tick(e, 5)
+        self.assertEqual(quotes(e, c["slug"])[-1]["phase"], "active")  # quoted again, on its own market's room
 
     async def test_hold_without_snapshot_and_during_cooldown(self):
         e, clock, pub, x = make_engine()
@@ -490,8 +535,8 @@ class ReviewRegressionTest(unittest.IsolatedAsyncioTestCase):
         await drain(e)
         self.assertEqual(len(quotes(e, phase="active")), 1)
 
-    async def test_fresh_listings_opening_together_respect_the_cap(self):
-        e, clock, pub, x = make_engine(settings(PREOPEN_MARKETS="btc,eth,sol,xrp,doge,hype,bnb", PREOPEN_MAX_OPEN_USD="20"))
+    async def test_fresh_listings_opening_together_are_each_budgeted_on_their_own(self):
+        e, clock, pub, x = make_engine(settings(PREOPEN_MARKETS="btc,eth,sol,xrp,doge,hype,bnb"), balance="10")
         start = mk.window_starts(clock.t, e.s)[-1]
         for coin in e.s.coins:
             m = pub.list_window(coin, start, created=clock.t - 60, accepting=None)
@@ -507,8 +552,8 @@ class ReviewRegressionTest(unittest.IsolatedAsyncioTestCase):
         for s_ in slugs:
             e.queued.discard(s_)
         await asyncio.gather(*(e.process(s_) for s_ in slugs))  # seven workers side by side
-        self.assertLessEqual(e.reserved(), D("20"))
-        self.assertEqual(len(quotes(e, phase="active")), 2)
+        self.assertEqual(len(quotes(e, phase="active")), 7)  # $10 covers each market's $9.80: funds are not shared
+        self.assertEqual(e.reserved(), 7 * D("9.80"))
 
     async def test_an_answer_in_flight_is_not_given_up(self):
         e, clock, pub, x = make_engine()
