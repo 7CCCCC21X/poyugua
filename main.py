@@ -20,7 +20,8 @@ from preopen.exchange import LiveExchange, PaperExchange
 from preopen.gamma import PublicApi
 from preopen.ledger import Ledger
 from preopen.probe import probe
-from preopen.telegram import HELP, Telegram
+from preopen.telegram import CONFIRM_PAUSE, HELP, Reply, Telegram, confirm_markup, web_markup
+from preopen.web import WebServer
 
 LOG = logging.getLogger("preopen")
 
@@ -32,11 +33,50 @@ def setup_logging(level: str) -> None:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
+WEB_HOWTO = ("网页控制台还没开：在 Railway 打开这个服务 → Settings → Networking → Generate Domain 生成一个域名，"
+             "再在 Variables 里加 WEB_KEY（至少 12 位的密码）后重新部署。之后左下角的菜单按钮就能直接打开控制台。")
+
+
+def commander(settings: config.Settings, engine: Engine, pub: PublicApi):
+    """The Telegram commands and buttons: one reply each (the pause asks first)."""
+    async def handle(cmd: str, args: list[str]) -> Reply | str:
+        if cmd in ("/status", "/preopen"):
+            return engine.status_text()
+        if cmd in ("/start", "/help", "/menu"):
+            return Reply(HELP)
+        if cmd == "/check":
+            return engine.check_text()
+        if cmd == "/probe":
+            try:
+                hours = float(args[0]) if args else 1.0
+            except ValueError:
+                hours = 1.0
+            return await probe(settings, pub, hours=max(0.1, min(hours, 24.0)))
+        if cmd == "/web":
+            if settings.web_url.startswith("https://") and settings.web_port:
+                return Reply("点下面的按钮在 Telegram 里打开控制台（也可以用左下角的菜单按钮）。"
+                             f"\n浏览器打开：{settings.web_url}（输入 WEB_KEY 登录）", web_markup(settings.web_url))
+            return WEB_HOWTO
+        if cmd == "/pause":
+            c = engine.counts()
+            return Reply(f"确定暂停吗？会撤掉本程序挂着的 {c['resting']} 张单（{c['windows']} 场），之后不再新挂，直到恢复。",
+                         confirm_markup(CONFIRM_PAUSE, "确认暂停并撤单"))
+        if cmd == "/" + CONFIRM_PAUSE:
+            n = engine.pause()
+            return f"⏸ 已暂停：{n} 场在撤单，不再新挂（▶️ 恢复 / /resume）"
+        if cmd == "/resume":
+            engine.resume()
+            return "▶️ 已恢复挂单"
+        return Reply(HELP)
+    return handle
+
+
 async def run(settings: config.Settings) -> None:
     ledger = Ledger(settings.ledger_path)
     pub = PublicApi()
     exchange = LiveExchange(settings) if settings.live else PaperExchange(settings.paper_balance)
-    tg = Telegram(settings.telegram_token, settings.telegram_chat) if settings.telegram_token and settings.telegram_chat else None
+    tg = (Telegram(settings.telegram_token, settings.telegram_chat, web_url=settings.web_url if settings.web_port else "")
+          if settings.telegram_token and settings.telegram_chat else None)
     engine = Engine(settings, exchange, pub, ledger, notify=tg.send if tg else None)
     for note in settings.notes:
         LOG.warning(note)
@@ -47,26 +87,26 @@ async def run(settings: config.Settings) -> None:
         except (NotImplementedError, RuntimeError):  # pragma: no cover - Windows
             pass
 
-    async def handle(cmd: str, args: list[str]) -> str:
-        if cmd in ("/status", "/preopen", "/start"):
-            return engine.status_text()
-        if cmd == "/check":
-            return engine.check_text()
-        if cmd == "/probe":
-            hours = float(args[0]) if args else 1.0
-            return await probe(settings, pub, hours=max(0.1, min(hours, 24.0)))
-        if cmd == "/pause":
-            n = engine.pause()
-            return f"⏸ 已暂停：{n} 场在撤单，不再新挂（/resume 恢复）"
-        if cmd == "/resume":
-            engine.resume()
-            return "▶️ 已恢复挂单"
-        return HELP
+    async def pause() -> str:
+        return f"已暂停：{engine.pause()} 场在撤单，不再新挂"
 
+    async def resume() -> str:
+        engine.resume()
+        return "已恢复挂单"
+    web = None
+    if settings.web_port:
+        web = WebServer(settings.web_port, engine.report, {"pause": pause, "resume": resume}, web_key=settings.web_key,
+                        bot_token=settings.telegram_token, admin_id=settings.telegram_chat)
+        try:
+            await web.start()
+        except OSError as error:
+            LOG.warning("网页控制台没能启动（端口 %d）：%s", settings.web_port, error)
+            web = None
     side_tasks = []
     if tg:
-        side_tasks.append(asyncio.create_task(tg.run(handle), name="telegram"))
-    LOG.info("启动：%s，币种 %s，每边 %s，数据库 %s", settings.mode(), ",".join(settings.coins), settings.levels_text(), settings.ledger_path)
+        side_tasks.append(asyncio.create_task(tg.run(commander(settings, engine, pub)), name="telegram"))
+    LOG.info("启动：%s，币种 %s，每边 %s，数据库 %s%s", settings.mode(), ",".join(settings.coins), settings.levels_text(),
+             settings.ledger_path, f"，网页 {settings.web_url or '端口 ' + str(settings.web_port)}" if web else "")
     if settings.live:
         allowed, line = await region.check()
         (LOG.info if allowed else LOG.warning)(line)
@@ -85,6 +125,8 @@ async def run(settings: config.Settings) -> None:
         for t in side_tasks:
             t.cancel()
         await asyncio.gather(*side_tasks, return_exceptions=True)
+        if web:
+            await web.close()
         if tg:
             await tg.close()
         await exchange.close()

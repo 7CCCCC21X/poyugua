@@ -354,7 +354,8 @@ class Engine:
         """Every listed window in range with a level to quote and not queued is queued, the soonest first, as far as
         the budget's room goes (a hold that cleared, a level withdrawn, a deeper level now near, money freed)."""
         now = self.now()
-        room = self.room() if not self.hold() else D(0)
+        held = self.hold()
+        room = self.room() if not held else D(0)
         queued_need = sum((self.need_of(self.wanted(self.listings[s])) for s in self.queued | self.placing if s in self.listings), D(0))
         room -= queued_need
         short = 0
@@ -372,7 +373,7 @@ class Engine:
                     continue
                 room -= need
                 self.enqueue(slug)
-        self.budget_note = f"{short} 场因资金/暂停没挂" if short else ""
+        self.budget_note = f"{short} 场因资金不够没挂" if short and not held else ""  # a hold is reported on its own
 
     def priority(self, slug: str) -> tuple[int, int]:
         listing = self.listings[slug]
@@ -1144,13 +1145,67 @@ class Engine:
             if mk.dt.datetime.fromtimestamp(q["start"], mk.BEIJING).date() != day:
                 continue
             f = {s: dnum(o.get("filled")) for s, o in q["orders"].items()}
-            if any(f.values()):
-                fills += 1
-                both += 1 if all(f.values()) else 0
+            if not any(f.values()):
+                continue  # withdrawn with nothing filled: not a trade
+            fills += 1
+            both += 1 if all(f.values()) else 0
             if q.get("phase") == "settled":
                 settled += 1
                 pnl += float(q.get("pnl") or 0)
         return {"fills": fills, "both": both, "pnl": pnl, "settled": settled}
+
+    def report(self) -> dict[str, Any]:
+        """Everything the web console shows, as plain JSON-able values (times also pre-formatted in Beijing time)."""
+        now = self.now()
+        c = self.counts()
+        t = self.today()
+
+        def median(values: collections.deque) -> float | None:
+            ordered = sorted(values)
+            return round(ordered[len(ordered) // 2], 2) if ordered else None
+
+        def f(value: Any) -> float:
+            return float(dnum(value))
+        starts = mk.window_starts(now, self.s)
+        front = self.frontier(starts)
+        listed_until = max((l.start for l in self.listings.values()), default=0)
+        nxt = min(front.values()) if front else 0
+        active = sorted((q for q in self.open_quotes() if q["phase"] in ("active", "closing")),
+                        key=lambda q: (q["start"], q["coin"], q["level"]))
+        upcoming = [{
+            "coin": mk.name_of(q["coin"]), "start": q["start"], "when": mk.hm(q["start"]), "in": mk.span(q["start"] - now),
+            "level": int(q["level"]), "price": f(q["price"]) * 100, "shares": f(q["shares"]), "phase": q["phase"],
+            "up": q["orders"]["up"]["state"], "down": q["orders"]["down"]["state"],
+            "up_filled": f(q["orders"]["up"].get("filled")), "down_filled": f(q["orders"]["down"].get("filled")),
+        } for q in active[:40]]
+        filled = sorted((q for q in self.ledger.rows.values() if any(f(o.get("filled")) > 0 for o in q["orders"].values())),
+                        key=lambda q: -q["start"])
+        fills = [{
+            "coin": mk.name_of(q["coin"]), "start": q["start"], "when": mk.hm(q["start"]), "level": int(q["level"]),
+            "price": f(q["price"]) * 100, "up": f(q["orders"]["up"].get("filled")), "down": f(q["orders"]["down"].get("filled")),
+            "phase": q["phase"], "result": mk.SIDES_CN.get(str(q.get("result") or ""), ""), "pnl": q.get("pnl"),
+            "redeem": q.get("redeem") or "",
+        } for q in filled[:30]]
+        return {
+            "now": now, "now_text": mk.hms(now), "mode": self.s.mode(), "live": bool(self.x.live), "paused": self.paused,
+            "coins": [mk.name_of(x) for x in self.s.coins], "levels": self.s.levels_text(), "window_usd": float(self.s.window_usd),
+            "settings": {"ahead_min": self.s.ahead_s // 60, "cancel_s": self.s.cancel_s, "expiry_s": self.s.expiry_s,
+                         "entry_s": self.s.entry_s, "weekend": self.s.weekend, "max_open": float(self.s.max_open_usd)},
+            "reserved": float(self.reserved()), "balance": float(self.balance) if self.balance is not None else None,
+            "unmanaged": len(self.unmanaged), "unmanaged_usd": float(self.unmanaged_usd()),
+            "windows": c["windows"], "resting": c["resting"], "unknown": c["unknown"], "closing": c["closing"],
+            "listed_until": mk.hm(listed_until) if listed_until else "",
+            "next_listing": {"start": mk.hm(nxt), "expected": mk.hms(nxt - self.lead)} if nxt else None,
+            "lags": {"open": median(self.open_lags), "place": median(self.place_lags), "cancel": median(self.cancel_lags),
+                     "listing": median(self.listing_lags)},
+            "today": t, "hold": self.hold(), "budget_note": self.budget_note,
+            "cooldown": self.cooldown_reason if now < self.cooldown_until else "",
+            "snapshot_age": round(now - self.snapshot_at, 1) if self.snapshot_at else None,
+            "queue": self.queue.qsize(), "waiting": len(self.timers), "placing": len(self.placing),
+            "id_is_hash": self.id_is_hash, "tier": getattr(self.x, "tier", "") or "", "lead_h": round(self.lead / 3600, 2),
+            "upcoming": upcoming, "fills": fills,
+            "errors": [{"when": mk.hms(ts), "text": text[:300]} for ts, text in list(self.errors)[-10:]][::-1],
+        }
 
     def status_text(self) -> str:
         c = self.counts()

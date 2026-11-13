@@ -72,6 +72,9 @@ class Settings:
     clob_passphrase: str = ""
     telegram_token: str = ""
     telegram_chat: str = ""
+    web_key: str = ""                  # the web console's password (WEB_KEY); Telegram's Mini App signs in without it
+    web_port: int = 0                  # the console listens here (Railway's PORT); 0 = no console
+    web_url: str = ""                  # the console's public https address (WEB_URL, else Railway's RAILWAY_PUBLIC_DOMAIN)
     log_level: str = "INFO"
     notes: tuple[str, ...] = field(default=())  # warnings found while reading the settings
 
@@ -243,6 +246,14 @@ def from_env(env: dict[str, str] | None = None) -> Settings:
     if any(relayer) and not all(relayer):
         raise ConfigError("POLY_RELAYER_API_KEY 和 POLY_RELAYER_API_KEY_ADDRESS 要一起填")
     max_open = parse_decimal("PREOPEN_MAX_OPEN_USD", g("PREOPEN_MAX_OPEN_USD"), D("0"), D("0"), D("10000000"))
+    web_key = (g("WEB_KEY") or g("WEB_CONTROL_KEY") or "").strip()
+    if web_key and len(web_key) < 12:
+        raise ConfigError("WEB_KEY 太短：至少 12 个字符（网页能暂停机器人、能看到余额）")
+    web_port = parse_int("PORT", g("PORT"), 8080 if web_key else 0, 0, 65535)
+    domain = (g("RAILWAY_PUBLIC_DOMAIN") or "").strip().strip("/")
+    web_url = (g("WEB_URL") or "").strip().rstrip("/") or (f"https://{domain}" if domain else "")
+    if web_url and not web_url.startswith("https://"):
+        notes.append(f"WEB_URL={web_url} 不是 https：Telegram 的菜单按钮只能打开 https 网页")
     settings = Settings(
         live=live,
         coins=coins,
@@ -276,6 +287,9 @@ def from_env(env: dict[str, str] | None = None) -> Settings:
         clob_passphrase=clob[2],
         telegram_token=(g("TELEGRAM_BOT_TOKEN") or "").strip(),
         telegram_chat=(g("TELEGRAM_CHAT_ID") or "").strip(),
+        web_key=web_key,
+        web_port=web_port,
+        web_url=web_url,
         log_level=(g("LOG_LEVEL") or "INFO").strip().upper(),
         notes=tuple(notes),
     )

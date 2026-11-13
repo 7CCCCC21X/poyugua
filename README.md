@@ -72,7 +72,7 @@ Polymarket 的挂买单**会占用 pUSD 余额**：`可下单量 = 余额 − Σ
 ## 部署（Railway）
 
 1. 把本仓库连到 Railway（Deploy from GitHub repo），使用仓库里的 `Dockerfile` 和 `railway.json`，启动命令 `python -u main.py`。
-   这是常驻进程：**不要配健康检查和 Cron**。构建时会跑全部离线测试，测试不过构建失败。
+   这是常驻进程：**不要配健康检查和 Cron**。构建时会跑全部离线测试，测试不过构建失败。想用网页控制台就生成一个域名（见下文「网页控制台」）。
    **地区必须选 EU West（Amsterdam）**：Polymarket 对美国、新加坡、英国、法国、德国、澳大利亚等地的 IP 在 API 上也只许平仓、不许开新单
    （Railway 的 US West / US East / Southeast Asia 区都下不了单）；荷兰只限制网页、不限制 API。Polymarket 的服务器在 AWS 伦敦（eu-west-2），
    Amsterdam 到那里延迟最低。实盘启动时机器人会查一次 `polymarket.com/api/geoblock` 并在日志/Telegram 里报出所在国家，受限就告警。
@@ -98,14 +98,25 @@ python main.py status           # 看本地账本的记录数和盈亏
 python tests/run_all.py         # 离线测试（不联网、不需要私钥）
 ```
 
+## 网页控制台
+
+机器人自带一个网页：挂着多少场、资金占用和余额、开场最近的挂单、有成交的场次和盈亏、最近的问题，还有「暂停并撤单 / 恢复挂单」按钮，每 5 秒刷新，手机上也能看。
+
+打开方法（Railway）：
+
+1. 打开这个服务 → **Settings → Networking → Generate Domain**，生成一个 `xxx.up.railway.app` 的域名（端口用 Railway 默认的 `PORT`，机器人自己会监听）。
+2. 在 **Variables** 里加 `WEB_KEY`（至少 12 位的密码），重新部署。
+3. 浏览器打开 `https://xxx.up.railway.app`，输入 `WEB_KEY` 登录（保持登录 30 天）。
+   - 填了 Telegram 的话，**不用密码**：点机器人聊天框左下角的菜单按钮「控制台」，网页直接在 Telegram 里打开，用 Telegram 的签名认证（只认 `TELEGRAM_CHAT_ID` 这个用户）。
+
 ## Telegram（可选）
 
-填 `TELEGRAM_BOT_TOKEN` 和 `TELEGRAM_CHAT_ID` 后，机器人会把启动、成交、结算、问题发到这个聊天，并接受命令：
+填 `TELEGRAM_BOT_TOKEN`（找 @BotFather 建机器人）和 `TELEGRAM_CHAT_ID`（你自己的用户 ID，可以问 @userinfobot）后：
 
-- `/status`（或 `/preopen`）：挂着多少场多少张、资金占用和余额、已发布到哪一场、下一场预计几点发布、开放接单→挂上用时、今天的成交和盈亏、不新挂的原因、最近的问题
-- `/check`：体检（快照多久前、冷却、队列、状态不明的单、订单号是否等于哈希、限流档位、学到的发布提前量）
-- `/probe [小时]`：只读探测
-- `/pause` / `/resume`
+- **输入框下面常驻一排按钮**：📊 状态、🩺 体检、🔎 探测、🌐 网页、⏸ 暂停、▶️ 恢复。⏸ 暂停会先弹出「确认暂停并撤单 / 取消」。
+- **左下角菜单按钮**：生成了域名时是「控制台」（打开网页）；没有域名时是命令列表。
+- 机器人会把启动、成交、结算和问题发到这个聊天。第一次用先给机器人发 `/start`。
+- 命令：`/status` 状态，`/check` 体检，`/probe [小时]` 只读探测，`/web` 网页，`/pause` 暂停（会先确认），`/resume` 恢复，`/help` 说明。
 
 ## 代码结构
 
@@ -118,7 +129,8 @@ python tests/run_all.py         # 离线测试（不联网、不需要私钥）
 | `preopen/exchange.py` | 交易所适配：实盘走官方统一 SDK `polymarket-client`（签名、15 张一批下单、按单号/按市场撤单、挂单列表、余额、领取），模拟盘在内存里 |
 | `preopen/engine.py` | 控制器：发现、下单队列、到点撤单、核对、账户快照、结算与领取、接管 |
 | `preopen/ledger.py` | SQLite 账本：先落盘再发送；两天前无成交的记录归档 |
-| `preopen/telegram.py` / `preopen/probe.py` / `preopen/region.py` | Telegram 通知与命令、只读探测、实盘前的所在地区检查 |
+| `preopen/web.py` | 网页控制台（自带的小 HTTP 服务，`WEB_KEY` 或 Telegram 签名登录） |
+| `preopen/telegram.py` / `preopen/probe.py` / `preopen/region.py` | Telegram 通知、按钮与命令，只读探测，实盘前的所在地区检查 |
 | `tests/` | 离线测试（假 Gamma、假 SDK、可控时钟） |
 
 依赖只有 `polymarket-client`（官方统一 SDK，固定 0.18.0；它还在 0.x 阶段、接口常变，所以所有调用都集中在 `preopen/exchange.py`）和 `httpx`。
