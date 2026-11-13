@@ -812,6 +812,34 @@ class OperatorTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("BTC ETH", text)
         self.assertIn("体检", e.check_text())
 
+    async def test_check_says_first_whether_every_window_is_quoted_and_why_not(self):
+        def verdict(e):
+            return e.check_text().splitlines()[1]
+        e, clock, pub, x = make_engine()
+        pub.list_range(["btc", "eth"], mk.window_starts(clock.t, e.s)[:3])
+        await tick(e)
+        await tick(e, 5)
+        self.assertTrue(verdict(e).startswith("✅ 正常：") and "挂着 6" in verdict(e))
+        self.assertIn("✅ 状态不明的单：0", e.check_text())
+        e.pause()
+        self.assertTrue(verdict(e).startswith("⏸ 已暂停"))
+
+        e, clock, pub, x = make_engine(balance="9")  # not enough for a window
+        pub.list_range(["btc"], mk.window_starts(clock.t, e.s)[:3])
+        await tick(e)
+        await tick(e, 5)
+        self.assertTrue(verdict(e).startswith("⚠️") and "3 场没挂" in verdict(e))
+        self.assertIn("资金不够 3", e.check_text())
+        self.assertIn("⚠️ 余额：$9.00，不够一场", e.check_text())
+
+        e, clock, pub, x = make_engine()  # the exchange refuses for the account's sake
+        m = pub.list_window("btc", mk.window_starts(clock.t, e.s)[0])
+        x.refuse_market[m["conditionId"]] = ("rejected", "invalid_expiration")
+        await tick(e)
+        self.assertTrue(verdict(e).startswith("⛔ 暂不新挂：交易所拒单（invalid_expiration"))
+        self.assertIn("⚠️ 交易所拒单：invalid_expiration", e.check_text())
+        self.assertLess(len(e.check_text()), 4000)  # one Telegram message
+
     async def test_deep_levels_only_near_the_start(self):
         e, clock, pub, x = make_engine(settings(PREOPEN_LEVELS="47x20", PREOPEN_DEEP_AHEAD_MINUTES="20"))
         far, near = T0 + 3000, T0 + 1200

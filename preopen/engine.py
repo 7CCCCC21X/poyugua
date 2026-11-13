@@ -1969,25 +1969,101 @@ class Engine:
         return "\n".join(lines)
 
     def check_text(self) -> str:
+        """/check (🩺 体检): the verdict first (is every window in range quoted, and if not, why), then each part marked
+        ✅ fine / ⚠️ look at it / ⛔ stopped, then the last ten minutes' problems."""
         now = self.now()
         c = self.counts()
+        cov = self.coverage()
+        n = cov["counts"]
+        hold = self.hold()
+        resting, total = n.get("resting", 0), cov["total"]
+        short = n.get("stopped", 0) + n.get("budget", 0)
+        pending = n.get("queued", 0) + n.get("waiting", 0)
+        if self.blocked:
+            verdict = f"⛔ 不工作：{self.blocked}"
+        elif self.paused:
+            verdict = "⏸ 已暂停，不挂单（▶️ 恢复 或 /resume）"
+        elif hold:
+            verdict = f"⛔ 暂不新挂：{hold}"
+        elif not total:
+            verdict = "ℹ️ 范围内没有要挂的场次" + ("（周末不挂）" if not self.s.weekend else "")
+        elif short:
+            verdict = f"⚠️ 范围内 {total} 场，有 {short} 场没挂（原因见「挂单」）"
+        elif pending:
+            verdict = f"⏳ 正在挂：范围内 {total} 场，挂上 {resting} 场，{pending} 场在排队或等开放"
+        else:
+            verdict = f"✅ 正常：{cov['text']}"
+        lines = [f"🩺 体检 {mk.hms(now)} · {self.s.mode()}", verdict, "", "【挂单】",
+                 f"{'⚠️' if short else '✅'} 范围内：{cov['text']}"]
+        timeouts = int(getattr(self.x, "_timeouts", 0) or 0)
+        if now < self.refused_until:
+            lines.append(f"⚠️ 交易所拒单：{self.refused_reason}；所有新挂暂停，{self.refused_until - now:.0f} 秒后再试"
+                         f"（连续第 {self.refused_streak} 次）")
+        elif now < self.cooldown_until:
+            lines.append(f"⚠️ 冷却中：{self.cooldown_reason[:120]}（还有 {self.cooldown_until - now:.0f} 秒）")
+        if timeouts:
+            lines.append(f"⚠️ 下单超时（order timed out）连续 {timeouts} 次")
+        lines.append(f"✅ 下单：最近一次被交易所接受是 {mk.span(now - self.accepted_at)}前" if self.accepted_at
+                     else "ℹ️ 下单：这次启动后还没有新下的单（挂着的是接管的）")
+        unknown = [now - float(o.get("unknown_at") or now) for q in self.open_quotes() for o in q["orders"].values()
+                   if o["state"] == "unknown"]
+        lines.append(f"⚠️ 状态不明的单：{len(unknown)} 张，最久 {mk.span(max(unknown))}（按订单哈希核对中，约 2 分钟内有结论）"
+                     if unknown else "✅ 状态不明的单：0")
+        if c["closing"]:
+            lines.append(f"ℹ️ 撤单/核对中：{c['closing']} 场")
+        lines.append("【资金】")
+        if self.balance is None:
+            lines.append("⛔ 余额：还没读到")
+        elif now - self.balance_at > BALANCE_STALE_S:
+            lines.append(f"⚠️ 余额：${self.balance:.2f}，但 {now - self.balance_at:.0f} 秒没读到新的（读余额一直失败）")
+        elif self.balance < self.s.window_usd:
+            lines.append(f"⚠️ 余额：${self.balance:.2f}，不够一场（每场 ${self.s.window_usd:.2f}）")
+        else:
+            lines.append(f"✅ 余额：${self.balance:.2f}（{now - self.balance_at:.0f} 秒前读到），每场 ${self.s.window_usd:.2f}，"
+                         f"成交缓冲 ${self.balance - self.s.window_usd:.2f}")
+        lines.append(f"ℹ️ 挂单合计：${self.reserved():.2f}" + (f"（上限 ${self.s.max_open_usd}）" if self.s.max_open_usd else "")
+                     + (f"；账户里另有 {len(self.unmanaged)} 张别的挂单 ${self.unmanaged_usd():.2f}" if self.unmanaged else ""))
+        claims = collections.Counter(str(q.get("redeem") or "") for q in self.ledger.rows.values())
+        queued, by_hand = claims["pending"] + claims["retry"], claims["failed"] + claims["manual"]
+        if not self.x.live:
+            lines.append("ℹ️ 领取：模拟盘不领取")
+        elif not self.s.auto_redeem:
+            lines.append("ℹ️ 领取：自动领取关着" + (f"；{by_hand} 场要到网页上领" if by_hand else ""))
+        elif self.x.redeem_problem():
+            lines.append("⚠️ 领取：没配 Relayer Key，赢的要到网页上手动领" + (f"（现在有 {by_hand} 场）" if by_hand else "")
+                         + "。polymarket.com → Settings → API Keys → Relayer API Keys 建一个，填到 Railway 的 "
+                         "POLY_RELAYER_API_KEY / POLY_RELAYER_API_KEY_ADDRESS")
+        else:
+            lines.append(("⚠️" if by_hand else "✅") + " 领取：会自动领取" + (f"；{queued} 场排着" if queued else "")
+                         + (f"；{by_hand} 场领取失败，要到网页上领" if by_hand else ""))
+        worst, risk = self.exposure(), self.risk_hold()
+        lines.append(("⛔" if risk else "✅") + f" 风控：未结算持仓最坏亏损 ${worst:.2f}"
+                     + (f"（上限 ${self.s.max_exposure_usd}）" if self.s.max_exposure_usd else "（未设上限）")
+                     + f"；今天已结算 {self.day_pnl():+.2f}" + (f"；{risk}" if risk else ""))
+        lines.append("【账户与接口】")
+        lines.append(f"⛔ 账本账户：{self.blocked}" if self.blocked else
+                     "✅ 账本账户：一致；撤单范围：" + ("整个 API Key" if self.s.key_exclusive else "只撤本程序签的单"))
+        if not self.snapshot_at:
+            lines.append("⛔ 账户快照：还没读到")
+        else:
+            age = now - self.snapshot_at
+            lines.append(("⚠️" if age > self.stale_after() else "✅") + f" 账户快照：{age:.0f} 秒前（{len(self.snapshot)} 张挂单，"
+                         f"读一次 {self.snapshot_took:.1f} 秒）")
+        lines.append(f"ℹ️ 订单号=哈希：{'是' if self.id_is_hash else '否' if self.id_is_hash is False else '未知'}；"
+                     f"限流档位：{getattr(self.x, 'tier', '') or '未知'}"
+                     + ("；⚠️ 交易所发过限流警告" if getattr(self.x, "rate_warning", False) else ""))
+        listed_until = max((l.start for l in self.listings.values()), default=0)
+        front = self.frontier(mk.window_starts(now, self.s))
+        lines.append(("✅" if listed_until else "⚠️") + " 发现市场："
+                     + (f"已发布到 {mk.hm(listed_until)}；" if listed_until else "还没找到；")
+                     + (f"下一场 {mk.hm(min(front.values()))} 预计 {mk.hms(min(front.values()) - self.lead)} 发布" if front else "范围内都已发布")
+                     + f"（发布提前量 {self.lead / 3600:.2f} 小时）")
         public = getattr(self.pub, "health", None)
-        lines = [f"🩺 体检 {mk.hms(now)}",
-                 f"账户快照：{now - self.snapshot_at:.0f} 秒前（{len(self.snapshot)} 张挂单，读一次 {self.snapshot_took:.1f} 秒）" if self.snapshot_at else "账户快照：还没读到",
-                 f"余额：{now - self.balance_at:.0f} 秒前读到" if self.balance_at else "余额：还没读到",
-                 f"账本账户：{'⛔ ' + self.blocked if self.blocked else '一致'}；撤单范围：" + ("整个 API Key（PREOPEN_KEY_EXCLUSIVE=on）" if self.s.key_exclusive else "只撤本程序签的单"),
-                 f"冷却：{self.cooldown_reason}（还有 {self.cooldown_until - now:.0f} 秒）" if now < self.cooldown_until else "冷却：无",
-                 f"不新挂的原因：{self.hold() or '无'}",
-                 f"队列 {self.queue.qsize()}，等候 {len(self.timers)}，正在挂 {len(self.placing)}",
-                 f"状态未知的单：{c['unknown']}；撤单/核对中：{c['closing']} 场",
-                 f"订单号=哈希：{'是' if self.id_is_hash else '否' if self.id_is_hash is False else '未知'}；限流档位：{getattr(self.x, 'tier', '') or '未知'}",
-                 f"发布提前量（学到的）：{self.lead / 3600:.2f} 小时；创建→发现："
-                 + (f"中位 {sorted(self.listing_lags)[len(self.listing_lags) // 2]:.1f} 秒" if self.listing_lags else "还没有新发布"),
-                 f"扫描：{self.scan_note or '—'}；{self.full_note or '全量扫描还没跑'}",
-                 f"公共接口：{public() if callable(public) else '—'}",
-                 f"按哈希待撤（判为没发出的）：{len(self.ghosts)}"]
+        health = public() if callable(public) else ""
+        lines.append(("⚠️" if "失败" in health or "限流" in health else "✅") + f" 公共接口：{health or '—'}")
+        if self.ghosts:
+            lines.append(f"ℹ️ 按哈希待撤（判为没发出的）：{len(self.ghosts)}")
         recent = [(ts, text) for ts, text in self.errors if now - ts < 600]
-        if recent:
-            lines.append("最近 10 分钟的问题：")
-            lines += [f"  {mk.hms(ts)} {text[:160]}" for ts, text in recent[-8:]]
+        lines.append("【最近 10 分钟的问题】" + ("" if recent else "无"))
+        lines += [f"  {mk.hms(ts)} {text[:160]}" for ts, text in recent[-8:]]
         return "\n".join(lines)
