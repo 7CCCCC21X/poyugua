@@ -6,14 +6,22 @@ so a pass over a day of windows is a few dozen requests and the next listing of 
 Gamma answers carry `cache-control: public, max-age=300` and CloudFront serves them from its cache: a slug asked
 before its listing keeps answering [] for up to five minutes (measured 11-13: "Hit from cloudfront, age: 264" while
 the market had been listed for four minutes). Every read therefore carries a parameter of its own (_=<ns>).
+
+A 429 is obeyed: the host is left alone for its Retry-After (10 s without one) and every read of it meanwhile raises
+PublicThrottled at once, without a request. A timeout, a 429 or a 5xx is an error, never "no such market": the callers
+ask again later rather than conclude anything from it.
 """
 from __future__ import annotations
 
 import asyncio
+import collections
+import email.utils
 import json
 import logging
+import math
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -24,20 +32,74 @@ SLUGS_PER_REQUEST = 40
 UA = "poyugua-preopen/1.0"
 
 
+class PublicThrottled(Exception):
+    """A public host answered 429: left alone for `seconds`."""
+
+    def __init__(self, host: str, seconds: float):
+        super().__init__(f"{host} 限流，{seconds:.0f} 秒后再问")
+        self.host, self.seconds = host, seconds
+
+
+def retry_after(response: httpx.Response, default: float = 10.0) -> float:
+    """The Retry-After of an answer, in seconds (a number or an HTTP date), within 1 s to 10 minutes."""
+    raw = (response.headers.get("retry-after") or "").strip()
+    seconds: float | None = None
+    if raw:
+        try:
+            seconds = float(raw)
+        except ValueError:
+            try:
+                seconds = email.utils.parsedate_to_datetime(raw).timestamp() - time.time()
+            except (TypeError, ValueError):
+                seconds = None
+    if seconds is None or not math.isfinite(seconds):
+        seconds = default
+    return max(1.0, min(seconds, 600.0))
+
+
 class PublicApi:
-    def __init__(self, timeout: float = 10.0, client: httpx.AsyncClient | None = None):
+    def __init__(self, timeout: float = 10.0, client: httpx.AsyncClient | None = None, clock=time.monotonic):
         self.http = client or httpx.AsyncClient(timeout=timeout, headers={"User-Agent": UA},
                                                 limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
+        self.clock = clock
         self.requests = 0
+        self.blocked_until: dict[str, float] = {}       # host -> when its 429 lifts
+        self.errors: collections.Counter = collections.Counter()   # host -> failed reads (timeouts, 5xx, 429)
+        self.last_error = ""
 
     async def close(self) -> None:
         await self.http.aclose()
 
+    def health(self) -> str:
+        now = self.clock()
+        blocked = [f"{h} 限流还剩 {until - now:.0f} 秒" for h, until in self.blocked_until.items() if until > now]
+        failed = "，".join(f"{h} 失败 {n} 次" for h, n in self.errors.most_common(3))
+        return "；".join(x for x in (f"{self.requests} 次请求", *blocked, failed, self.last_error and f"最近：{self.last_error[:120]}") if x)
+
     async def _get(self, url: str, params: Any = None) -> Any:
+        host = urlsplit(url).netloc
+        wait = self.blocked_until.get(host, 0.0) - self.clock()
+        if wait > 0:
+            raise PublicThrottled(host, wait)
         self.requests += 1
-        r = await self.http.get(url, params=params)
+        try:
+            r = await self.http.get(url, params=params)
+        except httpx.HTTPError as error:
+            self.errors[host] += 1
+            self.last_error = f"{host} {type(error).__name__} {error}"
+            raise
+        if r.status_code == 429:
+            seconds = retry_after(r)
+            self.blocked_until[host] = self.clock() + seconds
+            self.errors[host] += 1
+            self.last_error = f"{host} 429（{seconds:.0f} 秒）"
+            LOG.warning("公共接口 %s 限流：%.0f 秒内不再请求", host, seconds)
+            raise PublicThrottled(host, seconds)
         if r.status_code == 404:
             return None
+        if r.status_code >= 400:
+            self.errors[host] += 1
+            self.last_error = f"{host} HTTP {r.status_code}"
         r.raise_for_status()
         return r.json()
 
@@ -70,8 +132,15 @@ class PublicApi:
         return data if isinstance(data, dict) else None
 
     async def markets(self, slugs: list[str]) -> dict[str, dict]:
-        """Several markets by the direct path, side by side (each coin's next window); errors count as not found."""
+        """Several markets by the direct path, side by side (each coin's next window). A slug whose read failed is
+        left out (asked again at the next poll, never taken as unlisted for good); a 429 is raised for the caller to
+        back off."""
         answers = await asyncio.gather(*(self.market(s) for s in slugs), return_exceptions=True)
+        for a in answers:
+            if isinstance(a, PublicThrottled):
+                raise a
+            if isinstance(a, BaseException) and not isinstance(a, Exception):
+                raise a
         return {s: a for s, a in zip(slugs, answers) if isinstance(a, dict) and a.get("slug") == s}
 
     async def accepting(self, condition_id: str) -> bool | None:

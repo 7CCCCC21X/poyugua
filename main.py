@@ -13,7 +13,10 @@ import asyncio
 import logging
 import os
 import signal
+import socket
 import sys
+import time
+from pathlib import Path
 
 from preopen import config, region
 from preopen.engine import Engine
@@ -37,6 +40,37 @@ def setup_logging(level: str) -> None:
 
 WEB_HOWTO = ("网页控制台还没开：在 Railway 打开这个服务 → Settings → Networking → Generate Domain 生成一个域名，"
              "再在 Variables 里加 WEB_KEY（至少 12 位的密码）后重新部署。之后左下角的菜单按钮就能直接打开控制台。")
+
+
+class InstanceLocked(RuntimeError):
+    pass
+
+
+def acquire_lock(ledger_path: str):
+    """One process per ledger: a second one (a second replica, a deploy overlapping the old one, a local run on the same
+    file) would quote every window twice. An exclusive lock on <ledger>.lock, held for the life of the process (the OS
+    lets it go when the process ends, however it ends). None where there is nothing to lock."""
+    if ledger_path == ":memory:":
+        return None
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - Windows
+        return None
+    path = Path(ledger_path).with_name(Path(ledger_path).name + ".lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.seek(0)
+        holder = f.read().strip()
+        f.close()
+        raise InstanceLocked(f"账本 {ledger_path} 正被另一个进程使用（{holder or '未知'}）：同一个账本只能跑一个实例，这个实例退出")
+    f.seek(0)
+    f.truncate()
+    f.write(f"pid {os.getpid()} @ {socket.gethostname()} since {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    f.flush()
+    return f
 
 
 def commander(settings: config.Settings, engine: Engine, pub: PublicApi):
@@ -80,7 +114,8 @@ async def run(settings: config.Settings, env: dict[str, str] | None = None, over
     ledger = Ledger(settings.ledger_path)
     pub = PublicApi()
     exchange = LiveExchange(settings) if settings.live else PaperExchange(settings.paper_balance)
-    tg = (Telegram(settings.telegram_token, settings.telegram_chat, web_url=settings.web_url if settings.web_port else "")
+    tg = (Telegram(settings.telegram_token, settings.telegram_chat, web_url=settings.web_url if settings.web_port else "",
+                   admins=settings.telegram_admins)
           if settings.telegram_token and settings.telegram_chat else None)
     engine = Engine(settings, exchange, pub, ledger, notify=tg.send if tg else None)
     for note in [*settings.notes, *(dropped or [])]:
@@ -98,7 +133,7 @@ async def run(settings: config.Settings, env: dict[str, str] | None = None, over
     web = None
     if settings.web_port:
         web = WebServer(settings.web_port, console, web_key=settings.web_key, bot_token=settings.telegram_token,
-                        admin_id=settings.telegram_chat)
+                        admin_id=settings.telegram_admins)
         try:
             await web.start()
         except OSError as error:
@@ -183,7 +218,18 @@ def main(argv: list[str]) -> int:
     if cmd != "run":
         print(__doc__)
         return 2
-    if asyncio.run(run(settings, env, kept, dropped)):
+    try:
+        lock = acquire_lock(settings.ledger_path)
+    except InstanceLocked as error:
+        LOG.error("%s", error)
+        time.sleep(30)  # the platform starts it again: not in a tight loop
+        return 3
+    try:
+        restart = asyncio.run(run(settings, env, kept, dropped))
+    finally:
+        if lock is not None:
+            lock.close()
+    if restart:
         LOG.info("按网页的设置重启")
         sys.stdout.flush()
         os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])

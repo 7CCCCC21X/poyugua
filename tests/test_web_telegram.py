@@ -39,6 +39,11 @@ class InitDataTest(unittest.TestCase):
         self.assertFalse(web.check_init_data(tampered, TOKEN, ADMIN))
         self.assertFalse(web.check_init_data("", TOKEN, ADMIN))
         self.assertFalse(web.check_init_data(init_data(), TOKEN, ""))
+        self.assertFalse(web.check_init_data(init_data(), TOKEN, ()))
+        admins = ("555", ADMIN)  # TELEGRAM_ADMIN_IDS: any of them
+        self.assertTrue(web.check_init_data(init_data(), TOKEN, admins))
+        self.assertTrue(web.check_init_data(init_data("555"), TOKEN, admins))
+        self.assertFalse(web.check_init_data(init_data("556"), TOKEN, admins))
 
 
 class FakeApp:
@@ -179,9 +184,9 @@ class TelegramTest(unittest.IsolatedAsyncioTestCase):
             seen.append(cmd)
             return "ok"
         for text, cmd in BUTTONS.items():
-            await tg.on_message({"chat": {"id": int(ADMIN)}, "text": text}, handle)
+            await tg.on_message({"chat": {"id": int(ADMIN)}, "from": {"id": int(ADMIN)}, "text": text}, handle)
         self.assertEqual(seen, list(BUTTONS.values()))
-        await tg.on_message({"chat": {"id": 1}, "text": "📊 状态"}, handle)  # not the admin: ignored
+        await tg.on_message({"chat": {"id": 1}, "from": {"id": 1}, "text": "📊 状态"}, handle)  # not the admin: ignored
         self.assertEqual(len(seen), len(BUTTONS))
         text, markup = tg.outbox.get_nowait()
         self.assertEqual(markup["keyboard"][0][0]["text"], "📊 状态")
@@ -196,13 +201,15 @@ class TelegramTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reply.markup["inline_keyboard"][0][0]["callback_data"], CONFIRM_PAUSE)
         self.assertFalse(e.paused)
         tg = FakeTelegram()
-        await tg.on_callback({"id": "cb1", "data": CONFIRM_PAUSE, "message": {"chat": {"id": int(ADMIN)}, "message_id": 9}}, handle)
+        await tg.on_callback({"id": "cb1", "data": CONFIRM_PAUSE, "from": {"id": int(ADMIN)},
+                              "message": {"chat": {"id": int(ADMIN)}, "message_id": 9}}, handle)
         self.assertTrue(e.paused)
         methods = [m for m, _ in tg.posts]
         self.assertEqual(methods, ["answerCallbackQuery", "editMessageText"])
         self.assertIn("已暂停", tg.posts[1][1]["text"])
         e.resume()
-        await tg.on_callback({"id": "cb2", "data": "cancel", "message": {"chat": {"id": int(ADMIN)}, "message_id": 10}}, handle)
+        await tg.on_callback({"id": "cb2", "data": "cancel", "from": {"id": int(ADMIN)},
+                              "message": {"chat": {"id": int(ADMIN)}, "message_id": 10}}, handle)
         self.assertFalse(e.paused)
         self.assertEqual(tg.posts[-1][1]["text"], "已取消")
 

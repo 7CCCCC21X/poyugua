@@ -49,6 +49,9 @@ class Settings:
     expiry_s: int = 30                 # the orders expire (GTD) this long before the start: the backstop of the cancel
     entry_s: int = 300                 # no new order this close to the start
     max_open_usd: D = D("0")           # the bot's own reservation cap (0 = only the balance limits it)
+    max_exposure_usd: D = D("0")       # the worst case of the unsettled positions (one-sided fills) at most this (0 = off)
+    max_daily_loss_usd: D = D("0")     # today's settled loss at most this, then no new quote until Beijing midnight (0 = off)
+    key_exclusive: bool = False        # on: the API key is the bot's alone (market sweeps and cancel-all may be used)
     weekend: bool = True               # off = no window starting Sat 00:00 - Mon 08:00 Beijing time
     max_attempts: int = 3              # a window level quoted at most this often after failures of its own
     poll_s: float = 5.0                # discovery poll
@@ -73,6 +76,7 @@ class Settings:
     clob_passphrase: str = ""
     telegram_token: str = ""
     telegram_chat: str = ""
+    telegram_admins: tuple[str, ...] = ()   # the Telegram user ids whose commands and buttons are obeyed
     web_key: str = ""                  # the web console's password (WEB_KEY); Telegram's Mini App signs in without it
     web_port: int = 0                  # the console listens here (Railway's PORT); 0 = no console
     web_url: str = ""                  # the console's public https address (WEB_URL, else Railway's RAILWAY_PUBLIC_DOMAIN)
@@ -190,6 +194,22 @@ def parse_levels(price_raw: str | None, shares_raw: str | None, levels_raw: str 
     return tuple(levels)
 
 
+def parse_admins(raw: str | None, chat: str) -> tuple[str, ...]:
+    """TELEGRAM_ADMIN_IDS: the user ids allowed to command the bot (comma or space separated). Unset, the private chat's
+    id (TELEGRAM_CHAT_ID of a private chat is its user's id); a group's id (negative) names no user."""
+    ids: list[str] = []
+    for part in re.split(r"[,\s]+", (raw or "").strip()):
+        if not part:
+            continue
+        if not re.fullmatch(r"[1-9]\d{0,15}", part):
+            raise ConfigError(f"TELEGRAM_ADMIN_IDS 里的 {part!r} 不是 Telegram 用户 ID（正整数，可以问 @userinfobot）")
+        if part not in ids:
+            ids.append(part)
+    if not ids and re.fullmatch(r"[1-9]\d{0,15}", chat or ""):
+        ids.append(chat)
+    return tuple(ids)
+
+
 def load_dotenv(path: str = ".env") -> None:
     """A local .env (KEY=VALUE lines) for running outside Railway; real environment variables win."""
     p = Path(path)
@@ -247,6 +267,12 @@ def from_env(env: dict[str, str] | None = None) -> Settings:
     if any(relayer) and not all(relayer):
         raise ConfigError("POLY_RELAYER_API_KEY 和 POLY_RELAYER_API_KEY_ADDRESS 要一起填")
     max_open = parse_decimal("PREOPEN_MAX_OPEN_USD", g("PREOPEN_MAX_OPEN_USD"), D("0"), D("0"), D("10000000"))
+    max_exposure = parse_decimal("PREOPEN_MAX_EXPOSURE_USD", g("PREOPEN_MAX_EXPOSURE_USD"), D("0"), D("0"), D("10000000"))
+    max_daily_loss = parse_decimal("PREOPEN_MAX_DAILY_LOSS_USD", g("PREOPEN_MAX_DAILY_LOSS_USD"), D("0"), D("0"), D("10000000"))
+    telegram_chat = (g("TELEGRAM_CHAT_ID") or "").strip()
+    telegram_admins = parse_admins(g("TELEGRAM_ADMIN_IDS"), telegram_chat)
+    if (g("TELEGRAM_BOT_TOKEN") or "").strip() and telegram_chat and not telegram_admins:
+        notes.append("TELEGRAM_CHAT_ID 是群组：要在 TELEGRAM_ADMIN_IDS 里写上管理员的用户 ID，Telegram 的命令、按钮和网页免密登录才会生效")
     web_key = (g("WEB_KEY") or g("WEB_CONTROL_KEY") or "").strip()
     if web_key and len(web_key) < 12:
         raise ConfigError("WEB_KEY 太短：至少 12 个字符（网页能暂停机器人、能看到余额）")
@@ -265,6 +291,9 @@ def from_env(env: dict[str, str] | None = None) -> Settings:
         expiry_s=expiry_s,
         entry_s=entry_s,
         max_open_usd=max_open,
+        max_exposure_usd=max_exposure,
+        max_daily_loss_usd=max_daily_loss,
+        key_exclusive=parse_bool("PREOPEN_KEY_EXCLUSIVE", g("PREOPEN_KEY_EXCLUSIVE"), False),
         weekend=parse_bool("PREOPEN_WEEKEND", g("PREOPEN_WEEKEND"), True),
         max_attempts=parse_int("PREOPEN_MAX_ATTEMPTS", g("PREOPEN_MAX_ATTEMPTS"), 3, 1, 20),
         poll_s=float(parse_decimal("PREOPEN_POLL_SECONDS", g("PREOPEN_POLL_SECONDS"), D("5"), D("1"), D("120"))),
@@ -287,7 +316,8 @@ def from_env(env: dict[str, str] | None = None) -> Settings:
         clob_secret=clob[1],
         clob_passphrase=clob[2],
         telegram_token=(g("TELEGRAM_BOT_TOKEN") or "").strip(),
-        telegram_chat=(g("TELEGRAM_CHAT_ID") or "").strip(),
+        telegram_chat=telegram_chat,
+        telegram_admins=telegram_admins,
         web_key=web_key,
         web_port=web_port,
         web_url=web_url,
@@ -317,6 +347,8 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_ENTRY_SECONDS", "距开场不足几秒不再新挂", "至少比撤单多 60 秒、比到期多 150 秒（GTD 订单要求到期在 3 分钟后；默认 300）"),
     ("PREOPEN_WEEKEND", "周末也挂", "off = 北京时间周六 00:00 到周一 08:00 开始的场次不挂"),
     ("PREOPEN_MAX_OPEN_USD", "资金上限（$）", "0 = 不限，只受余额限制：本程序挂单最多占用这么多 pUSD（Polymarket 的挂买单占用余额）"),
+    ("PREOPEN_MAX_EXPOSURE_USD", "持仓最坏亏损上限（$）", "0 = 不限：还没结算的场次里，单边成交（没配对的份数）最坏会亏的钱到了这个数，就撤掉没成交的挂单、不再新挂，结算后自动恢复"),
+    ("PREOPEN_MAX_DAILY_LOSS_USD", "日亏损上限（$）", "0 = 不限：今天（北京时间）已结算的亏损到了这个数，就撤掉没成交的挂单、今天不再新挂，零点后自动恢复"),
     ("PREOPEN_MAX_ATTEMPTS", "一档最多重报几次", "1～20：因这一场自身原因失败（单边被拒、被别人撤掉）后最多重新报价几次"),
     ("PREOPEN_AUTO_REDEEM", "自动领取", "on = 结算后自动领取赢的一边（智能钱包需要 Relayer Key，EOA 需要 POL 付 gas）；off = 到网页上手动领取"),
     ("PREOPEN_CANCEL_ON_EXIT", "退出时撤单", "on = 程序停止时撤掉全部挂单；off = 留在簿上，到期自动失效，重启后接管（保住排队位置）"),
@@ -326,6 +358,8 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_SNAPSHOT_SECONDS", "读账户挂单间隔（秒）", "2～300"),
     ("PREOPEN_ORDER_RATE", "本地下单限速（单/秒）", "Standard 档位 40/秒、突发 60；升档后可调高"),
     ("PREOPEN_CANCEL_RATE", "本地撤单限速（单/秒）", "Standard 档位 80/秒、突发 120"),
+    ("PREOPEN_KEY_EXCLUSIVE", "API Key 只给本程序用", "off（默认）= 只撤本程序自己签的单（按订单号/哈希），同一个 Key 下别的策略、网页上的挂单都不碰；"
+     "on = 确认这个 Key 只有本程序在用：到撤单时间再按市场整场扫一遍、紧急停止和切到模拟盘时一次撤光这个 Key 的全部挂单"),
 )
 CONTROL_KEY_SET = frozenset(k for k, _, _ in CONTROL_KEYS)
 CONTROL_FORMS: dict[str, dict] = {
@@ -341,6 +375,8 @@ CONTROL_FORMS: dict[str, dict] = {
     "PREOPEN_ENTRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["180", "240", "300", "600"], "unit": "秒"},
     "PREOPEN_WEEKEND": {"kind": "choice", "group": "预挂", "options": [["on", "on 周末照挂"], ["off", "off 周末不挂"]]},
     "PREOPEN_MAX_OPEN_USD": {"kind": "number", "group": "资金", "presets": ["0", "50", "100", "500", "1000", "5000", "20000"], "unit": "$", "zero": "不限"},
+    "PREOPEN_MAX_EXPOSURE_USD": {"kind": "number", "group": "资金", "presets": ["0", "20", "50", "100", "500"], "unit": "$", "zero": "不限"},
+    "PREOPEN_MAX_DAILY_LOSS_USD": {"kind": "number", "group": "资金", "presets": ["0", "20", "50", "100", "500"], "unit": "$", "zero": "不限"},
     "PREOPEN_MAX_ATTEMPTS": {"kind": "number", "group": "资金", "presets": ["1", "2", "3", "5"], "unit": "次"},
     "PREOPEN_AUTO_REDEEM": {"kind": "choice", "group": "资金", "options": [["on", "on 自动领取"], ["off", "off 手动领取"]]},
     "PREOPEN_CANCEL_ON_EXIT": {"kind": "choice", "group": "资金", "options": [["off", "off 留在簿上"], ["on", "on 退出时撤单"]]},
@@ -350,6 +386,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "PREOPEN_SNAPSHOT_SECONDS": {"kind": "number", "group": "高级", "presets": ["5", "10", "20"], "unit": "秒"},
     "PREOPEN_ORDER_RATE": {"kind": "number", "group": "高级", "presets": ["20", "30", "60", "150"], "unit": "单/秒"},
     "PREOPEN_CANCEL_RATE": {"kind": "number", "group": "高级", "presets": ["40", "60", "120", "300"], "unit": "单/秒"},
+    "PREOPEN_KEY_EXCLUSIVE": {"kind": "choice", "group": "高级", "options": [["off", "off 只撤本程序的单"], ["on", "on Key 只给本程序用"]]},
 }
 
 
@@ -413,6 +450,8 @@ def current_values(s: Settings) -> dict[str, str]:
         "PREOPEN_ENTRY_SECONDS": str(s.entry_s),
         "PREOPEN_WEEKEND": "on" if s.weekend else "off",
         "PREOPEN_MAX_OPEN_USD": fmt_num(s.max_open_usd),
+        "PREOPEN_MAX_EXPOSURE_USD": fmt_num(s.max_exposure_usd),
+        "PREOPEN_MAX_DAILY_LOSS_USD": fmt_num(s.max_daily_loss_usd),
         "PREOPEN_MAX_ATTEMPTS": str(s.max_attempts),
         "PREOPEN_AUTO_REDEEM": "on" if s.auto_redeem else "off",
         "PREOPEN_CANCEL_ON_EXIT": "on" if s.cancel_on_exit else "off",
@@ -422,4 +461,5 @@ def current_values(s: Settings) -> dict[str, str]:
         "PREOPEN_SNAPSHOT_SECONDS": fmt_num(D(str(s.snapshot_s))),
         "PREOPEN_ORDER_RATE": fmt_num(D(str(s.order_rate))),
         "PREOPEN_CANCEL_RATE": fmt_num(D(str(s.cancel_rate))),
+        "PREOPEN_KEY_EXCLUSIVE": "on" if s.key_exclusive else "off",
     }

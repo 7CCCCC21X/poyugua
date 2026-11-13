@@ -4,8 +4,14 @@ LIVE=off and the tests. The engine sees only this module's types, so an SDK chan
 Outcomes of a placement, per order:
     open       the CLOB accepted it (its id is known)
     rejected   the CLOB refused it outright (post-only would cross, an invalid field, the balance): nothing rests
-    not_sent   nothing was sent (signing failed, the local rate limit, a restriction answered before processing)
-    unknown    sent, and the answer was lost (a timeout, a 5xx): it may rest on the book
+    not_sent   nothing was processed: signing failed, the request never left, or the answer says in so many words that it
+               was turned away before processing (429, 425 restarting, 503 cancel-only / post-only / trading disabled,
+               401/403 at the gate)
+    unknown    sent, and whether it was processed is not known (a timeout, a lost answer, any other 5xx): it may rest
+
+Every order is signed before anything is sent and the caller is handed the orders' hashes (`on_signed`) before the first
+POST: the caller writes them down first, so an order the process loses track of (a crash mid-send) is still found by its
+hash, cancelled by it and its fills read from the trades.
 """
 from __future__ import annotations
 
@@ -15,7 +21,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal as D
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 LOG = logging.getLogger(__name__)
 BATCH = 15                      # POST /orders takes 1 to 15 orders
@@ -28,6 +34,9 @@ RETRYABLE_CODES = {"market_not_ready", "post_only_mode", "post_only", "rate_limi
 
 def retryable(code: str) -> bool:
     return code in RETRYABLE_CODES or code.startswith("http_5")
+
+
+OnSigned = Callable[[list[tuple[str, str, int]]], None]   # [(ref, hash, salt)] of the orders signed, before any is sent
 TERMINAL = {"MATCHED", "INVALID", "EXPIRED", "FILLED", "REJECTED"}  # ...and every CANCELED* status
 
 STANDARD_EXCHANGE = "0xE111180000d2663C0091e4f400237545B87B996B"
@@ -108,14 +117,16 @@ class Exchange(Protocol):
     async def start(self) -> None: ...
     async def close(self) -> None: ...
     def prime(self, listing: Any) -> None: ...
-    async def place(self, specs: list[OrderSpec]) -> list[Placed]: ...
+    async def place(self, specs: list[OrderSpec], on_signed: OnSigned | None = None) -> list[Placed]: ...
     async def cancel(self, ids: list[str]) -> Cancelled: ...
-    async def cancel_market(self, condition_id: str) -> Cancelled: ...
-    async def cancel_all(self) -> Cancelled: ...
+    async def cancel_market(self, condition_id: str) -> Cancelled: ...   # every order of the API key on a market
+    async def cancel_all(self) -> Cancelled: ...                          # every order of the API key
     async def open_orders(self) -> list[Row]: ...
     async def order(self, order_id: str) -> Row | None: ...
+    async def fills(self, condition_id: str) -> dict[str, D]: ...       # order id -> shares bought, from the trades
     async def balance(self) -> D: ...
     async def redeem(self, condition_id: str) -> str: ...
+    def identity(self) -> str: ...                                        # the account the orders belong to
 
 
 class Bucket:
@@ -175,6 +186,38 @@ def _is_v2_position(asset: str) -> bool:
         return bool(is_v2_position_id(asset))
     except Exception:
         return False
+
+
+DISABLED_TEXTS = ("trading is currently disabled", "trading disabled", "trading is disabled")
+
+
+def refused_before_processing(error: Any) -> str:
+    """The code of an HTTP refusal that says the request was turned away before any order in it was processed, or "".
+    425 (the matching engine restarting) and a 503 the SDK recognised as cancel-only or post-only mode, or whose text
+    says trading is disabled; 401/403 (the key, the signature or the region refused at the gate). Any other 5xx (a
+    gateway timing out, a proxy's 502/503/504) may come after the orders were processed: not this."""
+    if error.restriction:
+        return str(error.restriction)
+    if error.status == 425:
+        return "restarting"
+    if error.status in (401, 403):
+        return "auth"
+    if error.status == 503 and any(t in str(error).lower() for t in DISABLED_TEXTS):
+        return "trading_disabled"
+    return ""
+
+
+def _no_such_order(error: BaseException) -> bool:
+    """Whether an unreadable single-order answer was an empty one (null, {}): the CLOB has no order with that id."""
+    cause = error.__cause__
+    try:
+        from pydantic import ValidationError
+    except ImportError:  # pragma: no cover
+        return False
+    if not isinstance(cause, ValidationError):
+        return False
+    inputs = [e.get("input") for e in cause.errors()]
+    return bool(inputs) and all(i is None or i == {} or i == "" or i == [] for i in inputs)
 
 
 def _cause_not_sent(error: BaseException) -> bool:
@@ -253,7 +296,9 @@ class LiveExchange:
         except Exception as error:
             LOG.debug("prime %s: %s", getattr(listing, "slug", "?"), error)
 
-    async def place(self, specs: list[OrderSpec]) -> list[Placed]:
+    async def place(self, specs: list[OrderSpec], on_signed: OnSigned | None = None) -> list[Placed]:
+        """Sign every order, hand the hashes to `on_signed` (the caller writes them down: if that raises, nothing is
+        sent), then POST them in batches of 15."""
         from polymarket import PolymarketError, RateLimitError, RequestRejectedError, UserInputError
         out: dict[str, Placed] = {}
         signed: list[tuple[OrderSpec, Any, str]] = []
@@ -268,6 +313,8 @@ class LiveExchange:
                 out[spec.ref] = Placed(spec.ref, "not_sent", code="sign_failed", message=str(error) or type(error).__name__)
                 continue
             signed.append((spec, order, order_hash(order, neg_risk=spec.neg_risk)))
+        if signed and on_signed is not None:
+            on_signed([(spec.ref, h, int(o.salt)) for spec, o, h in signed])  # durable before the first byte is sent
         stopped: Placed | None = None
         for i in range(0, len(signed), BATCH):
             batch = signed[i:i + BATCH]
@@ -279,7 +326,7 @@ class LiveExchange:
             await self.orders.take(len(batch))
             try:
                 responses = await self.client.post_orders([o for _, o, _ in batch])
-            except RateLimitError as error:
+            except RateLimitError as error:  # refused at the gate: nothing processed
                 stopped = Placed("", "not_sent", code="rate_limited", message=f"下单被限流（429）：{error}",
                                  wait=float(error.retry_after or 10.0))
                 for spec, o, h in batch:
@@ -287,17 +334,20 @@ class LiveExchange:
                                            salt=int(o.salt), wait=stopped.wait)
                 continue
             except RequestRejectedError as error:
-                if error.restriction or error.status in (401, 403, 425, 503):
-                    code = error.restriction or ("auth" if error.status in (401, 403) else "trading_disabled")
+                code = refused_before_processing(error)
+                if code:
                     wait = float(error.retry_after or (2.0 if code == "restarting" else 60.0 if code == "auth" else 30.0))
                     stopped = Placed("", "not_sent", code=code, message=f"下单被拒（{error.status} {code}）：{error}", wait=wait)
                     for spec, o, h in batch:
                         out[spec.ref] = Placed(spec.ref, "not_sent", code=code, message=stopped.message, hash=h,
                                                salt=int(o.salt), wait=wait)
                     continue
-                status = "rejected" if 400 <= error.status < 500 else "unknown"
+                # a 4xx is the request refused as it stood (nothing rests); a 5xx without those words, a 408 or a 409
+                # may come after processing: unknown, looked for by the hash
+                refused = 400 <= error.status < 500 and error.status not in (408, 409)
                 for spec, o, h in batch:
-                    out[spec.ref] = Placed(spec.ref, status, code=f"http_{error.status}", message=str(error), hash=h, salt=int(o.salt))
+                    out[spec.ref] = Placed(spec.ref, "rejected" if refused else "unknown", code=f"http_{error.status}",
+                                           message=str(error), hash=h, salt=int(o.salt))
                 continue
             except PolymarketError as error:  # a transport failure or a malformed answer: sent or not, unknown
                 status = "not_sent" if _cause_not_sent(error) else "unknown"
@@ -383,13 +433,37 @@ class LiveExchange:
         return rows
 
     async def order(self, order_id: str) -> Row | None:
-        from polymarket import RequestRejectedError
+        """One order by id, open or not; None when the CLOB has no order with that id (404, 400, an empty answer)."""
+        from polymarket import RequestRejectedError, UnexpectedResponseError
         try:
             return _row(await self.client.get_order(order_id=order_id))
         except RequestRejectedError as error:
             if error.status in (400, 404):
                 return None
             raise
+        except UnexpectedResponseError as error:
+            if _no_such_order(error):
+                return None
+            raise
+
+    async def fills(self, condition_id: str) -> dict[str, D]:
+        """What each of this account's orders bought on a market, from its trade history (order id -> shares): the
+        bot's orders are post-only, so they are the maker orders of the trades."""
+        out: dict[str, D] = {}
+        async for page in self.client.list_account_trades(market=condition_id):
+            for t in page.items:
+                if str(getattr(t, "status", "")).upper() == "FAILED":
+                    continue  # never settled on chain: no shares came of it
+                for m in t.maker_orders:
+                    oid = str(m.order_id)
+                    out[oid] = out.get(oid, D(0)) + D(str(m.matched_amount))
+        return out
+
+    def identity(self) -> str:
+        """The account the orders and records belong to: the wallet (the funds) and the signer (the API key's owner,
+        which alone can cancel them)."""
+        signer = str(getattr(self.client, "signer", "") or "")
+        return f"{self.wallet.lower()}|{signer.lower()}"
 
     async def balance(self) -> D:
         b = await self.client.get_balance_allowance(asset_type="COLLATERAL")
@@ -420,6 +494,8 @@ class PaperExchange:
         self.reject: dict[str, tuple[str, str]] = {}   # ref -> (status, code) the next placement of that ref answers (tests)
         self.fail_place: Exception | None = None
         self.fail_cancel: Exception | None = None
+        self.fail_read: Exception | None = None      # set: every order() and fills() raises it (tests)
+        self.fail_balance: Exception | None = None   # set: every balance() raises it (tests)
         self.markets: dict[str, str] = {}      # asset -> condition id (rows of the paper book carry it)
 
     async def start(self) -> None:
@@ -431,22 +507,30 @@ class PaperExchange:
     def prime(self, listing: Any) -> None:
         return None
 
-    async def place(self, specs: list[OrderSpec]) -> list[Placed]:
+    def identity(self) -> str:
+        return "paper"
+
+    async def place(self, specs: list[OrderSpec], on_signed: OnSigned | None = None) -> list[Placed]:
+        """As live: every order "signed" (its id, which is its hash, drawn) and handed to `on_signed` before any rests."""
         if self.fail_place is not None:
             error, self.fail_place = self.fail_place, None
             raise error
+        ids = []
+        for _ in specs:
+            self.seq += 1
+            ids.append(("0x" + format(self.seq, "064x"), self.seq))
+        if on_signed is not None:
+            on_signed([(spec.ref, oid, salt) for spec, (oid, salt) in zip(specs, ids)])
         out = []
-        for spec in specs:
+        for spec, (oid, salt) in zip(specs, ids):
             if spec.ref in self.reject:
                 status, code = self.reject.pop(spec.ref)
-                out.append(Placed(spec.ref, status, code=code, message=code))
+                out.append(Placed(spec.ref, status, code=code, message=code, hash=oid, salt=salt))
                 continue
-            self.seq += 1
-            oid = "0x" + format(self.seq, "064x")
             self.placed.append(spec)
             self.book[oid] = Row(id=oid, asset=spec.asset, market=spec.market or self.markets.get(spec.asset, ""), side="BUY", price=spec.price,
                                  size=spec.size, matched=D(0), status="LIVE", created=self.clock())
-            out.append(Placed(spec.ref, "open", order_id=oid, hash=oid, salt=self.seq))
+            out.append(Placed(spec.ref, "open", order_id=oid, hash=oid, salt=salt))
         return out
 
     async def cancel(self, ids: list[str]) -> Cancelled:
@@ -477,10 +561,20 @@ class PaperExchange:
         return [Row(**vars(r)) for r in self.book.values()]
 
     async def order(self, order_id: str) -> Row | None:
+        if self.fail_read is not None:
+            raise self.fail_read
         row = self.book.get(order_id) or self.gone.get(order_id)
         return Row(**vars(row)) if row else None
 
+    async def fills(self, condition_id: str) -> dict[str, D]:
+        if self.fail_read is not None:
+            raise self.fail_read
+        return {oid: row.matched for oid, row in {**self.gone, **self.book}.items()
+                if row.market == condition_id and row.matched > 0}
+
     async def balance(self) -> D:
+        if self.fail_balance is not None:
+            raise self.fail_balance
         return self.cash
 
     async def redeem(self, condition_id: str) -> str:

@@ -5,7 +5,7 @@ fills and the problems, and pause / resume.
     GET  /health       "ok", no sign-in
     POST /api/login    {"key": WEB_KEY} -> a session cookie
     GET  /api/status   the engine's report (signed in)
-    POST /api/action   {"action": "pause" | "resume"} (signed in)
+    POST /api/action   {"action": "pause" | "resume" | "emergency" | "withdraw" | "rebind"} (signed in)
 
 Signing in: inside Telegram the page is a Mini App (the bot's menu button), and the request carries Telegram's signed
 initData, checked with the bot token and the admin's user id: no password. In a browser, WEB_KEY once (a cookie keeps
@@ -38,9 +38,9 @@ def session_token(web_key: str) -> str:
     return hmac.new(web_key.encode(), b"preopen-web-session", hashlib.sha256).hexdigest()
 
 
-def check_init_data(init_data: str, bot_token: str, admin_id: str, now: float | None = None) -> bool:
+def check_init_data(init_data: str, bot_token: str, admins: Any, now: float | None = None) -> bool:
     """Telegram Mini App initData: signed with the bot token (HMAC-SHA256, key = HMAC("WebAppData", token)), fresh,
-    and from the admin (the user id equals TELEGRAM_CHAT_ID, which for a private chat is the user's id)."""
+    and from an admin (a user id in TELEGRAM_ADMIN_IDS; by default TELEGRAM_CHAT_ID, a private chat's user)."""
     if not init_data or not bot_token:
         return False
     try:
@@ -63,7 +63,8 @@ def check_init_data(init_data: str, bot_token: str, admin_id: str, now: float | 
         return False
     if (now or time.time()) - auth_date > INIT_DATA_MAX_AGE_S:
         return False
-    return str(user.get("id", "")) == str(admin_id).strip() and bool(str(admin_id).strip())
+    allowed = {str(a).strip() for a in ([admins] if isinstance(admins, (str, int)) else admins or ()) if str(a).strip()}
+    return str(user.get("id", "")) in allowed
 
 
 class WebServer:
@@ -235,7 +236,7 @@ nav { display:flex; gap:6px; margin-top:8px; overflow-x:auto; }
 nav a { padding:6px 14px; border-radius:999px; text-decoration:none; color:var(--text); background:var(--card); border:1px solid var(--line); white-space:nowrap; }
 nav a.on { background:var(--accent); color:#fff; border-color:var(--accent); }
 .ops { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; }
-.cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin-bottom:12px; }
+.cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(135px,1fr)); gap:10px; margin-bottom:12px; }
 .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px; }
 .card .k { color:var(--muted); font-size:12px; } .card .v { font-size:20px; font-weight:600; margin-top:2px; } .card .s { color:var(--muted); font-size:12px; }
 section { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px; margin-bottom:12px; }
@@ -291,6 +292,7 @@ select { font:inherit; padding:5px 8px; border-radius:8px; border:1px solid var(
     <div class="ops"><button id="pauseBtn" class="secondary">⏸ 暂停并撤单</button><button id="resumeBtn">▶️ 恢复挂单</button><button id="emergencyBtn" class="danger">🛑 紧急停止</button></div>
 
     <div id="tab-overview">
+      <div id="blocked" class="notice" hidden><span id="blockedText"></span> <button id="rebindBtn" class="danger">改绑当前账户</button></div>
       <div id="hold" class="notice" hidden></div>
       <div class="cards" id="cards"></div>
       <div class="grid2">
@@ -407,7 +409,8 @@ function renderTop(d) {
 function card(k, v, s) { return `<div class="card"><div class="k">${esc(k)}</div><div class="v">${v}</div><div class="s">${s || ""}</div></div>`; }
 const STATE = {open:"挂着", placing:"发送中", unknown:"状态不明", gone:"已撤/核对中", final:"已结束", rejected:"被拒", not_sent:"没发出", not_found:"没挂上"};
 function renderOverview(d) {
-  const hold = d.hold || d.cooldown;
+  $("blocked").hidden = !d.blocked; $("blockedText").textContent = d.blocked ? "⛔ " + d.blocked : "";
+  const hold = d.blocked ? "" : (d.hold || d.cooldown);
   $("hold").hidden = !hold && !d.budget_note; $("hold").textContent = [hold && ("暂不新挂：" + hold), d.budget_note && ("资金：" + d.budget_note)].filter(Boolean).join("　");
   const t = d.today || {};
   $("cards").innerHTML = [
@@ -417,6 +420,8 @@ function renderOverview(d) {
     card("今天盈亏", signed(t.pnl || 0), "已结算部分"),
     card("开放→挂上", d.lags.open == null ? "—" : d.lags.open + " 秒", "中位（市场约在创建后 75～90 秒开放）"),
     card("撤单确认", d.lags.cancel == null ? "—" : "开场前 " + d.lags.cancel + " 秒", "中位"),
+    card("持仓最坏亏损", money(d.exposure), (d.limits.exposure ? `上限 ${money(d.limits.exposure)}` : "未设上限") +
+      (d.limits.daily_loss ? `；日亏损上限 ${money(d.limits.daily_loss)}` : "") + (d.risk ? `<br><span class="warn">${esc(d.risk)}</span>` : "")),
   ].join("");
   const s = d.settings;
   const nxt = d.next_listing ? `${d.next_listing.start}（预计 ${d.next_listing.expected} 发布）` : "范围内都已发布";
@@ -425,6 +430,8 @@ function renderOverview(d) {
     ["时间", `开场前 ${s.ahead_min} 分钟内的场次；开场前 ${s.cancel_s} 秒撤单、${s.expiry_s} 秒到期、${s.entry_s} 秒内不新挂` + (s.weekend ? "" : "；周末不挂")],
     ["已发布到", d.listed_until || "—"], ["下一场", nxt], ["账户快照", d.snapshot_age == null ? "还没读到" : d.snapshot_age + " 秒前"],
     ["队列", `排队 ${d.queue}，等候 ${d.waiting}，正在挂 ${d.placing}`],
+    ["余额", d.balance_age == null ? "还没读到" : d.balance_age + " 秒前读到"],
+    ["撤单范围", d.key_exclusive ? "整个 API Key（PREOPEN_KEY_EXCLUSIVE=on）" : "只撤本程序签的单"],
     ["订单号=哈希", d.id_is_hash == null ? "未知" : (d.id_is_hash ? "是" : "否")], ["限流档位", d.tier || "未知"], ["发布提前量", d.lead_h + " 小时"],
   ].map(([k, v]) => `<div>${esc(k)}</div><div>${esc(v)}</div>`).join("");
   const pend = (d.pending || []).map((p) => `<div>⚠️ ${esc(p.what)}：${esc(p.window)} ${esc(p.side)}（${esc(p.since)}）<span class="muted small">${esc(p.note)}</span></div>`);
@@ -490,7 +497,7 @@ function toggleCoin(c) {
 }
 async function saveSetting(name, value) {
   if (name === "LIVE") {
-    const q = value === "on" ? "切到真实下单？程序会自动重启，之后用真钱挂单。" : "切到模拟盘？会先撤掉账户里本程序 API Key 的全部真实挂单，然后程序自动重启。";
+    const q = value === "on" ? "切到真实下单？程序会自动重启，之后用真钱挂单。" : "切到模拟盘？会先撤掉本程序的全部真实挂单（PREOPEN_KEY_EXCLUSIVE=on 时撤掉这个 API Key 的全部挂单），然后程序自动重启。";
     if (!(await ask(q))) return;
   }
   await change({name, value});
@@ -566,7 +573,8 @@ async function act(action, question, extra) {
 }
 $("pauseBtn").onclick = () => act("pause", "暂停新挂，并撤掉本程序的全部挂单？");
 $("resumeBtn").onclick = () => act("resume", "恢复挂单？");
-$("emergencyBtn").onclick = () => act("emergency", "紧急停止：暂停，并一次撤掉这个 API Key 的全部挂单？");
+$("emergencyBtn").onclick = () => act("emergency", "紧急停止：暂停，并马上撤掉本程序的全部挂单（PREOPEN_KEY_EXCLUSIVE=on 时一次撤光这个 API Key 的全部挂单）？");
+$("rebindBtn").onclick = () => act("rebind", "确定把账本改绑到当前账户吗？旧账户的记录不再接管（它们的挂单请先到 Polymarket 撤掉，否则到期才失效），程序会重启。");
 window.addEventListener("hashchange", () => go((location.hash || "").slice(1)));
 go(state.tab);
 </script>

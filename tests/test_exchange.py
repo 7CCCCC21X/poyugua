@@ -139,6 +139,83 @@ class LiveExchangeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.not_canceled, {"c": "order not found"})
 
 
+class HashFirstTest(unittest.IsolatedAsyncioTestCase):
+    async def test_the_hashes_are_handed_over_before_the_first_post(self):
+        x, c = live()
+        c.answers = [[accepted("0x" + "01" * 32), accepted("0x" + "02" * 32)]]
+        seen = []
+        out = await x.place(specs(2), on_signed=lambda hashes: seen.append((list(hashes), len(c.posted))))
+        (hashes, posted_then), = seen
+        self.assertEqual(posted_then, 0)  # written down while nothing had been sent
+        self.assertEqual([ref for ref, _, _ in hashes], ["q0/up", "q1/down"])
+        self.assertEqual([h for _, h, _ in hashes], [r.hash for r in out])
+        self.assertEqual([salt for _, _, salt in hashes], [1, 2])
+
+    async def test_a_failed_write_sends_nothing(self):
+        x, c = live()
+        c.answers = [[accepted("0x" + "01" * 32)]]
+
+        def disk_full(hashes):
+            raise OSError("disk full")
+        with self.assertRaises(OSError):
+            await x.place(specs(1), on_signed=disk_full)
+        self.assertEqual(c.posted, [])
+
+    async def test_only_an_explicit_refusal_counts_as_not_sent(self):
+        cases = [
+            (RequestRejectedError("Service Unavailable", status=503), "unknown", "http_503"),  # a bare 503: maybe processed
+            (RequestRejectedError("Trading is currently disabled. Check polymarket.com for updates", status=503), "not_sent", "trading_disabled"),
+            (RequestRejectedError("Trading is currently cancel-only", status=503, restriction="cancel_only"), "not_sent", "cancel_only"),
+            (RequestRejectedError("post only mode", status=503, code="post_only_mode", restriction="post_only"), "not_sent", "post_only"),
+            (RequestRejectedError("restarting", status=425, restriction="restarting"), "not_sent", "restarting"),
+            (RequestRejectedError("forbidden", status=403), "not_sent", "auth"),
+            (RequestRejectedError("bad gateway", status=502), "unknown", "http_502"),
+            (RequestRejectedError("gateway timeout", status=504), "unknown", "http_504"),
+            (RequestRejectedError("request timeout", status=408), "unknown", "http_408"),
+            (RequestRejectedError("conflict", status=409), "unknown", "http_409"),
+            (RequestRejectedError("bad", status=400), "rejected", "http_400"),
+        ]
+        for error, status, code in cases:
+            x, c = live()
+            c.answers = [error]
+            out = await x.place(specs(2))
+            with self.subTest(error=str(error), status=error.status):
+                self.assertEqual({r.status for r in out}, {status})
+                self.assertEqual({r.code for r in out}, {code})
+                self.assertTrue(all(r.hash for r in out))  # signed: its hash known whatever became of it
+
+    async def test_an_empty_order_answer_is_no_such_order(self):
+        from polymarket import UnexpectedResponseError
+        from polymarket.models.clob.account import OpenOrder
+        x, c = live()
+
+        async def empty(order_id):
+            return OpenOrder.parse_response(None)  # what the SDK makes of a null body
+        c.get_order = empty
+        self.assertIsNone(await x.order("0x" + "ab" * 32))
+
+        async def garbled(order_id):
+            raise UnexpectedResponseError("something else")
+        c.get_order = garbled
+        with self.assertRaises(UnexpectedResponseError):  # not an answer: no conclusion
+            await x.order("0x" + "ab" * 32)
+
+    async def test_fills_add_up_the_maker_orders_of_the_trades(self):
+        from types import SimpleNamespace as N
+        x, c = live()
+        trades = [N(status="CONFIRMED", maker_orders=[N(order_id="0xa", matched_amount="4"), N(order_id="0xb", matched_amount="1")]),
+                  N(status="MATCHED", maker_orders=[N(order_id="0xa", matched_amount="6")]),
+                  N(status="FAILED", maker_orders=[N(order_id="0xa", matched_amount="10")])]  # never settled
+        asked = []
+
+        def list_account_trades(market):
+            asked.append(market)
+            return _Paginator(trades)
+        c.list_account_trades = list_account_trades
+        self.assertEqual(await x.fills("0xc"), {"0xa": D("10"), "0xb": D("1")})
+        self.assertEqual(asked, ["0xc"])
+
+
 class _Page:
     def __init__(self, items):
         self.items = items

@@ -4,7 +4,8 @@ and the review — what preopen/web.py serves.
 A saved setting beats the environment variable of the same name, takes effect at once (Engine.apply_settings: a resting
 quote that no longer fits is withdrawn and quoted again, one that fits keeps its queue place) and is kept in
 <PREOPEN_DB stem>.control.json, so a restart runs on it too. LIVE is the one that needs a restart: switching it saves the
-value and starts the process again (leaving live trading, every open order of the API key is cancelled first).
+value and starts the process again (leaving live trading, every order the bot signed is cancelled first; with
+PREOPEN_KEY_EXCLUSIVE=on every open order of the API key).
 """
 from __future__ import annotations
 
@@ -108,15 +109,17 @@ class Console:
         return True, text
 
     async def switch_live(self, new: config.Settings) -> str:
-        """LIVE switched on the page: saved; leaving live trading, every open order of the API key is cancelled and the
-        records withdrawn first; then the process starts again in the new mode."""
+        """LIVE switched on the page: saved; leaving live trading, the bot's orders are cancelled (by id, an unknown one
+        by its hash; with PREOPEN_KEY_EXCLUSIVE=on every open order of the API key at once) and the records withdrawn
+        first; then the process starts again in the new mode."""
         e = self.engine
         if e.s.live and not new.live:
-            try:
-                r = await e.x.cancel_all()
-                e.mark_cancelled(r)
-            except Exception as error:
-                LOG.warning("切换到模拟盘：一次撤光失败：%s", error)
+            if e.s.key_exclusive:
+                try:
+                    r = await e.x.cancel_all()
+                    e.mark_cancelled(r)
+                except Exception as error:
+                    LOG.warning("切换到模拟盘：一次撤光失败：%s", error)
             left = await e.withdraw_all("切换到模拟盘", deadline_s=30)
             text = "已切到模拟盘：真实挂单已撤" + (f"（还可能挂着 {left} 张，到期自动失效）" if left else "") + "，程序正在重启"
         else:
@@ -138,6 +141,8 @@ class Console:
             return await e.emergency()
         if name == "withdraw":
             return e.withdraw(str(body.get("key") or ""))
+        if name == "rebind":
+            return e.rebind()
         raise ValueError(f"unknown action {name}")
 
-    ACTIONS = ("pause", "resume", "emergency", "withdraw")
+    ACTIONS = ("pause", "resume", "emergency", "withdraw", "rebind")

@@ -5,7 +5,8 @@ Buttons:
                                           Telegram) when the service has a public domain; the command list otherwise
     the keyboard under the input          📊 状态  🩺 体检 / 🔎 探测  🌐 网页 / ⏸ 暂停  ▶️ 恢复
     ⏸ 暂停                               asks first (an inline 确认 / 取消), then withdraws every resting order
-Commands (only from TELEGRAM_CHAT_ID): /status /check /probe [h] /web /pause /resume /help
+Commands: /status /check /probe [h] /web /pause /resume /help — obeyed only in TELEGRAM_CHAT_ID and only from a user
+in TELEGRAM_ADMIN_IDS (by default the private chat's own user): in a group, a member who is not an admin is ignored.
 """
 from __future__ import annotations
 
@@ -55,8 +56,11 @@ def web_markup(url: str) -> dict:
 
 
 class Telegram:
-    def __init__(self, token: str, chat_id: str, http: httpx.AsyncClient | None = None, web_url: str = ""):
+    def __init__(self, token: str, chat_id: str, http: httpx.AsyncClient | None = None, web_url: str = "",
+                 admins: tuple[str, ...] | list[str] | None = None):
         self.token, self.chat_id = token, str(chat_id).strip()
+        # the users whose commands are obeyed: by default the private chat's own user (its id is the chat's)
+        self.admins = {str(a).strip() for a in (admins if admins is not None else [self.chat_id]) if str(a).strip().isdigit()}
         self.web_url = web_url
         self.http = http or httpx.AsyncClient(timeout=40)
         self.outbox: asyncio.Queue[tuple[str, dict | None]] = asyncio.Queue(maxsize=500)
@@ -114,8 +118,12 @@ class Telegram:
                     await asyncio.sleep(3 * (attempt + 1))
             await asyncio.sleep(1.0)
 
+    def allowed(self, chat: dict | None, user: dict | None) -> bool:
+        """The admin chat, and in it an admin: a group's other members (and anyone elsewhere) are ignored."""
+        return str((chat or {}).get("id")) == self.chat_id and str((user or {}).get("id")) in self.admins
+
     async def on_message(self, msg: dict, handle: Handler) -> None:
-        if str((msg.get("chat") or {}).get("id")) != self.chat_id:
+        if not self.allowed(msg.get("chat"), msg.get("from")):
             return
         text = str(msg.get("text") or "").strip()
         if text in BUTTONS:
@@ -136,7 +144,7 @@ class Telegram:
 
     async def on_callback(self, cb: dict, handle: Handler) -> None:
         msg = cb.get("message") or {}
-        mine = str((msg.get("chat") or {}).get("id")) == self.chat_id
+        mine = self.allowed(msg.get("chat"), cb.get("from"))
         data = str(cb.get("data") or "")
         result = "只接受管理员的操作"
         if mine:

@@ -6,7 +6,7 @@ from decimal import Decimal as D
 from helpers import T0, Clock, FakePublic, drain, make_engine, settings, tick, unpark
 
 from preopen import markets as mk
-from preopen.exchange import PaperExchange
+from preopen.exchange import OrderSpec, PaperExchange
 from preopen.ledger import Ledger
 
 
@@ -184,8 +184,8 @@ class CancelTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(e.reserved(), D(0))
         self.assertTrue(e.cancel_lags)
 
-    async def test_failed_cancel_is_backed_by_the_market_sweep(self):
-        e, clock, pub, x = make_engine()
+    async def test_failed_cancel_is_backed_by_the_market_sweep_only_on_an_exclusive_key(self):
+        e, clock, pub, x = make_engine(settings(PREOPEN_KEY_EXCLUSIVE="on"))
         start = T0 + 1800
         m = pub.list_window("btc", start)
         await tick(e)
@@ -196,6 +196,24 @@ class CancelTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({o["state"] for o in quotes(e)[0]["orders"].values()}, {"gone"})
         await e.cancel_pass()
         self.assertEqual(len(x.market_cancels), 1)  # once
+
+    async def test_a_shared_key_is_never_swept_by_market(self):
+        e, clock, pub, x = make_engine()  # PREOPEN_KEY_EXCLUSIVE off (the default): another strategy may use the key
+        start = T0 + 1800
+        m = pub.list_window("btc", start)
+        await tick(e)
+        other = await x.place([OrderSpec("other/up", quotes(e)[0]["orders"]["up"]["asset"],
+                                         D("0.49"), D("10"), start + 30, market=m["conditionId"])])  # same token, price, size
+        clock.t = start - 60
+        x.fail_cancel = RuntimeError("boom")
+        await e.cancel_pass()
+        self.assertEqual(x.market_cancels, [])
+        await tick(e, 2)  # the cancel by id sprints every 2 s
+        self.assertEqual({o["state"] for o in quotes(e)[0]["orders"].values()}, {"gone"})
+        self.assertIn(other[0].order_id, x.book)  # the other strategy's identical order is left alone
+        for _ in range(5):
+            await tick(e, 2)
+        self.assertIn(other[0].order_id, x.book)
 
     async def test_failed_cancel_sprints_every_two_seconds(self):
         e, clock, pub, x = make_engine()
@@ -362,7 +380,7 @@ class RefusalTest(unittest.IsolatedAsyncioTestCase):
 
 
 class UnknownTest(unittest.IsolatedAsyncioTestCase):
-    async def test_unknown_placement_is_found_in_the_open_orders(self):
+    async def test_unknown_placement_is_found_in_the_open_orders_by_its_hash(self):
         e, clock, pub, x = make_engine()
         start = T0 + 1800
         pub.list_window("btc", start)
@@ -370,40 +388,58 @@ class UnknownTest(unittest.IsolatedAsyncioTestCase):
         await e.discover()
         real_place = x.place
 
-        async def lost_answer(specs):
-            await real_place(specs)  # placed, but the answer never came back
+        async def lost_answer(specs, on_signed=None):
+            await real_place(specs, on_signed)  # placed, but the answer never came back
             raise TimeoutError("read timeout")
         x.place = lost_answer
         await drain(e)
         q = quotes(e)[0]
         self.assertEqual({o["state"] for o in q["orders"].values()}, {"unknown"})
+        self.assertTrue(all(o["hash"] for o in q["orders"].values()))  # written down before the send
         await tick(e, 5)
         q = quotes(e)[0]
         self.assertEqual({o["state"] for o in q["orders"].values()}, {"open"})
-        self.assertEqual(q["phase"], "closing")  # an unconfirmed side closes the record (no re-signing)
-        await tick(e, 1)
-        self.assertEqual({o["state"] for o in quotes(e)[0]["orders"].values()}, {"gone"})
+        self.assertEqual({o["id"] for o in q["orders"].values()}, {o["hash"] for o in q["orders"].values()})
+        self.assertEqual(q["phase"], "active")  # found in time: it keeps resting (its place in the queue kept)
+        self.assertTrue(q.get("placed"))
+        await tick(e, 60)
+        self.assertEqual(quotes(e)[0]["phase"], "active")
+        self.assertEqual(len(quotes(e)), 1)
 
-    async def test_unknown_at_cancel_time_sweeps_the_market(self):
+    async def test_unknown_is_cancelled_by_its_hash_and_settled_from_the_trades_past_its_expiry(self):
         e, clock, pub, x = make_engine()
         start = T0 + 1800
         m = pub.list_window("btc", start)
+        hashes = []
 
-        async def lost(specs):
+        async def lost(specs, on_signed=None):  # signed, then the answer lost: whether it rests is not known
+            signed = [(s.ref, "0x" + format(900 + i, "064x"), 900 + i) for i, s in enumerate(specs)]
+            hashes.extend(h for _, h, _ in signed)
+            on_signed(signed)
             raise TimeoutError("read timeout")
         await e.account_once()
         await e.discover()
         x.place = lost
         await drain(e)
-        clock.t = start - 60
-        await e.cancel_pass()
-        self.assertEqual(x.market_cancels, [m["conditionId"]])
-        clock.t = start - 30 + 5
-        await e.reconcile_pass()
         q = quotes(e)[0]
-        self.assertEqual({o["state"] for o in q["orders"].values()}, {"not_found"})
-        await e.reconcile_pass()
-        self.assertEqual(quotes(e)[0]["phase"], "closed")
+        self.assertEqual([o["hash"] for o in q["orders"].values()], hashes)
+        for _ in range(4):  # never found: withdrawn after the grace, kept unknown (the id is not known to be the hash)
+            await tick(e, 10)
+        q = quotes(e)[0]
+        self.assertEqual(q["phase"], "closing")
+        self.assertEqual({o["state"] for o in q["orders"].values()}, {"unknown"})
+        self.assertTrue(any(set(c) & set(hashes) for c in x.cancel_calls))  # cancelled by its hash, never by market
+        self.assertEqual(x.market_cancels, [])
+        clock.t = start - 60
+        await tick(e)
+        self.assertEqual({o["state"] for o in quotes(e)[0]["orders"].values()}, {"unknown"})  # not given up before its expiry
+        clock.t = q["expiration"] + 6
+        await tick(e)
+        q = quotes(e)[0]
+        self.assertEqual({o["state"] for o in q["orders"].values()}, {"not_found"})  # the trades show no fill
+        await tick(e)
+        self.assertIn(quotes(e)[0]["phase"], ("closed", "settled"))
+        self.assertEqual(len(quotes(e)), 1)  # never quoted again meanwhile
 
 
 class ReviewRegressionTest(unittest.IsolatedAsyncioTestCase):
@@ -483,9 +519,9 @@ class ReviewRegressionTest(unittest.IsolatedAsyncioTestCase):
         gate = asyncio.Event()
         real = x.place
 
-        async def slow(specs):
+        async def slow(specs, on_signed=None):
             await gate.wait()  # the POST takes a long while
-            return await real(specs)
+            return await real(specs, on_signed)
         x.place = slow
         slug = mk.slug_of("btc", start)
         e.queue.get_nowait()
@@ -522,6 +558,7 @@ class HashLookupTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_unknown_never_seen_is_given_up_and_the_level_requoted(self):
         e, clock, pub, x = make_engine()
+        e.id_is_hash = True  # learned from the first accepted order (live): the id is the hash
         start = T0 + 1800
         pub.list_window("btc", start)
         await tick(e)
@@ -530,6 +567,7 @@ class HashLookupTest(unittest.IsolatedAsyncioTestCase):
         x.book.pop(o["id"])  # it never rested
         e.by_id.pop(o["id"])
         o.update(state="unknown", id="", hash="0x" + "ee" * 32, sent=clock.t)
+        e.save(q)
         await tick(e, 10)
         await tick(e, 10)
         self.assertEqual(o["state"], "unknown")  # too early to give up

@@ -1,3 +1,5 @@
+# What the code uses directly. The image installs requirements.lock (generated from this file: every transitive
+# dependency pinned with its hash); see the header there.
 # Polymarket's unified Python SDK (signing for EOA / Proxy / Safe / Deposit Wallet accounts, the CLOB, the relayer).
 # Pinned: the SDK is pre-1.0 and changes its interface between minor versions; preopen/exchange.py is the only file that uses it.
 polymarket-client==0.18.0
