@@ -46,6 +46,7 @@ REFUSALS = (
     ("owner of the api key", "auth"),
     ("address of the api key", "auth"),
     ("order timed out", "timed_out"),
+    ("could not insert order", "insert_failed"),
     ("cancel-only", "cancel_only"),
     ("post-only mode", "post_only_mode"),
 )
@@ -56,6 +57,9 @@ REFUSALS = (
 # every window it meets.
 WINDOW_CODES = {"post_only_would_cross", "invalid_tick", "invalid_size", "invalid", "canceled_onchain", "unmatched",
                 "fok_not_filled", "fak_not_filled"}
+
+
+TRANSIENT_WAIT = {"insert_failed": 5.0}   # the exchange's own hiccup under load: not inserted; sent again after this
 
 
 def refusal_code(message: str, fallback: str) -> str:
@@ -396,7 +400,7 @@ class LiveExchange:
                 refused = 400 <= error.status < 500 and error.status not in (408, 409) and code != "duplicated"
                 for spec, o, h in batch:
                     out[spec.ref] = Placed(spec.ref, "rejected" if refused else "unknown", code=code,
-                                           message=str(error), hash=h, salt=int(o.salt))
+                                           message=str(error), hash=h, salt=int(o.salt), wait=TRANSIENT_WAIT.get(code, 0.0))
                 continue
             except PolymarketError as error:  # a transport failure or a malformed answer: sent or not, unknown
                 status = "not_sent" if _cause_not_sent(error) else "unknown"
@@ -419,7 +423,7 @@ class LiveExchange:
                     if code == "unknown":  # words the SDK does not map: the documented ones are
                         code = refusal_code(message, code)
                     out[spec.ref] = Placed(spec.ref, "unknown" if code == "duplicated" else "rejected", code=code,
-                                           message=message, hash=h, salt=int(o.salt))
+                                           message=message, hash=h, salt=int(o.salt), wait=TRANSIENT_WAIT.get(code, 0.0))
         return [out[s.ref] for s in specs]
 
     async def cancel(self, ids: list[str]) -> Cancelled:
@@ -539,10 +543,10 @@ class LiveExchange:
 
 class PaperExchange:
     """LIVE=off: orders are kept in memory and never fill; the discovery, the timing and the bookkeeping run as live.
-    The balance rule is Polymarket's (docs: concepts/order-lifecycle, maxOrderSize = balance − Σ(open size − filled)):
-    every open BUY, a new one included, adds up to at most the balance, whatever its market; an order over it is refused
-    with "not enough balance / allowance". Should the balance fall under the open BUYs, the newest are cancelled
-    (CANCELED_NOT_ENOUGH_BALANCE) until it covers them."""
+    The balance rule is Polymarket's, market by market: a market's open BUYs, a new one included, add up to at most the
+    balance, and other markets' orders do not count (funds are not shared); an order over it is refused with "not
+    enough balance / allowance". When the balance falls under a market's open BUYs (fills elsewhere spent it), that
+    market's orders are cancelled (CANCELED_NOT_ENOUGH_BALANCE)."""
     live = False
 
     def __init__(self, balance: D = D("1000"), clock=time.time):
@@ -596,7 +600,7 @@ class PaperExchange:
                 out.append(Placed(spec.ref, status, code=code, message=code, hash=oid, salt=salt))
                 continue
             market = spec.market or self.markets.get(spec.asset, "")
-            if self.open_usd() + spec.price * spec.size > self.cash:  # every open BUY against the one balance
+            if self.market_open(market) + spec.price * spec.size > self.cash:  # this market's BUYs against the balance
                 out.append(Placed(spec.ref, "rejected", code="not_enough_balance", message="not enough balance / allowance",
                                   hash=oid, salt=salt))
                 continue
@@ -653,19 +657,30 @@ class PaperExchange:
     async def redeem(self, condition_id: str) -> str:
         return "paper"
 
-    def open_usd(self) -> D:
-        return sum((r.price * (r.size - r.matched) for r in self.book.values() if r.side == "BUY"), D(0))
+    def market_open(self, market: str) -> D:
+        return sum((r.price * (r.size - r.matched) for r in self.book.values() if r.market == market and r.side == "BUY"), D(0))
 
     def enforce(self) -> list[str]:
-        """The CLOB keeps checking: while the open BUYs add up to more than the balance, the newest are cancelled."""
+        """The CLOB keeps checking: a market whose open BUYs add up to more than the balance has them cancelled."""
         gone = []
-        for oid in reversed(list(self.book)):  # the newest first
-            if self.open_usd() <= self.cash:
-                break
-            row = self.book.pop(oid)
-            row.status = "CANCELED_NOT_ENOUGH_BALANCE"
-            self.gone[oid] = row
-            gone.append(oid)
+        for market in {r.market for r in self.book.values()}:
+            if self.market_open(market) > self.cash:
+                for oid in [i for i, r in self.book.items() if r.market == market]:
+                    row = self.book.pop(oid)
+                    row.status = "CANCELED_NOT_ENOUGH_BALANCE"
+                    self.gone[oid] = row
+                    gone.append(oid)
+        return gone
+
+    def cancel_elsewhere(self, ids: list[str] | None = None) -> list[str]:
+        """Test helper: orders cancelled from outside the bot (the website's 取消所有 when `ids` is None)."""
+        gone = []
+        for oid in list(self.book) if ids is None else ids:
+            if oid in self.book:
+                row = self.book.pop(oid)
+                row.status = "CANCELED"
+                self.gone[oid] = row
+                gone.append(oid)
         return gone
 
     # --- test helpers ---

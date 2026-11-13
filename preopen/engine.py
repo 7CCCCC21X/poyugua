@@ -78,6 +78,8 @@ UNSURE = ("unknown", "placing", "prepared")   # sent (or maybe sent) and not ans
 REFUSE_HOLD_S = 30        # the CLOB refused orders for a reason not the window's own: no new order this long, doubling
 REFUSE_HOLD_MAX_S = 600   # to this while it keeps refusing (an accepted order resets it); no window is struck off for it
 ACCOUNT_REFUSALS = {"invalid_expiration", "banned", "closed_only", "batch_too_large", "invalid_payload"}
+EXTERNAL_MASS = 3         # the bot's orders cancelled elsewhere (plain CANCELED: the website's 取消所有, another program
+EXTERNAL_WINDOW_S = 60    # with the key) in this many windows within this long: taken as "stop", and the bot pauses
 
 
 def dnum(value: Any) -> D:
@@ -147,6 +149,8 @@ class Engine:
         self.refused_streak = 0
         self.refused_at: dict[str, float] = {}  # slug -> when its orders were last refused that way
         self.accepted_at = 0.0                # when the CLOB last accepted an order (ends a refusal streak)
+        self.recent_refusals: collections.deque = collections.deque(maxlen=500)  # (when, slug, code) of those refusals
+        self.external: collections.deque = collections.deque(maxlen=200)         # (when, slug) of cancels made elsewhere
         self.restart = False                  # set by the console (a LIVE switch): main() starts the process again
         self._archive: tuple[int, list[dict]] = (-1, [])
         self.attempted: dict[str, tuple[str, int]] = {}  # condition id -> (slug, start) of every market an order was sent to
@@ -379,17 +383,25 @@ class Engine:
         return sum((r.price * max(D(0), r.size - r.matched) for r in self.unmanaged
                     if r.side == "BUY" and (market is None or r.market == market)), D(0))
 
-    def room(self) -> D:
-        """What more the bot may reserve now. Polymarket holds every open BUY against the one pUSD balance, whatever its
-        market (docs, concepts/order-lifecycle: maxOrderSize = balance − Σ(open order size − filled)): the bot's orders
-        and the account's others all count. PREOPEN_MAX_OPEN_USD caps the bot's own total below that."""
+    def market_rests(self, slug: str) -> D:
+        """The bot's own resting money in one market (a window): its levels, and orders of an earlier attempt that are
+        not confirmed gone yet."""
+        return sum((dnum(q["price"]) * max(D(0), dnum(q["shares"]) - dnum(o.get("filled")))
+                    for q in self.quotes_of(slug) for o in q["orders"].values() if o["state"] in MAY_REST), D(0))
+
+    def market_room(self, listing: mk.Listing) -> D:
+        """What more one market (window) may take. Polymarket checks each market's BUY orders against the balance on its
+        own: a market's open BUYs, the new one included, may add up to the balance, and other markets' orders do not
+        count (11-13: three $49 orders in three markets rest together on a $75.10 balance). Funds are not shared, so
+        every window can be quoted with the balance one window needs."""
         if self.balance is None:
             return D(0)
-        mine = self.reserved()
-        room = self.balance - mine - self.unmanaged_usd()
-        if self.s.max_open_usd > 0:
-            room = min(room, self.s.max_open_usd - mine)
-        return room
+        return self.balance - self.market_rests(listing.slug) - self.unmanaged_usd(listing.condition_id)
+
+    def cap_room(self) -> D:
+        """PREOPEN_MAX_OPEN_USD: the bot's own resting orders in all at most this (the exchange does not limit the sum,
+        which can be many times the balance); unlimited when 0."""
+        return self.s.max_open_usd - self.reserved() if self.s.max_open_usd > 0 else D("Infinity")
 
     def fit(self, levels: list[int], room: D) -> list[int]:
         """The levels that fit in `room`, the nearest first (a level's two sides together); a deeper one that does not
@@ -406,19 +418,26 @@ class Engine:
     def need_of(self, levels: list[int]) -> D:
         return sum((2 * self.s.levels[i].usd for i in levels), D(0))
 
-    def budget_problem(self, levels: list[int]) -> str:
+    def short_of(self, listing: mk.Listing, levels: list[int], cap: D) -> str:
+        """Why not even the first of these levels fits: "cap" (PREOPEN_MAX_OPEN_USD reached), "balance" (this market's
+        room), or "" when it fits."""
+        if not levels or self.fit(levels, min(self.market_room(listing), cap)):
+            return ""
+        return "cap" if cap < 2 * self.s.levels[levels[0]].usd else "balance"
+
+    def budget_problem(self, listing: mk.Listing, levels: list[int]) -> str:
         """Why not even the first of these levels fits ("" when it does)."""
         if self.balance is None:
             return "还没读到余额"
-        if not levels or self.fit(levels, self.room()):
+        why = self.short_of(listing, levels, self.cap_room())
+        if not why:
             return ""
         need = 2 * self.s.levels[levels[0]].usd
-        mine = self.reserved()
-        if self.s.max_open_usd > 0 and mine + need > self.s.max_open_usd:
-            return f"已挂到资金上限 PREOPEN_MAX_OPEN_USD=${self.s.max_open_usd}（已挂 ${mine:.2f}，再挂一场要 ${need:.2f}）"
-        others = self.unmanaged_usd()
-        return (f"余额不够再挂一场：余额 ${self.balance:.2f}，已挂 ${mine:.2f}" + (f"、账户里别的挂单 ${others:.2f}" if others else "")
-                + f"，再挂要 ${need:.2f}（所有挂单共用一份余额）")
+        if why == "cap":
+            return f"本程序挂单合计到了上限 PREOPEN_MAX_OPEN_USD=${self.s.max_open_usd}（已挂 ${self.reserved():.2f}，再挂一场要 ${need:.2f}）"
+        mine, others = self.market_rests(listing.slug), self.unmanaged_usd(listing.condition_id)
+        return (f"余额不够这一场：余额 ${self.balance:.2f}" + (f"，这一场已挂 ${mine:.2f}" if mine else "")
+                + (f"，这一场别的挂单 ${others:.2f}" if others else "") + f"，要 ${need:.2f}（各场分别核对余额，不共用）")
 
     # ------------------------------------------------------------------ discovery
     def frontier(self, starts: list[int]) -> dict[str, int]:
@@ -520,29 +539,39 @@ class Engine:
 
     def sweep(self) -> None:
         """Every listed window in range with a level to quote and not queued is queued (a hold that cleared, a level
-        withdrawn, a deeper level now near, money freed), the soonest first, as far as the one balance goes: every open
-        order of the account counts against it, whatever its market."""
+        withdrawn, a deeper level now near, money back), the soonest first. Each market is checked against the balance
+        on its own (funds are not shared between markets); PREOPEN_MAX_OPEN_USD, when set, caps the bot's orders in
+        all, the soonest windows taking it first."""
         if self.hold():
             self.budget_note = ""  # a hold is reported on its own
             return
-        room = self.room()
-        for slug in self.queued | self.placing:  # windows on their way: their money is spoken for
+        cap = self.cap_room()
+        for slug in self.queued | self.placing:  # windows on their way: their share of the cap is spoken for
             if slug in self.listings:
-                room -= self.need_of(self.fit(self.wanted(self.listings[slug]), room))
-        short = 0
+                listing = self.listings[slug]
+                cap -= self.need_of(self.fit(self.wanted(listing), min(self.market_room(listing), cap)))
+        short: collections.Counter = collections.Counter()
         for t in mk.window_starts(self.now(), self.s):
             for coin in self.s.coins:
                 slug = mk.slug_of(coin, t)
                 if slug not in self.listings or slug in self.queued or slug in self.placing or slug in self.timers:
                     continue
-                levels = self.fit(self.wanted(self.listings[slug]), room)
+                listing = self.listings[slug]
+                wanted = self.wanted(listing)
+                levels = self.fit(wanted, min(self.market_room(listing), cap))
                 if not levels:
-                    short += bool(self.wanted(self.listings[slug]))
+                    if wanted:
+                        short[self.short_of(listing, wanted, cap) or "balance"] += 1
                     continue
-                room -= self.need_of(levels)
+                cap -= self.need_of(levels)
                 self.enqueue(slug)
-        self.budget_note = (f"{short} 场因资金不够还没挂（余额 ${self.balance or 0:.2f}，已挂 ${self.reserved():.2f}；"
-                            f"所有挂单共用一份余额，开场最近的先挂）" if short else "")
+        parts = []
+        if short["cap"]:
+            parts.append(f"{short['cap']} 场等挂单合计上限 PREOPEN_MAX_OPEN_USD=${self.s.max_open_usd}（开场最近的先挂）")
+        if short["balance"]:
+            parts.append(f"{short['balance']} 场余额不够（余额 ${self.balance or 0:.2f}，一场要 ${2 * self.s.first.usd:.2f}；"
+                         f"各场分别核对余额，不共用）")
+        self.budget_note = "；".join(parts)
 
     def priority(self, slug: str) -> tuple[int, int, int]:
         """Fresh listings first (the queue's front), then the soonest; a window refused since the CLOB last accepted an
@@ -656,9 +685,9 @@ class Engine:
                 return Hold(why, None if self.paused else HOLD_RETRY_S)
         # from here to the records' save nothing awaits: the budget check and the reservation are one step (the seven
         # coins' fresh listings open together and must not all pass against the same reservation)
-        fitting = self.fit(levels, self.room())
+        fitting = self.fit(levels, min(self.market_room(listing), self.cap_room()))
         if not fitting:
-            return Hold(self.budget_problem(levels), None)
+            return Hold(self.budget_problem(listing, levels), None)
         if len(fitting) < len(levels):
             LOG.info("%s 余额只放得下前 %d 档（共要挂 %d 档）", slug, len(fitting), len(levels))
         levels = fitting
@@ -727,9 +756,11 @@ class Engine:
             account = [c for c in codes if c in ACCOUNT_REFUSALS or unrecognised(c)]
             if states <= {"not_sent", "rejected"} and all(retryable(c) for c in codes):
                 prev = self.refused_at.get(slug)
-                if any(unrecognised(c) for c in codes) and prev is not None and self.accepted_at > prev:
+                words = next((c for c in codes if unrecognised(c)), "")
+                if words and prev is not None and self.accepted_at > prev and not any(
+                        when > prev and other != slug and code == words for when, other, code in self.recent_refusals):
                     # refused again in words not recognised, while other windows' orders were accepted since its last
-                    # refusal: the window's own (counted against it, as a refusal about its order is)
+                    # refusal and none of them was refused so: the window's own (counted, as a refusal about its order)
                     self.refused_at.pop(slug, None)
                     self.close(q, "交易所只拒这一场：" + "；".join(f"{mk.SIDES_CN[s]} {o.get('code', '')} {o['error'][:80]}".strip()
                                                          for s, o in q["orders"].items()), free=False, save=False)
@@ -748,6 +779,7 @@ class Engine:
                 self.forget(q)
                 if account:  # the account's refusal: everything waits (escalating), nothing is struck off
                     self.refused_at[slug] = done
+                    self.recent_refusals.append((done, slug, account[0]))
                     self.refuse(account[0], next((o["error"] for o in q["orders"].values() if o.get("code") == account[0]), ""))
                     hold = hold or Hold(f"交易所拒单（{account[0]}）", None)
                 hold = hold or Hold(next((o["error"] for o in q["orders"].values() if o["error"]), "没发出"), HOLD_RETRY_S)
@@ -763,6 +795,7 @@ class Engine:
                            free=all(retryable(c) for c in codes), save=False)
                 if account:
                     self.refused_at[slug] = done
+                    self.recent_refusals.append((done, slug, account[0]))
                     self.refuse(account[0], next((o["error"] for o in q["orders"].values() if o.get("code") == account[0]), ""))
             self.save(q)
             for side, o in q["orders"].items():
@@ -1222,8 +1255,25 @@ class Engine:
             elif state.startswith("CANCELED_") or state == "INVALID":  # the exchange's own doing (the market resolved or
                 # vanished, the order timed out, expired or was invalidated): not the window's failure
                 self.close(q, f"{mk.SIDES_CN[side]}方挂单被交易所撤掉（{row.status}）", free=True, save=False)
-            else:  # cancelled by someone else (the website, another program): counted, quoted again up to the cap
-                self.close(q, f"{mk.SIDES_CN[side]}方挂单被撤（{row.status}）", free=False, save=False)
+            else:  # cancelled by someone else (the website, another program with the key)
+                now = self.now()
+                self.external.append((now, q["slug"]))
+                if len({s for t, s in self.external if t > now - EXTERNAL_WINDOW_S}) >= EXTERNAL_MASS:
+                    # many windows at once (the website's 取消所有): a stop. Paused, said so; no window charged for it
+                    self.close(q, f"{mk.SIDES_CN[side]}方挂单被别处成批撤掉（{row.status}）", free=True, save=False)
+                    for other in {s for t, s in self.external if t > now - EXTERNAL_WINDOW_S} - {q["slug"]}:
+                        for r in self.quotes_of(other):  # the first ones of the batch were charged before it was one
+                            if r.get("counted") and "挂单被撤（" in str(r.get("reason") or "") and \
+                                    float(r.get("closing_at") or 0) > now - EXTERNAL_WINDOW_S:
+                                r["counted"] = False
+                                r["reason"] = str(r["reason"]).replace("挂单被撤（", "挂单被别处成批撤掉（")
+                                self.save(r)
+                    if not self.paused:
+                        self.pause()
+                        self.problem("本程序的挂单在别处被成批撤掉（比如网页上的「取消所有」）：已暂停新挂并撤掉其余挂单。"
+                                     "要继续请在控制台点「恢复挂单」或发 /resume", key="external-cancel")
+                else:  # one window: counted, quoted again up to the cap
+                    self.close(q, f"{mk.SIDES_CN[side]}方挂单被撤（{row.status}）", free=False, save=False)
         self.save(q)
 
     def note_fill(self, q: dict, side: str, matched: D, at: float | None = None) -> None:
@@ -1695,7 +1745,7 @@ class Engine:
                 else:
                     counts["held" if held else "budget"] += 1
         names = (("resting", "挂着"), ("closing", "撤单中"), ("queued", "排队/正在挂"), ("waiting", "等开放/重试"),
-                 ("budget", "资金不够排在后面"), ("held", "暂停中"), ("unlisted", "还没发布"), ("stopped", "不挂"))
+                 ("budget", "资金不够"), ("held", "暂停中"), ("unlisted", "还没发布"), ("stopped", "不挂"))
         parts = [f"{label} {counts[k]}" for k, label in names if counts[k]]
         if stopped:
             parts[-1] += "（" + "，".join(f"{why} {n}" for why, n in stopped.most_common(4)) + "）"
@@ -1728,10 +1778,10 @@ class Engine:
         return reasons[0] if reasons else "其他"
 
     def revive(self) -> int:
-        """Windows the earlier rules gave up on for a refusal that was not their own (a 400 for the whole batch such as
-        "not enough balance / allowance", words not recognised, an order the exchange invalidated): quoted again while
-        their entry time is ahead. A manual withdrawal, a window with a fill and a refusal about the order itself stay
-        as they are."""
+        """Windows given up on for something that was not their own doing (a refusal the earlier rules took as final:
+        a 400 for the whole batch, words not recognised; an order the exchange invalidated; orders cancelled elsewhere,
+        e.g. the website's 取消所有, three times): quoted again while their entry time is ahead. A manual withdrawal, a
+        window with a fill and a refusal about the order itself stay as they are."""
         now = self.now()
         revived = []
         for q in self.ledger.rows.values():
@@ -1745,7 +1795,8 @@ class Engine:
             codes = [refusal_code(o.get("error") or "", str(o.get("code") or "")) for o in orders
                      if o["state"] in ("rejected", "not_sent")]
             invalidated = any(str(o.get("status") or "").upper() == "INVALID" for o in orders)
-            if not (codes or invalidated) or any(c in WINDOW_CODES for c in codes):
+            elsewhere = "挂单被撤（" in str(q.get("reason") or "")  # cancelled elsewhere (e.g. the website's 取消所有)
+            if not (codes or invalidated or elsewhere) or any(c in WINDOW_CODES for c in codes):
                 continue
             q["permanent"] = q["counted"] = False
             q["revived"] = now
@@ -1841,8 +1892,7 @@ class Engine:
             "settings": {"ahead_min": self.s.ahead_s // 60, "cancel_s": self.s.cancel_s, "expiry_s": self.s.expiry_s,
                          "entry_s": self.s.entry_s, "weekend": self.s.weekend, "max_open": float(self.s.max_open_usd)},
             "reserved": float(self.reserved()), "balance": float(self.balance) if self.balance is not None else None,
-            "room": float(self.room()) if self.balance is not None else None,
-            "fits": int(self.room() // self.s.window_usd) if self.balance is not None and self.s.window_usd > 0 else None,
+            "buffer": float(self.balance - self.s.window_usd) if self.balance is not None else None,
             "refused": self.refused_reason if now < self.refused_until else "",
             "coverage": self.coverage(),
             "unmanaged": len(self.unmanaged), "unmanaged_usd": float(self.unmanaged_usd()),
@@ -1876,10 +1926,10 @@ class Engine:
         lines = [
             f"📌 Polymarket 5 分钟涨跌预挂 · {self.s.mode()}" + (" · ⏸ 已暂停" if self.paused else ""),
             f"币种：{' '.join(mk.name_of(x) for x in self.s.coins) or '无'}",
-            f"每边：{self.s.levels_text()}（post-only GTD）；每场预留 ${self.s.window_usd:.2f}",
+            f"每边：{self.s.levels_text()}（post-only GTD）；每场占用 ${self.s.window_usd:.2f}（各场分别核对余额，不共用）",
             f"时间：开场前 {self.s.ahead_s // 60} 分钟内的场次；开场前 {self.s.cancel_s} 秒撤单，{self.s.expiry_s} 秒到期，"
             f"{self.s.entry_s} 秒内不新挂" + ("" if self.s.weekend else "；周末不挂"),
-            f"挂着：{c['windows']} 场 {c['resting']} 张单，预留 ${self.reserved():.2f}"
+            f"挂着：{c['windows']} 场 {c['resting']} 张单，合计 ${self.reserved():.2f}"
             + (f"（上限 ${self.s.max_open_usd}）" if self.s.max_open_usd else "")
             + (f"；余额 ${self.balance:.2f}" if self.balance is not None else "；余额未读到"),
         ]

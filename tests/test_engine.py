@@ -107,27 +107,21 @@ class PlacementTest(unittest.IsolatedAsyncioTestCase):
         await drain(e)
         self.assertEqual(len(x.placed), 2)
 
-    async def test_one_balance_for_every_window_the_soonest_first(self):
-        e, clock, pub, x = make_engine(balance="20")  # every open order counts against the one balance: two windows fit
+    async def test_every_window_is_quoted_on_the_balance_one_window_needs(self):
+        e, clock, pub, x = make_engine(balance="15")  # one window takes $9.80: each market is checked on its own
         starts = mk.window_starts(clock.t, e.s)
         pub.list_range(["btc", "eth"], starts)
         await e.account_once()
         await e.discover()
         await drain(e)
-        placed = quotes(e)
-        self.assertEqual(len(placed), 2)
-        self.assertEqual({q["start"] for q in placed}, {starts[0]})  # the soonest: both coins' first window
-        self.assertLessEqual(e.reserved(), D("20"))
+        self.assertEqual(len(quotes(e, phase="active")), 2 * len(starts))
+        self.assertGreater(e.reserved(), 10 * D("15"))  # all of them together: far more than the balance, as allowed
         await tick(e, 5)
-        self.assertEqual(len(quotes(e)), 2)
-        self.assertIn(f"{2 * len(starts) - 2} 场因资金不够还没挂", e.budget_note)
-        cov = e.coverage()
-        self.assertEqual(cov["counts"]["resting"], 2)
-        self.assertEqual(cov["counts"]["budget"], 2 * len(starts) - 2)
-        self.assertIn("资金不够排在后面", cov["text"])
+        self.assertEqual(e.budget_note, "")
+        self.assertEqual(e.coverage()["counts"]["resting"], 2 * len(starts))
 
     async def test_budget_cap_holds_the_later_windows(self):
-        e, clock, pub, x = make_engine(settings(PREOPEN_MAX_OPEN_USD="20"))
+        e, clock, pub, x = make_engine(settings(PREOPEN_MAX_OPEN_USD="20"))  # the bot's orders in all, at most $20
         starts = mk.window_starts(clock.t, e.s)
         pub.list_range(["btc"], starts)
         await e.account_once()
@@ -139,7 +133,7 @@ class PlacementTest(unittest.IsolatedAsyncioTestCase):
         e.sweep()
         await drain(e)
         self.assertEqual(len(quotes(e)), 2)
-        self.assertIn("资金", e.budget_note)
+        self.assertIn(f"{len(starts) - 2} 场等挂单合计上限", e.budget_note)
 
     async def test_a_balance_below_one_window_quotes_nothing(self):
         e, clock, pub, x = make_engine(balance="9")
@@ -150,7 +144,7 @@ class PlacementTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(x.placed, [])
         await tick(e, 5)  # the next sweep says why
         self.assertEqual(x.placed, [])
-        self.assertIn("4 场因资金不够还没挂", e.budget_note)
+        self.assertIn("4 场余额不够", e.budget_note)
 
     async def test_the_cap_takes_the_levels_that_fit_the_nearest_first(self):
         # 49x10 is $9.80 a window, 48x20 another $19.20
@@ -162,26 +156,27 @@ class PlacementTest(unittest.IsolatedAsyncioTestCase):
                 await tick(e)
                 self.assertEqual([{q["level"] for q in quotes(e, mk.slug_of("btc", t))} for t in starts], levels)
 
-    async def test_another_strategys_orders_count_against_the_balance(self):
+    async def test_another_strategys_orders_count_in_their_own_market_only(self):
         e, clock, pub, x = make_engine(balance="15")
         a, b = mk.window_starts(clock.t, e.s)[:2]
         ma = pub.list_window("btc", a)
         pub.list_window("btc", b)
         token = __import__("json").loads(ma["clobTokenIds"])[0]
-        await x.place([OrderSpec("website/up", token, D("0.50"), D("10"), a + 30, market=ma["conditionId"])])  # $5 open
+        await x.place([OrderSpec("website/up", token, D("0.50"), D("20"), a + 30, market=ma["conditionId"])])  # $10 in market a
         await tick(e)
-        self.assertEqual([q["start"] for q in quotes(e)], [a])  # $10 left: one window of $9.80
         await tick(e, 5)
-        self.assertIn("1 场因资金不够还没挂", e.budget_note)
+        self.assertEqual([q["start"] for q in quotes(e)], [b])  # a has $5 left: not enough; b has all $15
+        self.assertIn("1 场余额不够", e.budget_note)
 
-    async def test_a_balance_that_falls_under_the_orders_loses_the_newest_until_it_is_back(self):
-        e, clock, pub, x = make_engine(balance="30")
+    async def test_fills_that_drain_the_balance_lose_a_markets_orders_until_it_is_back(self):
+        e, clock, pub, x = make_engine(balance="15")
         starts = mk.window_starts(clock.t, e.s)[:3]
         pub.list_range(["btc"], starts)
         await tick(e)
         a, b, c = quotes(e)
-        x.cash = D("20")  # $10 moved out of the wallet: $29.40 of orders on $20
-        x.enforce()
+        x.fill(a["orders"]["up"]["id"], D("10"))  # $4.90 spent: $10.10 left, still above every market's $9.80
+        self.assertEqual(len(x.book), 5)
+        x.fill(b["orders"]["up"]["id"], D("10"))  # $5.20 left: market c's $9.80 is no longer covered
         self.assertEqual({r.market for r in x.book.values()}, {a["condition_id"], b["condition_id"]})
         await tick(e, 10)
         await tick(e, 6)
@@ -191,12 +186,46 @@ class PlacementTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({q["phase"] for q in (quotes(e, a["slug"])[0], quotes(e, b["slug"])[0])}, {"active"})
         self.assertEqual(e.hold(), "")  # no blanket pause: the others keep going
         await tick(e, 10)
-        self.assertEqual(len(quotes(e, c["slug"])), 1)  # $0.40 of room: c waits
-        self.assertIn("资金不够", e.budget_note)
-        x.cash = D("30")
+        self.assertEqual(len(quotes(e, c["slug"])), 1)  # $5.20 cannot take $9.80: c waits
+        self.assertIn("余额不够", e.budget_note)
+        x.cash += D("10")  # the winnings redeemed
         await tick(e, 31)
         await tick(e, 5)
-        self.assertEqual(quotes(e, c["slug"])[-1]["phase"], "active")  # quoted again once the money is back
+        self.assertEqual(quotes(e, c["slug"])[-1]["phase"], "active")  # quoted again, on its own market's room
+
+    async def test_the_websites_cancel_all_pauses_the_bot_and_charges_no_window(self):
+        e, clock, pub, x = make_engine()
+        starts = mk.window_starts(clock.t, e.s)[:4]
+        pub.list_range(["btc"], starts)
+        await tick(e)
+        self.assertEqual(len(x.book), 8)
+        x.cancel_elsewhere()  # 取消所有 on the website: every order of the account, plain CANCELED
+        for _ in range(3):
+            await tick(e, 6)
+        self.assertTrue(e.paused)
+        self.assertIn("成批撤掉", e.errors[-1][1])
+        self.assertTrue(any("external-cancel" in k for k in e.notified))
+        self.assertFalse(any(q.get("counted") for q in quotes(e)))  # no window charged for it
+        self.assertEqual(x.book, {})
+        e.resume()
+        await tick(e, 5)
+        await tick(e, 1)
+        self.assertEqual({q["start"] for q in quotes(e, phase="active")}, set(starts))
+
+    async def test_one_window_cancelled_elsewhere_counts_and_is_quoted_again(self):
+        e, clock, pub, x = make_engine()
+        starts = mk.window_starts(clock.t, e.s)[:3]
+        pub.list_range(["btc"], starts)
+        await tick(e)
+        a = quotes(e)[0]
+        x.cancel_elsewhere([a["orders"]["up"]["id"]])
+        for _ in range(4):
+            await tick(e, 6)
+        self.assertFalse(e.paused)
+        self.assertTrue(quotes(e, a["slug"])[0]["counted"])
+        await tick(e, 61)
+        await tick(e, 1)
+        self.assertEqual(quotes(e, a["slug"])[-1]["phase"], "active")  # quoted again (attempt 1 of the cap)
 
     async def test_hold_without_snapshot_and_during_cooldown(self):
         e, clock, pub, x = make_engine()
@@ -490,6 +519,26 @@ class RefusalTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(q["counted"])
         self.assertIn("只拒这一场", q["reason"])
         self.assertEqual(e.hold(), "")
+
+    async def test_the_same_unknown_words_on_several_windows_charge_none_of_them(self):
+        """Like an account limit on open orders: windows beyond it are refused in the same words, while a window gets
+        accepted now and then as a slot frees. None of the refused is charged for it."""
+        e, clock, pub, x = make_engine()
+        a, b, c, d = mk.window_starts(clock.t, e.s)[:4]
+        pub.list_window("btc", a)
+        mc, md = pub.list_window("btc", c), pub.list_window("btc", d)
+        for m in (mc, md):
+            x.refuse_market[m["conditionId"]] = ("rejected", "unknown")
+        await e.account_once()
+        await e.discover()
+        await drain(e)
+        pub.list_window("btc", b)  # a new window, listed later, accepted between the refusals
+        for step in (31, 1, 61, 1, 121, 1, 241, 1):
+            await tick(e, step)
+        self.assertEqual(quotes(e, mk.slug_of("btc", b))[0]["phase"], "active")
+        for t in (c, d):
+            self.assertFalse(any(q.get("counted") for q in quotes(e, mk.slug_of("btc", t))))
+        self.assertIn("交易所拒单（unknown", e.hold())
 
 
 class UnknownTest(unittest.IsolatedAsyncioTestCase):

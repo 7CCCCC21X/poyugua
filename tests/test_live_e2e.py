@@ -55,7 +55,7 @@ class FakeClob:
         self.answers: list[str] = []
         self.posted = 0
         self.balance_usd = D("1000")
-        self.elsewhere = D(0)   # held by orders this key does not list (another key on the wallet): counted all the same
+        self.elsewhere = D(0)   # held in every market by orders this key does not list (another key): counted all the same
         self.refused = 0
         self.redeemed: list[str] = []
         self.balance_error: Exception | None = None
@@ -88,12 +88,17 @@ class FakeClob:
         self.posted += len(orders)
         if answer == "timed_out":  # docs: rejected before reaching the book, safe to send again
             raise RequestRejectedError("order timed out", status=500)
-        # docs (concepts/order-lifecycle): maxOrderSize = balance − Σ(open order size − filled), every market's orders
-        need = sum(D(o.maker_amount) / 10**6 for o in orders)
-        held = sum(D(o.price) * (D(o.original_size) - D(o.size_matched)) for o in self.live()) + self.elsewhere
-        if held + need > self.balance_usd:
-            self.refused += len(orders)
-            raise RequestRejectedError("not enough balance / allowance", status=400)
+        # each market's open BUYs against the balance on its own (11-13: three $49 orders in three markets rest on
+        # $75.10); over it, the batch is refused with the documented 400
+        need: dict[str, D] = {}
+        for o in orders:
+            market = self.markets.get(str(o.token_id), "")
+            need[market] = need.get(market, D(0)) + D(o.maker_amount) / 10**6
+        for market, amount in need.items():
+            held = sum(D(o.price) * (D(o.original_size) - D(o.size_matched)) for o in self.live() if o.condition_id == market)
+            if held + self.elsewhere + amount > self.balance_usd:
+                self.refused += len(orders)
+                raise RequestRejectedError("not enough balance / allowance", status=400)
         if answer == "lost":
             error = TransportError("timed out")
             error.__cause__ = httpx.ReadTimeout("read")
@@ -171,6 +176,11 @@ class FakeClob:
 
     def live(self) -> list[N]:
         return [o for o in self.orders.values() if o.status == "LIVE"]
+
+    def website_cancel_all(self) -> None:
+        """取消所有 on the website: every open order of the account, plain CANCELED."""
+        for o in self.live():
+            o.status = "CANCELED"
 
 
 def adapter(fake: FakeClob, s) -> LiveExchange:
@@ -320,49 +330,46 @@ def seven_coins(clock, fake, pub, ahead="120"):
 
 class BalanceEndToEndTest(unittest.IsolatedAsyncioTestCase):
     """The 11-13 live case: $75.10, seven coins at 47¢ x 10 ($9.40 a window), the weekend off on a Friday afternoon (no
-    window enters the range later). Per-market budgeting sent every window at once, the CLOB answered the batches over
-    the balance with 400 "not enough balance / allowance", and each of those windows was struck off for good: once the
-    first seven had started, nothing rested and nothing said why."""
+    window enters the range later). Each market is checked against the balance on its own, so every window is quoted;
+    whatever the exchange refuses or cancels, no window is struck off without a word."""
 
     def engine(self, clock, fake, pub, s, ledger=None):
         return make_engine(s, clock=clock, ledger=ledger, exchange=adapter(fake, s), public=pub)[0]
 
-    async def test_the_next_windows_are_always_quoted_within_the_balance(self):
+    async def test_every_window_is_quoted_on_75_dollars(self):
         clock = Clock()
         fake, pub = FakeClob(clock), FakePublic(clock)
         fake.balance_usd = D("75.10")
         s = seven_coins(clock, fake, pub)
+        starts = mk.window_starts(clock.t, s)
         e = self.engine(clock, fake, pub, s)
-        quoted = set()
         for _ in range(240):  # twenty minutes in 5 s steps
             await tick(e, 5)
-            held = sum(D(o.price) * D(o.original_size) for o in fake.live())
-            self.assertLessEqual(held, D("75.10"))
-            quoted |= {q["start"] for q in quotes(e)}
-        self.assertEqual(fake.refused, 0)              # nothing over the balance was ever sent
-        self.assertEqual(len(fake.live()), 14)         # the next window of every coin
-        self.assertEqual(len(quoted), 4)               # the four starts due in twenty minutes, none skipped: each
-        self.assertEqual(max(quoted) - min(quoted), 900)  # window's successor placed as its orders were cancelled
-        cov = e.coverage()
-        self.assertIn("资金不够排在后面", cov["text"])
+        self.assertEqual(fake.refused, 0)              # nothing a market could not take was ever sent
+        ahead = [t for t in starts if t - s.cancel_s > clock.t]
+        self.assertEqual(len(fake.live()), 2 * 7 * len(ahead))  # every window not yet at its cancel time
+        self.assertGreater(sum(D(o.price) * D(o.original_size) for o in fake.live()), 10 * D("75.10"))
+        cov = e.coverage()  # the range: windows still open to new orders (more than entry_s ahead)
+        listed = [t for t in mk.window_starts(clock.t, s) if t in starts]  # the range moved on past what was listed
+        self.assertEqual(cov["counts"]["resting"], 7 * len(listed))
         self.assertNotIn("stopped", cov["counts"])     # no window struck off
 
     async def test_a_balance_refusal_the_bot_could_not_see_coming_strikes_off_nothing(self):
         clock = Clock()
         fake, pub = FakeClob(clock), FakePublic(clock)
-        fake.balance_usd, fake.elsewhere = D("75.10"), D("60")  # $60 held by orders this key does not list
+        fake.balance_usd, fake.elsewhere = D("75.10"), D("70")  # $70 in every market held by orders this key does not list
         s = seven_coins(clock, fake, pub)
         e = self.engine(clock, fake, pub, s)
         await tick(e)
         await tick(e, 1)
         self.assertGreater(fake.refused, 0)
-        self.assertEqual(len(fake.live()), 2)          # $75.10 - $60 = $15.10: one window
+        self.assertEqual(fake.live(), [])              # $5.10 left in each market: no window fits
         self.assertIn("交易所说余额不够", e.hold())       # a minute's hold, then the balance read again
-        self.assertEqual([q for q in quotes(e) if q["phase"] != "active"], [])  # the refused: no record, no attempt
+        self.assertEqual(quotes(e), [])                # the refused: no record, no attempt used
         fake.elsewhere = D(0)
         for _ in range(9):
             await tick(e, 10)
-        self.assertEqual(len(fake.live()), 14)
+        self.assertGreater(len(fake.live()), 100)      # every window quoted once the money is there
         self.assertNotIn("stopped", e.coverage()["counts"])
 
     async def test_the_stuck_ledger_comes_back_after_the_fix(self):
@@ -400,9 +407,33 @@ class BalanceEndToEndTest(unittest.IsolatedAsyncioTestCase):
             await tick(e, 1)
             first = {q["coin"] for q in quotes(e) if q["phase"] == "active" and q["start"] == starts[0]}
             self.assertEqual(first, {"sol", "xrp", "doge", "hype", "bnb"})  # btc withdrawn by hand, eth's own refusal
-            self.assertEqual(len(fake.live()), 14)  # the balance's seven windows: these five, then the next ones
+            self.assertEqual(len(fake.live()), 2 * (7 * len(starts) - 2))  # every other window quoted again
             self.assertIn("手动撤了", e.coverage()["text"])
             ledger.close()
+
+
+class CancelledElsewhereTest(unittest.IsolatedAsyncioTestCase):
+    async def test_the_websites_cancel_all_pauses_the_bot(self):
+        clock = Clock()
+        fake, pub = FakeClob(clock), FakePublic(clock)
+        fake.balance_usd = D("75.10")
+        s = seven_coins(clock, fake, pub)
+        e = make_engine(s, clock=clock, exchange=adapter(fake, s), public=pub)[0]
+        await tick(e)
+        await tick(e, 1)
+        placed = len(fake.live())
+        self.assertGreater(placed, 100)
+        fake.website_cancel_all()
+        for _ in range(4):
+            await tick(e, 6)
+        self.assertTrue(e.paused)
+        self.assertEqual(fake.live(), [])
+        self.assertEqual(fake.posted, placed)          # nothing placed again while paused
+        self.assertFalse(any(q.get("counted") for q in quotes(e)))
+        e.resume()
+        await tick(e, 5)
+        await tick(e, 1)
+        self.assertGreater(len(fake.live()), 100)      # quoted again once resumed
 
 
 class RefusalWordsTest(unittest.IsolatedAsyncioTestCase):

@@ -48,7 +48,7 @@ class Settings:
     cancel_s: int = 60                 # cancel this long before the start
     expiry_s: int = 30                 # the orders expire (GTD) this long before the start: the backstop of the cancel
     entry_s: int = 300                 # no new order this close to the start
-    max_open_usd: D = D("0")           # the bot's own resting orders in all at most this (0 = only the balance limits it)
+    max_open_usd: D = D("0")           # the bot's own resting orders in all at most this (0 = no cap; markets don't share)
     max_exposure_usd: D = D("0")       # the worst case of the unsettled positions (one-sided fills) at most this (0 = off)
     max_daily_loss_usd: D = D("0")     # today's settled loss at most this, then no new quote until Beijing midnight (0 = off)
     key_exclusive: bool = False        # on: the API key is the bot's alone (market sweeps and cancel-all may be used)
@@ -346,8 +346,8 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_EXPIRY_SECONDS", "开场前几秒订单自动失效", "0～3600：撤单发不出去时的兜底（默认 30）"),
     ("PREOPEN_ENTRY_SECONDS", "距开场不足几秒不再新挂", "至少比撤单多 60 秒、比到期多 150 秒（GTD 订单要求到期在 3 分钟后；默认 300）"),
     ("PREOPEN_WEEKEND", "周末也挂", "off = 北京时间周六 00:00 到周一 08:00 开始的场次不挂"),
-    ("PREOPEN_MAX_OPEN_USD", "资金上限（$）", "0 = 不限，只受余额限制：本程序全部挂单合计最多占用这么多 pUSD。Polymarket 的挂买单"
-     "占用余额，所有市场的挂单共用一份余额（还能挂 = 余额 − 全部挂单未成交部分），开场最近的先挂"),
+    ("PREOPEN_MAX_OPEN_USD", "挂单合计上限（$）", "0 = 不限。Polymarket 按市场分别核对余额：每一场的挂单合计不超过余额就能挂，"
+     "各场不共用，所以余额够一场就能挂全部场次，挂单合计可以是余额的很多倍。设了这个数，本程序全部挂单合计最多这么多，开场最近的先挂"),
     ("PREOPEN_MAX_EXPOSURE_USD", "持仓最坏亏损上限（$）", "0 = 不限：还没结算的场次里，单边成交（没配对的份数）最坏会亏的钱到了这个数，就撤掉没成交的挂单、不再新挂，结算后自动恢复"),
     ("PREOPEN_MAX_DAILY_LOSS_USD", "日亏损上限（$）", "0 = 不限：今天（北京时间）已结算的亏损到了这个数，就撤掉没成交的挂单、今天不再新挂，零点后自动恢复"),
     ("PREOPEN_MAX_ATTEMPTS", "一档最多重报几次", "1～20：因这一场自身原因失败（单边被拒、被别人撤掉）后最多重新报价几次"),
