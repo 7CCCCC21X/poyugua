@@ -247,8 +247,12 @@ class TelegramTest(unittest.IsolatedAsyncioTestCase):
             await tick(e, 30)
         handle = main.commander(settings(), e, pub)
         review = await handle("/review", [])
+        self.assertTrue(review.splitlines()[1].startswith("结论："))  # the conclusion first
         self.assertIn("开场前几秒撤单最好", review)
         self.assertIn("什么时候成交的", review)
+        self.assertIn("（BTC、最近 7 天）", await handle("/review", ["btc", "7"]))
+        self.assertIn("报价 0 场", await handle("/review", ["eth"]))  # only ETH: nothing quoted
+        self.assertIn("看不懂：abc", await handle("/review", ["abc"]))
         reply = await handle("/export", [])
         self.assertEqual([n.split("_")[0] for n, _ in reply.files], ["全部报价", "成交明细", "每日汇总", "撤单时间复盘"])
         fills = dict(reply.files)[next(n for n, _ in reply.files if n.startswith("成交明细"))].decode("utf-8")

@@ -386,11 +386,11 @@ def cancel_csv(review: dict) -> str:
     return "\ufeff" + out.getvalue()
 
 
-def review_text(records: list[dict], now: float, current: int | None = None) -> str:
-    """The review for Telegram: the totals, then the cancel-time replay and when the fills came."""
+def review_text(records: list[dict], now: float, current: int | None = None, scope: str = "") -> str:
+    """The review for Telegram: the conclusion first, then the totals, the cancel-time replay and when the fills came."""
     j = journal(records, now)
     c = cancel_review(records, now, current)
-    lines = [f"📈 复盘（北京时间 {mk.hms(now)}）"]
+    lines = [f"📈 复盘{f'（{scope}）' if scope else ''} · 北京时间 {mk.hms(now)}", f"结论：{c['advice']}", ""]
     for k, name in (("today", "今天"), ("7d", "近 7 天"), ("all", "累计")):
         t = j["totals"][k]
         lines.append(f"{name}：报价 {t['quoted']} 场，成交 {t['filled']} 场（双边 {t['both']}），赢 {t['wins']} 输 {t['losses']}"
@@ -399,9 +399,10 @@ def review_text(records: list[dict], now: float, current: int | None = None) -> 
     for r in c["rows"]:
         lines.append(f"  {r['cancel_s']:>3} 秒：成交 {r['filled']} 场（双边 {r['both']}），盈亏 {r['pnl']:+.2f}"
                      + ("  ← 现在" if r["cancel_s"] == current else "") + ("  ★最好" if r["cancel_s"] == c["best"] else ""))
-    lines.append(f"结论：{c['advice']}")
     if c["rows"]:
-        lines.append(f"（比开场前 {c['base']} 秒更晚撤算不出来：那时单子已经撤了。{c['approx']} 场的成交时刻是快照时间，偏晚几秒）")
+        lines.append(f"（比开场前 {c['base']} 秒更晚撤算不出来：那时单子已经撤了"
+                     + (f"；{c['approx']} 场的成交时刻是快照时间，偏晚几秒" if c["approx"] else "")
+                     + (f"；另有 {c['excluded']} 场当时撤得更早，没算" if c["excluded"] else "") + "）")
     if c["by_fill_time"]:
         lines += ["", "【什么时候成交的】买的那一边最后赢的比例，低于保本（=买价）就是亏"]
         for t in c["by_fill_time"]:

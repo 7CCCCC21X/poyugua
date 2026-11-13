@@ -76,6 +76,28 @@ def acquire_lock(ledger_path: str):
     return f
 
 
+def review(engine: Engine, args: list[str]) -> str:
+    """/review [days] [coin ...]: the analysis as a message, for the last days and the coins named (default: all)."""
+    days, coins, bad = 0.0, set(), []
+    for a in args:
+        try:
+            days = float(a)
+            continue
+        except ValueError:
+            pass
+        key = a.lower().strip()
+        if key in config.COINS:
+            coins.add(key)
+        else:
+            bad.append(a)
+    if bad:
+        return f"看不懂：{' '.join(bad)}。用法：/review（全部）、/review 7（最近 7 天）、/review btc、/review btc eth 3"
+    now = engine.now()
+    records = [q for q in engine.all_records() if (not days or q["start"] >= now - days * 86400) and (not coins or q["coin"] in coins)]
+    scope = "、".join(x for x in (" ".join(mk.name_of(c) for c in sorted(coins)), f"最近 {mk.fmt(D(str(days)))} 天" if days else "") if x)
+    return journal.review_text(records, now, engine.s.cancel_s, scope)
+
+
 def export(engine: Engine, args: list[str]) -> Reply:
     """/export [days]: the records as CSV files (all quotes, the fills, by day, the cancel-time review), for a review in
     Excel or anywhere else. Without a number, everything the ledger holds."""
@@ -107,7 +129,7 @@ def commander(settings: config.Settings, engine: Engine, pub: PublicApi):
         if cmd == "/check":
             return engine.check_text()
         if cmd == "/review":
-            return journal.review_text(engine.all_records(), engine.now(), engine.s.cancel_s)
+            return review(engine, args)
         if cmd == "/export":
             return export(engine, args)
         if cmd == "/probe":
