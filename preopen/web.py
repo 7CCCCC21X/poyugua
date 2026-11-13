@@ -115,7 +115,7 @@ class WebServer:
         if path in ("/", "/index.html", "/control", "/journal"):
             if method != "GET":
                 return 405, "text/plain", b"", []
-            return 200, "text/html; charset=utf-8", PAGE.encode(), []
+            return 200, "text/html; charset=utf-8", PAGE_HTML, []
         if path == "/api/login":
             if method != "POST":
                 return 405, "text/plain", b"", []
@@ -139,8 +139,8 @@ class WebServer:
         if not self.authorized(headers):
             return self._json(401, {"error": "sign in", "web_key": bool(self.web_key)})
         if method == "GET":
-            if path == "/api/status":
-                return self._json(200, self.app.report())
+            if path == "/api/status":  # with the page's version: a page left open across a deploy reloads itself
+                return self._json(200, {**self.app.report(), "page": PAGE_VERSION})
             if path == "/api/settings":
                 return self._json(200, self.app.settings())
             if path == "/api/orders":
@@ -337,6 +337,7 @@ select { font:inherit; padding:5px 8px; border-radius:8px; border:1px solid var(
 </main>
 <div id="toast" class="toast" hidden></div>
 <script>
+const PAGE_VERSION = "__PAGE_VERSION__";
 const tg = window.Telegram && window.Telegram.WebApp;
 if (tg) { tg.ready(); tg.expand(); }
 const initData = tg ? tg.initData : "";
@@ -387,7 +388,9 @@ document.querySelectorAll("nav a").forEach((a) => a.onclick = () => go(a.dataset
 document.querySelectorAll("[data-goto]").forEach((a) => a.onclick = () => go(a.dataset.goto));
 async function tick(first) {
   try {
-    const st = await api("/api/status"); if (st.status === 200) { state.report = st.data; renderTop(st.data); if (state.tab === "overview") renderOverview(st.data); }
+    const st = await api("/api/status");
+    if (st.status === 200 && st.data.page && st.data.page !== PAGE_VERSION) { location.reload(); return; }  // a new version deployed
+    if (st.status === 200) { state.report = st.data; renderTop(st.data); if (state.tab === "overview") renderOverview(st.data); }
     if (state.tab === "settings" && first) await loadSettings();
     if (state.tab === "orders") await loadOrders();
     if (state.tab === "journal" && (first || Date.now() - (state.jAt || 0) > 60000)) await loadJournal();
@@ -586,3 +589,6 @@ go(state.tab);
 </body>
 </html>
 """
+
+PAGE_VERSION = hashlib.sha256(PAGE.encode()).hexdigest()[:12]
+PAGE_HTML = PAGE.replace("__PAGE_VERSION__", PAGE_VERSION).encode()

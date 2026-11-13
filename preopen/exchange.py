@@ -25,6 +25,9 @@ from typing import Any, Callable, Protocol
 
 LOG = logging.getLogger(__name__)
 BATCH = 15                      # POST /orders takes 1 to 15 orders
+POSTS_IN_FLIGHT = 1             # the account's order POSTs at a time: the CLOB times out bursts of concurrent submissions
+                                # from one account ("order timed out", docs); what waits meanwhile goes in the next batch
+TIMED_OUT_WAIT_S, TIMED_OUT_MAX_S = 5.0, 60.0   # after "order timed out": no new order this long, doubling while it lasts
 CANCEL_CHUNK = 200              # DELETE /orders takes up to 1000 ids; a chunk is also kept within the local cancel bucket's burst
 # The CLOB's refusal messages (docs: resources/error-codes, "Order Processing Errors"). They come per order in a 200, or
 # for the whole request as a 400 (`not enough balance / allowance` among them): the words decide the code, not the status.
@@ -296,6 +299,10 @@ class LiveExchange:
         self.wallet_list_off_until = 0.0
         self.orders = order_bucket or Bucket(settings.order_rate, settings.order_burst)
         self.cancels = cancel_bucket or Bucket(settings.cancel_rate, settings.cancel_burst)
+        self._outbox: list[tuple[list[tuple[OrderSpec, Any, str]], asyncio.Future]] = []   # signed, waiting for the sender
+        self._senders: list[asyncio.Task] = []
+        self._wake: asyncio.Event | None = None
+        self._timeouts = 0              # "order timed out" answers in a row
 
     def _on_rate(self, update: Any) -> None:
         if getattr(update, "tier", None):
@@ -320,6 +327,8 @@ class LiveExchange:
         LOG.info("Polymarket 账户 %s（%s），签名地址 %s", self.wallet, self.wallet_type, self.client.signer)
 
     async def close(self) -> None:
+        for task in self._senders:
+            task.cancel()
         if self.client is not None:
             with contextlib.suppress(Exception):
                 await self.client.close()
@@ -343,8 +352,8 @@ class LiveExchange:
 
     async def place(self, specs: list[OrderSpec], on_signed: OnSigned | None = None) -> list[Placed]:
         """Sign every order, hand the hashes to `on_signed` (the caller writes them down: if that raises, nothing is
-        sent), then POST them in batches of 15."""
-        from polymarket import PolymarketError, RateLimitError, RequestRejectedError, UserInputError
+        sent), then POST them: one POST of the account at a time, up to 15 orders, other windows' orders with them."""
+        from polymarket import PolymarketError, UserInputError
         out: dict[str, Placed] = {}
         signed: list[tuple[OrderSpec, Any, str]] = []
         for spec in specs:
@@ -360,6 +369,65 @@ class LiveExchange:
             signed.append((spec, order, order_hash(order, neg_risk=spec.neg_risk)))
         if signed and on_signed is not None:
             on_signed([(spec.ref, h, int(o.salt)) for spec, o, h in signed])  # durable before the first byte is sent
+        if signed:
+            out.update(await self._submit(signed))
+        return [out[s.ref] for s in specs]
+
+    async def _submit(self, signed: list[tuple[OrderSpec, Any, str]]) -> dict[str, Placed]:
+        """Hand signed orders to the sender and wait for their answers. One POST of the account is in flight at a time;
+        orders signed meanwhile by the other workers wait and go together, up to 15 to a POST (a window's orders are
+        never split while they fit)."""
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        self._outbox.append((signed, future))
+        if self._wake is None:
+            self._wake = asyncio.Event()
+        self._senders = [t for t in self._senders if not t.done()]
+        while len(self._senders) < POSTS_IN_FLIGHT:
+            self._senders.append(loop.create_task(self._sender(), name="order-sender"))
+        self._wake.set()
+        return await future
+
+    async def _sender(self) -> None:
+        while True:
+            if not self._outbox:
+                self._wake.clear()
+                await self._wake.wait()
+                continue
+            groups = [self._outbox.pop(0)]
+            size = len(groups[0][0])
+            while self._outbox and size + len(self._outbox[0][0]) <= BATCH:
+                group = self._outbox.pop(0)
+                groups.append(group)
+                size += len(group[0])
+            items = [item for signed, _ in groups for item in signed]
+            try:
+                results = await self._post(items)
+            except asyncio.CancelledError:
+                for _, future in groups:
+                    future.cancel()
+                raise
+            except BaseException as error:  # the request itself blew up: every caller of the batch sees it
+                for _, future in groups:
+                    if not future.done():
+                        future.set_exception(error)
+                continue
+            for signed, future in groups:
+                if not future.done():
+                    future.set_result({spec.ref: results[spec.ref] for spec, _, _ in signed})
+            stopped = next((r for r in results.values() if r.status == "not_sent" and r.wait > 0), None)
+            if stopped is not None:  # refused before processing (429, a restart, timed out): what waits is not sent
+                waiting, self._outbox = self._outbox, []
+                for signed, future in waiting:
+                    if not future.done():
+                        future.set_result({spec.ref: Placed(spec.ref, "not_sent", code=stopped.code, message="前一批被拒，没发",
+                                                            hash=h, salt=int(o.salt), wait=stopped.wait)
+                                           for spec, o, h in signed})
+
+    async def _post(self, signed: list[tuple[OrderSpec, Any, str]]) -> dict[str, Placed]:
+        """POST signed orders in batches of 15 and read each answer."""
+        from polymarket import PolymarketError, RateLimitError, RequestRejectedError
+        out: dict[str, Placed] = {}
         stopped: Placed | None = None
         for i in range(0, len(signed), BATCH):
             batch = signed[i:i + BATCH]
@@ -389,7 +457,10 @@ class LiveExchange:
                     continue
                 code = refusal_code(str(error), f"http_{error.status}")
                 if code == "timed_out":  # 500 "order timed out": rejected before reaching the book, safe to send again
-                    stopped = Placed("", "not_sent", code=code, message=f"下单超时被拒（{error.status}）：{error}", wait=5.0)
+                    self._timeouts += 1
+                    wait = min(TIMED_OUT_MAX_S, TIMED_OUT_WAIT_S * 2 ** (self._timeouts - 1))
+                    stopped = Placed("", "not_sent", code=code, message=f"下单超时被拒（{error.status}，连续第 {self._timeouts} 次）：{error}",
+                                     wait=wait)
                     for spec, o, h in batch:
                         out[spec.ref] = Placed(spec.ref, "not_sent", code=code, message=stopped.message, hash=h,
                                                salt=int(o.salt), wait=stopped.wait)
@@ -413,6 +484,7 @@ class LiveExchange:
                     out[spec.ref] = Placed(spec.ref, "unknown", code="malformed", message=f"{len(responses)} 个应答对 {len(batch)} 张单",
                                            hash=h, salt=int(o.salt))
                 continue
+            self._timeouts = 0
             for (spec, o, h), r in zip(batch, responses):
                 if getattr(r, "ok", False):
                     out[spec.ref] = Placed(spec.ref, "open", order_id=str(r.order_id), hash=h, salt=int(o.salt),
@@ -424,7 +496,7 @@ class LiveExchange:
                         code = refusal_code(message, code)
                     out[spec.ref] = Placed(spec.ref, "unknown" if code == "duplicated" else "rejected", code=code,
                                            message=message, hash=h, salt=int(o.salt), wait=TRANSIENT_WAIT.get(code, 0.0))
-        return [out[s.ref] for s in specs]
+        return out
 
     async def cancel(self, ids: list[str]) -> Cancelled:
         """Cancel by id in chunks the local bucket admits whole. A refusal before processing (429, a restart) ends the

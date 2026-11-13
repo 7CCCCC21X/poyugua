@@ -95,6 +95,12 @@ class WebServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("HttpOnly", dict(extra)["Set-Cookie"])
         status, _, body, _ = await s.respond("GET", "/api/status", {"cookie": cookie}, b"")
         self.assertEqual((status, json.loads(body)["ok"]), (200, 1))
+        # the page knows its version and the status says the running one: a page left open across a deploy reloads
+        page = (await s.respond("GET", "/", {}, b""))[2].decode()
+        version = json.loads(body)["page"]
+        self.assertRegex(version, r"^[0-9a-f]{12}$")
+        self.assertIn(f'const PAGE_VERSION = "{version}";', page)
+        self.assertNotIn("__PAGE_VERSION__", page)
         self.assertEqual((await s.respond("GET", "/api/status", {"x-telegram-init-data": init_data()}, b""))[0], 200)
         self.assertEqual((await s.respond("GET", "/api/status", {"x-telegram-init-data": init_data("5")}, b""))[0], 401)
         self.assertEqual((await s.respond("GET", "/api/status", {"authorization": "Bearer correct-horse-battery"}, b""))[0], 200)

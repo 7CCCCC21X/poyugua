@@ -2,6 +2,7 @@
 own models: the review's scenarios as it reproduced them — the CLOB takes the orders, then the process dies or the
 gateway answers a bare 503; another strategy's identical orders on the same API key; a balance endpoint down for ten
 minutes — run through the code paths that run live (signing, the order hash, batches, lookups, cancels)."""
+import asyncio
 import contextlib
 import datetime as dt
 import json
@@ -19,7 +20,7 @@ from polymarket.models.clob.cancel import CancelOrdersResponse
 from polymarket.models.clob.order_response import AcceptedOrder
 from polymarket.models.clob.orders import SignedOrder
 import preopen.markets as mk
-from preopen.exchange import Bucket, LiveExchange, order_hash
+from preopen.exchange import Bucket, LiveExchange, OrderSpec, order_hash
 from preopen.ledger import Ledger
 
 WALLET = "0x1111111111111111111111111111111111111111"
@@ -434,6 +435,61 @@ class CancelledElsewhereTest(unittest.IsolatedAsyncioTestCase):
         await tick(e, 5)
         await tick(e, 1)
         self.assertGreater(len(fake.live()), 100)      # quoted again once resumed
+
+
+class SenderTest(unittest.IsolatedAsyncioTestCase):
+    """One order POST of the account at a time (the CLOB times out concurrent submissions from one account, docs):
+    windows signed meanwhile wait and go together, up to 15 orders to a POST."""
+
+    def specs(self, fake, pub, clock, n):
+        out = []
+        for i in range(n):
+            m = fake.know(pub.list_window("btc", T0 + 600 + 300 * i))
+            up, down = json.loads(m["clobTokenIds"])
+            out.append([OrderSpec(f"w{i}/{side}", token, D("0.47"), D("10"), T0 + 650 + 300 * i, market=m["conditionId"])
+                        for side, token in (("up", up), ("down", down))])
+        return out
+
+    async def test_windows_signed_together_share_posts_one_at_a_time(self):
+        clock = Clock()
+        fake, pub = FakeClob(clock), FakePublic(clock)
+        flying, most, sizes = 0, 0, []
+        real = fake.post_orders
+
+        async def slow(orders):
+            nonlocal flying, most
+            flying += 1
+            most = max(most, flying)
+            sizes.append(len(orders))
+            await asyncio.sleep(0.05)
+            try:
+                return await real(orders)
+            finally:
+                flying -= 1
+        fake.post_orders = slow
+        x = adapter(fake, settings())
+        results = await asyncio.gather(*(x.place(group) for group in self.specs(fake, pub, clock, 16)))  # 16 workers
+        self.assertEqual(most, 1)                                   # never two POSTs in flight
+        self.assertEqual(sizes, [14, 14, 4])                        # 7 windows to a POST, a window never split
+        self.assertEqual({r.status for group in results for r in group}, {"open"})
+        await x.close()
+
+    async def test_order_timed_out_holds_what_waits_and_backs_off(self):
+        clock = Clock()
+        fake, pub = FakeClob(clock), FakePublic(clock)
+        x = adapter(fake, settings())
+        groups = self.specs(fake, pub, clock, 3)
+        waits = []
+        for _ in range(3):
+            fake.answers = ["timed_out"]
+            results = await asyncio.gather(*(x.place(g) for g in groups))
+            self.assertEqual({r.status for group in results for r in group}, {"not_sent"})  # nothing rests: sent again later
+            waits.append(results[0][0].wait)
+        self.assertEqual(waits, [5.0, 10.0, 20.0])               # doubling while it lasts
+        await x.place(groups[0])                                   # accepted: the next timeout starts again at 5 s
+        fake.answers = ["timed_out"]
+        self.assertEqual((await x.place(groups[1]))[0].wait, 5.0)
+        await x.close()
 
 
 class RefusalWordsTest(unittest.IsolatedAsyncioTestCase):
