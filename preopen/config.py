@@ -48,7 +48,7 @@ class Settings:
     cancel_s: int = 60                 # cancel this long before the start
     expiry_s: int = 30                 # the orders expire (GTD) this long before the start: the backstop of the cancel
     entry_s: int = 300                 # no new order this close to the start
-    max_open_usd: D = D("0")           # the bot's own orders in any one market at most this (0 = the balance; markets don't share)
+    max_open_usd: D = D("0")           # the bot's own resting orders in all at most this (0 = only the balance limits it)
     max_exposure_usd: D = D("0")       # the worst case of the unsettled positions (one-sided fills) at most this (0 = off)
     max_daily_loss_usd: D = D("0")     # today's settled loss at most this, then no new quote until Beijing midnight (0 = off)
     key_exclusive: bool = False        # on: the API key is the bot's alone (market sweeps and cancel-all may be used)
@@ -346,8 +346,8 @@ CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
     ("PREOPEN_EXPIRY_SECONDS", "开场前几秒订单自动失效", "0～3600：撤单发不出去时的兜底（默认 30）"),
     ("PREOPEN_ENTRY_SECONDS", "距开场不足几秒不再新挂", "至少比撤单多 60 秒、比到期多 150 秒（GTD 订单要求到期在 3 分钟后；默认 300）"),
     ("PREOPEN_WEEKEND", "周末也挂", "off = 北京时间周六 00:00 到周一 08:00 开始的场次不挂"),
-    ("PREOPEN_MAX_OPEN_USD", "每场资金上限（$）", "Polymarket 按市场分别占用余额、各场不共用：每一场的挂买单合计不超过余额就能挂，"
-     "所以余额够一场就能挂全部场次。0 = 每场都可用到全部余额；设了就是本程序在每一场最多挂这么多（深档按顺序放得下几档挂几档）"),
+    ("PREOPEN_MAX_OPEN_USD", "资金上限（$）", "0 = 不限，只受余额限制：本程序全部挂单合计最多占用这么多 pUSD。Polymarket 的挂买单"
+     "占用余额，所有市场的挂单共用一份余额（还能挂 = 余额 − 全部挂单未成交部分），开场最近的先挂"),
     ("PREOPEN_MAX_EXPOSURE_USD", "持仓最坏亏损上限（$）", "0 = 不限：还没结算的场次里，单边成交（没配对的份数）最坏会亏的钱到了这个数，就撤掉没成交的挂单、不再新挂，结算后自动恢复"),
     ("PREOPEN_MAX_DAILY_LOSS_USD", "日亏损上限（$）", "0 = 不限：今天（北京时间）已结算的亏损到了这个数，就撤掉没成交的挂单、今天不再新挂，零点后自动恢复"),
     ("PREOPEN_MAX_ATTEMPTS", "一档最多重报几次", "1～20：因这一场自身原因失败（单边被拒、被别人撤掉）后最多重新报价几次"),
@@ -375,7 +375,7 @@ CONTROL_FORMS: dict[str, dict] = {
     "PREOPEN_EXPIRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["10", "20", "30", "45"], "unit": "秒"},
     "PREOPEN_ENTRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["180", "240", "300", "600"], "unit": "秒"},
     "PREOPEN_WEEKEND": {"kind": "choice", "group": "预挂", "options": [["on", "on 周末照挂"], ["off", "off 周末不挂"]]},
-    "PREOPEN_MAX_OPEN_USD": {"kind": "number", "group": "资金", "presets": ["0", "10", "20", "50", "100", "500"], "unit": "$", "zero": "每场可用全部余额"},
+    "PREOPEN_MAX_OPEN_USD": {"kind": "number", "group": "资金", "presets": ["0", "50", "100", "500", "1000", "5000", "20000"], "unit": "$", "zero": "不限"},
     "PREOPEN_MAX_EXPOSURE_USD": {"kind": "number", "group": "资金", "presets": ["0", "20", "50", "100", "500"], "unit": "$", "zero": "不限"},
     "PREOPEN_MAX_DAILY_LOSS_USD": {"kind": "number", "group": "资金", "presets": ["0", "20", "50", "100", "500"], "unit": "$", "zero": "不限"},
     "PREOPEN_MAX_ATTEMPTS": {"kind": "number", "group": "资金", "presets": ["1", "2", "3", "5"], "unit": "次"},

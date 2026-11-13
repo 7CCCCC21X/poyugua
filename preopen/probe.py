@@ -82,15 +82,14 @@ async def probe(settings: Settings, pub: PublicApi, hours: float = 1.0, now: flo
                              f"{mk.fmt(settings.first.price * 100)}¢ 已有 {ahead:.0f} 份排队")
             lines.append(f"    {mk.name_of(coin)}：" + "；".join(parts))
     windows = len(starts) * len(settings.coins)
-    per = capital_note(settings)
-    lines.append(f"资金：范围内 {windows} 场，每场挂满要 ${settings.window_usd:.2f}。Polymarket 按市场分别占用余额、各场不共用，"
-                 f"余额 ≥ ${per:.2f} 就能把这 {windows} 场全挂上；多出来的部分是成交的缓冲（成交花掉余额，"
-                 f"余额低于某一场的挂单合计时，交易所会撤掉那一场的单）")
-    if settings.max_open_usd and settings.max_open_usd < settings.window_usd:
-        lines.append(f"PREOPEN_MAX_OPEN_USD=${settings.max_open_usd}（每场上限）：每场只挂放得下的档位")
+    full = capital_note(settings, windows)
+    lines.append(f"资金：范围内 {windows} 场全挂上要预留 ${full:,.2f}（每场 ${settings.window_usd:.2f}）。Polymarket 的挂买单占用"
+                 f" pUSD 余额，所有市场的挂单共用一份余额（还能挂 = 余额 − 全部挂单未成交部分）；钱不够时开场最近的先挂")
+    if settings.max_open_usd:
+        lines.append(f"PREOPEN_MAX_OPEN_USD=${settings.max_open_usd}：约能同时挂 {int(settings.max_open_usd / settings.window_usd)} 场")
     return "\n".join(lines)
 
 
-def capital_note(settings: Settings) -> D:
-    """The balance that covers every window: one window's orders (funds are held per market, not shared)."""
-    return min(settings.window_usd, settings.max_open_usd) if settings.max_open_usd > 0 else settings.window_usd
+def capital_note(settings: Settings, windows: int) -> D:
+    """What every window in range quoted at once would hold: Polymarket holds every open BUY against the one balance."""
+    return settings.window_usd * windows

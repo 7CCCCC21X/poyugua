@@ -400,13 +400,14 @@ function renderTop(d) {
   $("mode").textContent = d.mode; $("mode").className = "badge " + (d.live ? "live" : "paper");
   $("runstate").textContent = d.paused ? "已暂停" : "运行中"; $("runstate").className = "badge " + (d.paused ? "pause" : "run");
   const t = d.today || {};
-  $("bar").innerHTML = [`挂着 <b>${d.windows}</b> 场 <b>${d.resting}</b> 张`, `余额 <b>${money(d.balance)}</b>`,
-    `每场占用 ${money(d.per_market)}` + (d.buffer != null && d.buffer < 0 ? ` <span class="warn">余额不够一场</span>` : ""), `今日盈亏 ${signed(t.pnl || 0)}`, d.unknown ? `<span class="warn">状态不明 ${d.unknown}</span>` : "", `更新 ${esc(d.now_text)}`]
+  $("bar").innerHTML = [`挂着 <b>${d.windows}</b> 场 <b>${d.resting}</b> 张`, `预留 <b>${money(d.reserved)}</b>` + (d.settings.max_open ? ` / 上限 ${money(d.settings.max_open)}` : ""),
+    `余额 <b>${money(d.balance)}</b>`, `今日盈亏 ${signed(t.pnl || 0)}`, d.unknown ? `<span class="warn">状态不明 ${d.unknown}</span>` : "", `更新 ${esc(d.now_text)}`]
     .filter(Boolean).map((x) => `<span>${x}</span>`).join("");
   $("pauseBtn").disabled = d.paused; $("resumeBtn").disabled = !d.paused;
   $("stamp").textContent = "北京时间 " + d.now_text;
 }
 function card(k, v, s) { return `<div class="card"><div class="k">${esc(k)}</div><div class="v">${v}</div><div class="s">${s || ""}</div></div>`; }
+const REDEEM = {pending:"待领取", retry:"重试中", done:"已领取", failed:"领取失败", manual:"需手动领取", none:"—", "":""};
 const STATE = {open:"挂着", placing:"发送中", unknown:"状态不明", gone:"已撤/核对中", final:"已结束", rejected:"被拒", not_sent:"没发出", not_found:"没挂上"};
 function renderOverview(d) {
   $("blocked").hidden = !d.blocked; $("blockedText").textContent = d.blocked ? "⛔ " + d.blocked : "";
@@ -415,9 +416,9 @@ function renderOverview(d) {
   const t = d.today || {};
   $("cards").innerHTML = [
     card("挂着", `${d.windows} 场`, `${d.resting} 张单，合计 ${money(d.reserved)}` + (d.unknown ? `，<span class="warn">${d.unknown} 张状态不明</span>` : "")),
-    card("余额", money(d.balance), `每场占用 ${money(d.per_market)}，各场不共用` + (d.buffer == null ? "" :
-      d.buffer < 0 ? `<br><span class="warn">不够一场，挂不了</span>` : `<br>成交缓冲 ${money(d.buffer)}`) +
-      (d.settings.max_open ? `<br>每场上限 ${money(d.settings.max_open)}` : "")),
+    card("余额", money(d.balance), `每场预留 ${money(d.window_usd)}，所有挂单共用` + (d.room == null ? "" :
+      d.fits > 0 ? `<br>还能再挂约 ${d.fits} 场（${money(d.room)}）` : `<br><span class="warn">已用满，开场最近的先挂</span>`) +
+      (d.settings.max_open ? `<br>上限 ${money(d.settings.max_open)}` : "")),
     card("今天成交", `${t.fills || 0} 场`, `双边 ${t.both || 0}，已结算 ${t.settled || 0}`),
     card("今天盈亏", signed(t.pnl || 0), "已结算部分"),
     card("开放→挂上", d.lags.open == null ? "—" : d.lags.open + " 秒", "中位（市场约在创建后 75～90 秒开放）"),
@@ -428,7 +429,8 @@ function renderOverview(d) {
   const s = d.settings;
   const nxt = d.next_listing ? `${d.next_listing.start}（预计 ${d.next_listing.expected} 发布）` : "范围内都已发布";
   $("info").innerHTML = [
-    ["币种", d.coins.join(" ") || "无"], ["每边", d.levels + `（每场挂满 ${money(d.window_usd)}，各场分别占用余额、不共用）`],
+    ["币种", d.coins.join(" ") || "无"], ["每边", d.levels + `（每场预留 ${money(d.window_usd)}）`],
+    ["范围内", d.coverage ? d.coverage.text : "—"],
     ["时间", `开场前 ${s.ahead_min} 分钟内的场次；开场前 ${s.cancel_s} 秒撤单、${s.expiry_s} 秒到期、${s.entry_s} 秒内不新挂` + (s.weekend ? "" : "；周末不挂")],
     ["已发布到", d.listed_until || "—"], ["下一场", nxt], ["账户快照", d.snapshot_age == null ? "还没读到" : d.snapshot_age + " 秒前"],
     ["队列", `排队 ${d.queue}，等候 ${d.waiting}，正在挂 ${d.placing}`],
@@ -437,7 +439,7 @@ function renderOverview(d) {
     ["订单号=哈希", d.id_is_hash == null ? "未知" : (d.id_is_hash ? "是" : "否")], ["限流档位", d.tier || "未知"], ["发布提前量", d.lead_h + " 小时"],
   ].map(([k, v]) => `<div>${esc(k)}</div><div>${esc(v)}</div>`).join("");
   const pend = (d.pending || []).map((p) => `<div>⚠️ ${esc(p.what)}：${esc(p.window)} ${esc(p.side)}（${esc(p.since)}）<span class="muted small">${esc(p.note)}</span></div>`);
-  if (d.unmanaged) pend.push(`<div>账户里另有 ${d.unmanaged} 张本程序没记录的挂单（${money(d.unmanaged_usd)}），只占用它们各自那一场的余额</div>`);
+  if (d.unmanaged) pend.push(`<div>账户里另有 ${d.unmanaged} 张本程序没记录的挂单（${money(d.unmanaged_usd)}），它们也占用余额</div>`);
   if (d.cooldown) pend.push(`<div>接口冷却：${esc(d.cooldown)}</div>`);
   $("pending").innerHTML = pend.length ? pend.join("") : '<span class="muted">无</span>';
   $("upcoming").innerHTML = "<tr><th>场次</th><th>还有</th><th>档</th><th>价格×份数</th><th>涨</th><th>跌</th></tr>" + (d.upcoming.map((q) =>
@@ -447,7 +449,8 @@ function renderOverview(d) {
     '<tr><td colspan="6" class="muted">没有挂着的单</td></tr>');
   $("fills").innerHTML = "<tr><th>场次</th><th>价格</th><th>涨成交</th><th>跌成交</th><th>结果</th><th>盈亏</th><th>领取</th></tr>" + (d.fills.map((q) =>
     `<tr><td>${esc(q.coin)} ${esc(q.when)}</td><td>${q.price}¢</td><td>${q.up || ""}</td><td>${q.down || ""}</td><td>${esc(q.result || (q.phase === "settled" ? "" : "待结算"))}</td>` +
-    `<td>${q.pnl == null ? "" : signed(q.pnl)}</td><td>${esc(q.redeem)}</td></tr>`).join("") || '<tr><td colspan="7" class="muted">还没有成交</td></tr>');
+    `<td>${q.pnl == null ? "" : signed(q.pnl)}</td><td title="${esc(q.redeem_error || "")}">${esc(REDEEM[q.redeem] ?? q.redeem)}` +
+    (q.redeem_error ? `<div class="muted small">${esc(q.redeem_error.slice(0, 60))}…</div>` : "") + `</td></tr>`).join("") || '<tr><td colspan="7" class="muted">还没有成交</td></tr>');
   $("errors").innerHTML = d.errors.length ? d.errors.map((e) => `<div>${esc(e.when)} ${esc(e.text)}</div>`).join("") : "无";
 }
 

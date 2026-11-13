@@ -49,8 +49,8 @@ class PlacementTest(unittest.IsolatedAsyncioTestCase):
         pub.list_window("eth", fresh, created=clock.t - 0.5)
         await e.discover()
         first = e.queue.get_nowait()
-        self.assertEqual(first[0], 0)  # priority class 0: fresh listings first
-        self.assertEqual(first[1], fresh)
+        self.assertEqual(first[:2], (0, 0))  # not refused, and priority class 0: fresh listings first
+        self.assertEqual(first[2], fresh)
         e.queue.put_nowait(first)
         await drain(e)
         placed_starts = [int(q["start"]) for q in quotes(e)]
@@ -107,16 +107,39 @@ class PlacementTest(unittest.IsolatedAsyncioTestCase):
         await drain(e)
         self.assertEqual(len(x.placed), 2)
 
-    async def test_every_window_is_quoted_on_the_balance_one_window_needs(self):
-        e, clock, pub, x = make_engine(balance="15")  # one window takes $9.80: each market is checked on its own
+    async def test_one_balance_for_every_window_the_soonest_first(self):
+        e, clock, pub, x = make_engine(balance="20")  # every open order counts against the one balance: two windows fit
         starts = mk.window_starts(clock.t, e.s)
         pub.list_range(["btc", "eth"], starts)
         await e.account_once()
         await e.discover()
         await drain(e)
-        self.assertEqual(len(quotes(e, phase="active")), 2 * len(starts))
-        self.assertGreater(e.reserved(), 10 * D("15"))  # all of them together: far more than the balance, as allowed
-        self.assertEqual(e.budget_note, "")
+        placed = quotes(e)
+        self.assertEqual(len(placed), 2)
+        self.assertEqual({q["start"] for q in placed}, {starts[0]})  # the soonest: both coins' first window
+        self.assertLessEqual(e.reserved(), D("20"))
+        await tick(e, 5)
+        self.assertEqual(len(quotes(e)), 2)
+        self.assertIn(f"{2 * len(starts) - 2} 场因资金不够还没挂", e.budget_note)
+        cov = e.coverage()
+        self.assertEqual(cov["counts"]["resting"], 2)
+        self.assertEqual(cov["counts"]["budget"], 2 * len(starts) - 2)
+        self.assertIn("资金不够排在后面", cov["text"])
+
+    async def test_budget_cap_holds_the_later_windows(self):
+        e, clock, pub, x = make_engine(settings(PREOPEN_MAX_OPEN_USD="20"))
+        starts = mk.window_starts(clock.t, e.s)
+        pub.list_range(["btc"], starts)
+        await e.account_once()
+        await e.discover()
+        await drain(e)
+        placed = quotes(e)
+        self.assertEqual(len(placed), 2)  # $9.80 each: two fit under $20
+        self.assertEqual([q["start"] for q in placed], starts[:2])  # the soonest
+        e.sweep()
+        await drain(e)
+        self.assertEqual(len(quotes(e)), 2)
+        self.assertIn("资金", e.budget_note)
 
     async def test_a_balance_below_one_window_quotes_nothing(self):
         e, clock, pub, x = make_engine(balance="9")
@@ -127,39 +150,38 @@ class PlacementTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(x.placed, [])
         await tick(e, 5)  # the next sweep says why
         self.assertEqual(x.placed, [])
-        self.assertIn("4 场挂不下", e.budget_note)
+        self.assertIn("4 场因资金不够还没挂", e.budget_note)
 
-    async def test_the_per_market_cap_takes_the_levels_that_fit(self):
-        for cap, levels in (("20", {0}), ("30", {0, 1})):  # 49x10 is $9.80 a window, 48x20 another $19.20
+    async def test_the_cap_takes_the_levels_that_fit_the_nearest_first(self):
+        # 49x10 is $9.80 a window, 48x20 another $19.20
+        for cap, levels in (("20", [{0}, {0}, set()]), ("30", [{0, 1}, set(), set()])):
             with self.subTest(cap=cap):
                 e, clock, pub, x = make_engine(settings(PREOPEN_MAX_OPEN_USD=cap, PREOPEN_LEVELS="48x20"))
                 starts = mk.window_starts(clock.t, e.s)[:3]
                 pub.list_range(["btc"], starts)
                 await tick(e)
-                for t in starts:
-                    self.assertEqual({q["level"] for q in quotes(e, mk.slug_of("btc", t))}, levels)
+                self.assertEqual([{q["level"] for q in quotes(e, mk.slug_of("btc", t))} for t in starts], levels)
 
-    async def test_another_strategys_orders_count_in_their_own_market_only(self):
+    async def test_another_strategys_orders_count_against_the_balance(self):
         e, clock, pub, x = make_engine(balance="15")
         a, b = mk.window_starts(clock.t, e.s)[:2]
         ma = pub.list_window("btc", a)
         pub.list_window("btc", b)
         token = __import__("json").loads(ma["clobTokenIds"])[0]
-        await x.place([OrderSpec("website/up", token, D("0.50"), D("20"), a + 30, market=ma["conditionId"])])  # $10 in market a
+        await x.place([OrderSpec("website/up", token, D("0.50"), D("10"), a + 30, market=ma["conditionId"])])  # $5 open
         await tick(e)
+        self.assertEqual([q["start"] for q in quotes(e)], [a])  # $10 left: one window of $9.80
         await tick(e, 5)
-        self.assertEqual([q["start"] for q in quotes(e)], [b])  # a has $5 left: not enough; b has all $15
-        self.assertIn("1 场挂不下", e.budget_note)
+        self.assertIn("1 场因资金不够还没挂", e.budget_note)
 
-    async def test_fills_that_drain_the_balance_lose_a_markets_orders_until_it_is_back(self):
-        e, clock, pub, x = make_engine(balance="15")
+    async def test_a_balance_that_falls_under_the_orders_loses_the_newest_until_it_is_back(self):
+        e, clock, pub, x = make_engine(balance="30")
         starts = mk.window_starts(clock.t, e.s)[:3]
         pub.list_range(["btc"], starts)
         await tick(e)
         a, b, c = quotes(e)
-        x.fill(a["orders"]["up"]["id"], D("10"))  # $4.90 spent: $10.10 left, still above every market's $9.80
-        self.assertEqual(len(x.book), 5)
-        x.fill(b["orders"]["up"]["id"], D("10"))  # $5.20 left: market c's $9.80 is no longer covered
+        x.cash = D("20")  # $10 moved out of the wallet: $29.40 of orders on $20
+        x.enforce()
         self.assertEqual({r.market for r in x.book.values()}, {a["condition_id"], b["condition_id"]})
         await tick(e, 10)
         await tick(e, 6)
@@ -169,12 +191,12 @@ class PlacementTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({q["phase"] for q in (quotes(e, a["slug"])[0], quotes(e, b["slug"])[0])}, {"active"})
         self.assertEqual(e.hold(), "")  # no blanket pause: the others keep going
         await tick(e, 10)
-        self.assertEqual(len(quotes(e, c["slug"])), 1)  # $5.20 cannot take $9.80: c waits
-        self.assertIn("挂不下", e.budget_note)
-        x.cash += D("10")  # the winnings redeemed
+        self.assertEqual(len(quotes(e, c["slug"])), 1)  # $0.40 of room: c waits
+        self.assertIn("资金不够", e.budget_note)
+        x.cash = D("30")
         await tick(e, 31)
         await tick(e, 5)
-        self.assertEqual(quotes(e, c["slug"])[-1]["phase"], "active")  # quoted again, on its own market's room
+        self.assertEqual(quotes(e, c["slug"])[-1]["phase"], "active")  # quoted again once the money is back
 
     async def test_hold_without_snapshot_and_during_cooldown(self):
         e, clock, pub, x = make_engine()
@@ -410,18 +432,64 @@ class RefusalTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(quotes(e)), 1)
         self.assertEqual(quotes(e)[0]["attempt"], 0)
 
-    async def test_permanent_refusal_is_not_quoted_again(self):
+    async def test_a_refusal_about_the_order_counts_against_the_window_up_to_the_cap(self):
         e, clock, pub, x = make_engine()
         start = T0 + 1800
         slug = mk.slug_of("btc", start)
         pub.list_window("btc", start)
-        x.reject[f"{slug}#0@0/up"] = ("rejected", "invalid")
-        x.reject[f"{slug}#0@0/down"] = ("rejected", "invalid")
+        for attempt in range(3):
+            for side in ("up", "down"):
+                x.reject[f"{slug}#0@{attempt}/{side}"] = ("rejected", "post_only_would_cross")
         await tick(e)
-        await tick(e, 6)
-        await tick(e, 120)
-        self.assertEqual(len(quotes(e, slug)), 1)
-        self.assertTrue(quotes(e, slug)[0]["permanent"])
+        for _ in range(8):
+            await tick(e, 61)
+        self.assertEqual([q["attempt"] for q in quotes(e, slug)], [0, 1, 2])  # three tries, then given up on
+        self.assertTrue(all(q["counted"] for q in quotes(e, slug)))
+        self.assertFalse(any(q.get("permanent") for q in quotes(e, slug)))
+        self.assertEqual(e.hold(), "")  # the window's own refusal holds nothing else up
+        self.assertIn("失败 3 次", e.coverage()["text"])
+
+    async def test_an_account_refusal_holds_every_window_and_strikes_off_none(self):
+        e, clock, pub, x = make_engine()
+        starts = mk.window_starts(clock.t, e.s)[:3]
+        pub.list_range(["btc"], starts)
+        for t in starts:
+            for side in ("up", "down"):
+                x.reject[f"{mk.slug_of('btc', t)}#0@0/{side}"] = ("rejected", "invalid_expiration")
+        await e.account_once()
+        await e.discover()
+        await drain(e)
+        self.assertEqual(len(x.placed), 0)
+        self.assertEqual(quotes(e), [])                  # no record, no attempt used
+        self.assertIn("交易所拒单（invalid_expiration", e.hold())
+        self.assertIn("暂停中", e.coverage()["text"])
+        x.reject.clear()
+        await tick(e, 31)  # the 30 s hold over: every window placed
+        await tick(e, 1)
+        self.assertEqual({q["start"] for q in quotes(e, phase="active")}, set(starts))
+        self.assertEqual(e.refused_streak, 0)
+
+    async def test_refusals_in_unknown_words_hold_everything_until_one_window_alone_is_refused(self):
+        e, clock, pub, x = make_engine()
+        a, b = mk.window_starts(clock.t, e.s)[:2]
+        ma = pub.list_window("btc", a)
+        pub.list_window("btc", b)
+        bad = mk.slug_of("btc", a)
+        x.refuse_market[ma["conditionId"]] = ("rejected", "unknown")  # every order on that market, every time
+        await e.account_once()
+        await e.discover()
+        await drain(e)
+        self.assertIn("交易所拒单（unknown", e.hold())  # unknown words: taken for the account's at first
+        self.assertEqual(quotes(e, bad), [])
+        await tick(e, 31)
+        await tick(e, 1)
+        await tick(e, 1)
+        # the other window went first and was accepted; the refused one, refused again since: its own
+        self.assertEqual(quotes(e, mk.slug_of("btc", b))[0]["phase"], "active")
+        (q,) = quotes(e, bad)
+        self.assertTrue(q["counted"])
+        self.assertIn("只拒这一场", q["reason"])
+        self.assertEqual(e.hold(), "")
 
 
 class UnknownTest(unittest.IsolatedAsyncioTestCase):
@@ -535,8 +603,8 @@ class ReviewRegressionTest(unittest.IsolatedAsyncioTestCase):
         await drain(e)
         self.assertEqual(len(quotes(e, phase="active")), 1)
 
-    async def test_fresh_listings_opening_together_are_each_budgeted_on_their_own(self):
-        e, clock, pub, x = make_engine(settings(PREOPEN_MARKETS="btc,eth,sol,xrp,doge,hype,bnb"), balance="10")
+    async def test_fresh_listings_opening_together_respect_the_cap(self):
+        e, clock, pub, x = make_engine(settings(PREOPEN_MARKETS="btc,eth,sol,xrp,doge,hype,bnb", PREOPEN_MAX_OPEN_USD="20"))
         start = mk.window_starts(clock.t, e.s)[-1]
         for coin in e.s.coins:
             m = pub.list_window(coin, start, created=clock.t - 60, accepting=None)
@@ -548,12 +616,12 @@ class ReviewRegressionTest(unittest.IsolatedAsyncioTestCase):
         unpark(e)
         slugs = []
         while not e.queue.empty():
-            slugs.append(e.queue.get_nowait()[2])
+            slugs.append(e.queue.get_nowait()[-1])
         for s_ in slugs:
             e.queued.discard(s_)
         await asyncio.gather(*(e.process(s_) for s_ in slugs))  # seven workers side by side
-        self.assertEqual(len(quotes(e, phase="active")), 7)  # $10 covers each market's $9.80: funds are not shared
-        self.assertEqual(e.reserved(), 7 * D("9.80"))
+        self.assertLessEqual(e.reserved(), D("20"))
+        self.assertEqual(len(quotes(e, phase="active")), 2)
 
     async def test_an_answer_in_flight_is_not_given_up(self):
         e, clock, pub, x = make_engine()

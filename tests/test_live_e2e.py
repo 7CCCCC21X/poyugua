@@ -18,6 +18,7 @@ from polymarket import RequestRejectedError, TransportError
 from polymarket.models.clob.cancel import CancelOrdersResponse
 from polymarket.models.clob.order_response import AcceptedOrder
 from polymarket.models.clob.orders import SignedOrder
+import preopen.markets as mk
 from preopen.exchange import Bucket, LiveExchange, order_hash
 from preopen.ledger import Ledger
 
@@ -54,6 +55,9 @@ class FakeClob:
         self.answers: list[str] = []
         self.posted = 0
         self.balance_usd = D("1000")
+        self.elsewhere = D(0)   # held by orders this key does not list (another key on the wallet): counted all the same
+        self.refused = 0
+        self.redeemed: list[str] = []
         self.balance_error: Exception | None = None
         self.missing = "404"
         self.market_cancels: list[str] = []
@@ -82,6 +86,14 @@ class FakeClob:
     async def post_orders(self, orders):
         answer = self.answers.pop(0) if self.answers else "ok"
         self.posted += len(orders)
+        if answer == "timed_out":  # docs: rejected before reaching the book, safe to send again
+            raise RequestRejectedError("order timed out", status=500)
+        # docs (concepts/order-lifecycle): maxOrderSize = balance − Σ(open order size − filled), every market's orders
+        need = sum(D(o.maker_amount) / 10**6 for o in orders)
+        held = sum(D(o.price) * (D(o.original_size) - D(o.size_matched)) for o in self.live()) + self.elsewhere
+        if held + need > self.balance_usd:
+            self.refused += len(orders)
+            raise RequestRejectedError("not enough balance / allowance", status=400)
         if answer == "lost":
             error = TransportError("timed out")
             error.__cause__ = httpx.ReadTimeout("read")
@@ -89,6 +101,8 @@ class FakeClob:
         ids = [self.book(o) for o in orders]
         if answer == "crash":
             raise Crash()
+        if answer == "duplicated":  # the very orders are on the book already
+            raise RequestRejectedError(f"order {ids[0]} is invalid. Duplicated.", status=400)
         if answer in ("502", "503"):
             raise RequestRejectedError("Bad Gateway" if answer == "502" else "Service Unavailable", status=int(answer))
         return [AcceptedOrder(order_id=i, status="live", making_amount=D(0), taking_amount=D(0), trade_ids=(),
@@ -137,6 +151,13 @@ class FakeClob:
 
     async def close(self):
         return None
+
+    async def redeem_positions(self, *, condition_id):
+        self.redeemed.append(condition_id)
+
+        async def wait():
+            return N(transaction_hash="0x" + "cd" * 32)
+        return N(wait=wait)
 
     # --- the market's side ---
     def fill(self, oid: str, shares: D) -> None:
@@ -286,6 +307,152 @@ class LiveEndToEndTest(unittest.IsolatedAsyncioTestCase):
                 eth = [q for q in quotes(e) if q["coin"] == "eth"]
                 self.assertEqual([q["attempt"] for q in eth], [0, 1])
                 self.assertEqual({o["state"] for o in eth[0]["orders"].values()}, {"not_found"})
+
+
+def seven_coins(clock, fake, pub, ahead="120"):
+    s = settings(PREOPEN_MARKETS="btc,eth,sol,xrp,doge,hype,bnb", PREOPEN_AHEAD_MINUTES=ahead, PREOPEN_PRICE_CENTS="47",
+                 PREOPEN_SHARES="10", PREOPEN_CANCEL_SECONDS="15", PREOPEN_EXPIRY_SECONDS="10", PREOPEN_ENTRY_SECONDS="300")
+    for coin in s.coins:
+        for t in mk.window_starts(clock.t, s):
+            fake.know(pub.list_window(coin, t))
+    return s
+
+
+class BalanceEndToEndTest(unittest.IsolatedAsyncioTestCase):
+    """The 11-13 live case: $75.10, seven coins at 47¢ x 10 ($9.40 a window), the weekend off on a Friday afternoon (no
+    window enters the range later). Per-market budgeting sent every window at once, the CLOB answered the batches over
+    the balance with 400 "not enough balance / allowance", and each of those windows was struck off for good: once the
+    first seven had started, nothing rested and nothing said why."""
+
+    def engine(self, clock, fake, pub, s, ledger=None):
+        return make_engine(s, clock=clock, ledger=ledger, exchange=adapter(fake, s), public=pub)[0]
+
+    async def test_the_next_windows_are_always_quoted_within_the_balance(self):
+        clock = Clock()
+        fake, pub = FakeClob(clock), FakePublic(clock)
+        fake.balance_usd = D("75.10")
+        s = seven_coins(clock, fake, pub)
+        e = self.engine(clock, fake, pub, s)
+        quoted = set()
+        for _ in range(240):  # twenty minutes in 5 s steps
+            await tick(e, 5)
+            held = sum(D(o.price) * D(o.original_size) for o in fake.live())
+            self.assertLessEqual(held, D("75.10"))
+            quoted |= {q["start"] for q in quotes(e)}
+        self.assertEqual(fake.refused, 0)              # nothing over the balance was ever sent
+        self.assertEqual(len(fake.live()), 14)         # the next window of every coin
+        self.assertEqual(len(quoted), 4)               # the four starts due in twenty minutes, none skipped: each
+        self.assertEqual(max(quoted) - min(quoted), 900)  # window's successor placed as its orders were cancelled
+        cov = e.coverage()
+        self.assertIn("资金不够排在后面", cov["text"])
+        self.assertNotIn("stopped", cov["counts"])     # no window struck off
+
+    async def test_a_balance_refusal_the_bot_could_not_see_coming_strikes_off_nothing(self):
+        clock = Clock()
+        fake, pub = FakeClob(clock), FakePublic(clock)
+        fake.balance_usd, fake.elsewhere = D("75.10"), D("60")  # $60 held by orders this key does not list
+        s = seven_coins(clock, fake, pub)
+        e = self.engine(clock, fake, pub, s)
+        await tick(e)
+        await tick(e, 1)
+        self.assertGreater(fake.refused, 0)
+        self.assertEqual(len(fake.live()), 2)          # $75.10 - $60 = $15.10: one window
+        self.assertIn("交易所说余额不够", e.hold())       # a minute's hold, then the balance read again
+        self.assertEqual([q for q in quotes(e) if q["phase"] != "active"], [])  # the refused: no record, no attempt
+        fake.elsewhere = D(0)
+        for _ in range(9):
+            await tick(e, 10)
+        self.assertEqual(len(fake.live()), 14)
+        self.assertNotIn("stopped", e.coverage()["counts"])
+
+    async def test_the_stuck_ledger_comes_back_after_the_fix(self):
+        """What the 11-13 ledger holds: windows closed for good on a 400 "not enough balance / allowance" for the whole
+        batch. Started on it, the bot quotes them again; a manual withdrawal and a refusal about the order stay."""
+        with tempfile.TemporaryDirectory() as d:
+            path = str(Path(d) / "live.sqlite3")
+            clock = Clock()
+            fake, pub = FakeClob(clock), FakePublic(clock)
+            fake.balance_usd = D("75.10")
+            s = seven_coins(clock, fake, pub)
+            ledger = Ledger(path)
+            starts = mk.window_starts(clock.t, s)
+            for coin in s.coins:
+                for t in starts:
+                    slug = mk.slug_of(coin, t)
+                    code, error, extra = "http_400", "not enough balance / allowance", {}
+                    if (coin, t) == ("btc", starts[0]):
+                        extra = {"manual": True, "reason": "网页手动撤单"}
+                    if (coin, t) == ("eth", starts[0]):
+                        code, error = "post_only_would_cross", "invalid post-only order: order crosses book"
+                    ledger.save({"key": f"{slug}#0@0", "slug": slug, "coin": coin, "start": t, "level": 0, "attempt": 0,
+                                 "price": "0.47", "shares": "10", "expiration": t + 50, "condition_id": f"0x{t:064x}",
+                                 "market_id": "", "neg_risk": False, "listed": None, "seen": clock.t, "created": clock.t - 600,
+                                 "phase": "settled", "reason": f"单边没挂上：涨 rejected {code}", "counted": True,
+                                 "permanent": True, "closed_at": clock.t - 600, "pnl": 0.0,
+                                 "orders": {side: {"asset": "", "state": "rejected", "id": "", "hash": "", "salt": 0,
+                                                   "filled": "0", "code": code, "error": error, "sent": clock.t - 600}
+                                            for side in ("up", "down")}, **extra})
+            e = self.engine(clock, fake, pub, s, ledger=ledger)
+            await e.discover()
+            self.assertEqual(e.coverage()["counts"].get("stopped"), 7 * len(starts))  # where 11-13 stood: all struck off
+            e.take_over()
+            await tick(e)
+            await tick(e, 1)
+            first = {q["coin"] for q in quotes(e) if q["phase"] == "active" and q["start"] == starts[0]}
+            self.assertEqual(first, {"sol", "xrp", "doge", "hype", "bnb"})  # btc withdrawn by hand, eth's own refusal
+            self.assertEqual(len(fake.live()), 14)  # the balance's seven windows: these five, then the next ones
+            self.assertIn("手动撤了", e.coverage()["text"])
+            ledger.close()
+
+
+class RefusalWordsTest(unittest.IsolatedAsyncioTestCase):
+    async def test_an_order_timed_out_is_sent_again_and_a_duplicate_is_looked_up(self):
+        for answer in ("timed_out", "duplicated"):
+            with self.subTest(answer=answer):
+                clock = Clock()
+                fake, pub = FakeClob(clock), FakePublic(clock)
+                fake.know(pub.list_window("btc", T0 + 1800))
+                s = settings()
+                e = make_engine(s, clock=clock, exchange=adapter(fake, s), public=pub)[0]
+                fake.answers = [answer]
+                await tick(e)
+                for _ in range(4):
+                    await tick(e, 5)
+                (q,) = [q for q in quotes(e) if q["phase"] == "active"]
+                self.assertEqual({o["state"] for o in q["orders"].values()}, {"open"})
+                self.assertEqual(len(fake.live()), 2)
+                self.assertEqual(fake.posted, 4 if answer == "timed_out" else 2)  # sent again / found by its hash
+
+
+class RedeemTest(unittest.IsolatedAsyncioTestCase):
+    async def test_a_web_wallet_without_a_relayer_key_is_told_once_and_claims_after_a_restart(self):
+        clock, start = Clock(), T0 + 1800
+        fake, pub = FakeClob(clock), FakePublic(clock)
+        m = fake.know(pub.list_window("btc", start))
+        s = settings()
+        x = adapter(fake, s)
+        x.wallet_type = "DEPOSIT_WALLET"
+        e = make_engine(s, clock=clock, exchange=x, public=pub)[0]
+        await tick(e)
+        (q,) = quotes(e)
+        fake.fill(q["orders"]["down"]["id"], D("10"))
+        clock.t = start + 300 + 61
+        pub.results[m["slug"]] = {**m, "closed": True, "outcomePrices": '["0", "1"]'}
+        for _ in range(5):
+            await tick(e, 30)
+        (q,) = quotes(e)
+        self.assertEqual(q["redeem"], "manual")
+        self.assertIn("Relayer", q["redeem_error"])
+        self.assertEqual(fake.redeemed, [])
+        s2 = settings(POLY_RELAYER_API_KEY="k", POLY_RELAYER_API_KEY_ADDRESS="0x" + "22" * 20)  # the key added, restarted
+        x2 = adapter(fake, s2)
+        x2.wallet_type = "DEPOSIT_WALLET"
+        e2 = make_engine(s2, clock=clock, ledger=e.ledger, exchange=x2, public=pub)[0]
+        self.assertEqual(e2.redeem_again(), 1)
+        clock.advance(30)
+        await e2.redeem_pass()
+        self.assertEqual(fake.redeemed, [m["conditionId"]])
+        self.assertEqual(quotes(e2)[0]["redeem"], "done")
 
 
 if __name__ == "__main__":

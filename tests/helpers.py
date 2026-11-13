@@ -137,7 +137,7 @@ def make_engine(s: config.Settings | None = None, clock: Clock | None = None, le
 async def drain(e: Engine) -> None:
     """Run the queued windows through the workers' path until the queue is empty (parked ones stay parked)."""
     while not e.queue.empty():
-        _, _, slug = e.queue.get_nowait()
+        *_, slug = e.queue.get_nowait()
         e.queued.discard(slug)
         await e.process(slug)
 

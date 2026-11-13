@@ -26,14 +26,54 @@ from typing import Any, Callable, Protocol
 LOG = logging.getLogger(__name__)
 BATCH = 15                      # POST /orders takes 1 to 15 orders
 CANCEL_CHUNK = 200              # DELETE /orders takes up to 1000 ids; a chunk is also kept within the local cancel bucket's burst
-RETRYABLE_CODES = {"market_not_ready", "post_only_mode", "post_only", "rate_limited", "restarting", "cancel_only",
-                   "trading_disabled", "auth", "sign_failed", "not_enough_balance", "transport", "exception", "malformed",
-                   "missing"}
-# ^ a refusal (or a lost answer) that is not the window's own doing: placed again, not counted
+# The CLOB's refusal messages (docs: resources/error-codes, "Order Processing Errors"). They come per order in a 200, or
+# for the whole request as a 400 (`not enough balance / allowance` among them): the words decide the code, not the status.
+REFUSALS = (
+    ("not enough balance / allowance", "not_enough_balance"),
+    ("crosses book", "post_only_would_cross"),
+    ("crosses the book", "post_only_would_cross"),
+    ("minimum tick size", "invalid_tick"),
+    ("lower than the minimum", "invalid_size"),
+    ("duplicated", "duplicated"),
+    ("invalid expiration", "invalid_expiration"),
+    ("not yet ready to process", "market_not_ready"),
+    ("match delayed", "delayed"),
+    ("canceled in the ctf exchange", "canceled_onchain"),
+    ("address banned", "banned"),
+    ("closed only mode", "closed_only"),
+    ("too many orders in payload", "batch_too_large"),
+    ("invalid order payload", "invalid_payload"),
+    ("owner of the api key", "auth"),
+    ("address of the api key", "auth"),
+    ("order timed out", "timed_out"),
+    ("cancel-only", "cancel_only"),
+    ("post-only mode", "post_only_mode"),
+)
+# Refusals about this order on this market's book (its price crossing, its tick or size, the market's own state): counted
+# against the window, which is quoted again up to PREOPEN_MAX_ATTEMPTS. Any other refusal is not the window's doing (the
+# account's balance, an exchange rule, a restriction, a lost answer, words not recognised): it uses no attempt, and the
+# engine holds all new placement for a while instead (Engine.refused), so one account-wide refusal never strikes off
+# every window it meets.
+WINDOW_CODES = {"post_only_would_cross", "invalid_tick", "invalid_size", "invalid", "canceled_onchain", "unmatched",
+                "fok_not_filled", "fak_not_filled"}
+
+
+def refusal_code(message: str, fallback: str) -> str:
+    text = (message or "").lower()
+    for needle, code in REFUSALS:
+        if needle in text:
+            return code
+    return fallback
 
 
 def retryable(code: str) -> bool:
-    return code in RETRYABLE_CODES or code.startswith("http_5")
+    """Not the window's own doing: the window is placed again without using an attempt."""
+    return code not in WINDOW_CODES
+
+
+def unrecognised(code: str) -> bool:
+    """A refusal whose words were not recognised: the account's or the window's, told apart by what follows."""
+    return code == "unknown" or (code.startswith("http_4") and code not in ("http_408", "http_409"))
 
 
 OnSigned = Callable[[list[tuple[str, str, int]]], None]   # [(ref, hash, salt)] of the orders signed, before any is sent
@@ -126,6 +166,7 @@ class Exchange(Protocol):
     async def fills(self, condition_id: str) -> dict[str, D]: ...       # order id -> shares bought, from the trades
     async def balance(self) -> D: ...
     async def redeem(self, condition_id: str) -> str: ...
+    def redeem_problem(self) -> str: ...                                  # why winnings cannot be claimed from here ("")
     def identity(self) -> str: ...                                        # the account the orders belong to
 
 
@@ -342,11 +383,19 @@ class LiveExchange:
                         out[spec.ref] = Placed(spec.ref, "not_sent", code=code, message=stopped.message, hash=h,
                                                salt=int(o.salt), wait=wait)
                     continue
-                # a 4xx is the request refused as it stood (nothing rests); a 5xx without those words, a 408 or a 409
-                # may come after processing: unknown, looked for by the hash
-                refused = 400 <= error.status < 500 and error.status not in (408, 409)
+                code = refusal_code(str(error), f"http_{error.status}")
+                if code == "timed_out":  # 500 "order timed out": rejected before reaching the book, safe to send again
+                    stopped = Placed("", "not_sent", code=code, message=f"下单超时被拒（{error.status}）：{error}", wait=5.0)
+                    for spec, o, h in batch:
+                        out[spec.ref] = Placed(spec.ref, "not_sent", code=code, message=stopped.message, hash=h,
+                                               salt=int(o.salt), wait=stopped.wait)
+                    continue
+                # a 4xx is the request refused as it stood (nothing rests), "Duplicated" aside (the very order is on the
+                # book already); a 5xx without those words, a 408 or a 409 may come after processing: unknown, looked for
+                # by the hash
+                refused = 400 <= error.status < 500 and error.status not in (408, 409) and code != "duplicated"
                 for spec, o, h in batch:
-                    out[spec.ref] = Placed(spec.ref, "rejected" if refused else "unknown", code=f"http_{error.status}",
+                    out[spec.ref] = Placed(spec.ref, "rejected" if refused else "unknown", code=code,
                                            message=str(error), hash=h, salt=int(o.salt))
                 continue
             except PolymarketError as error:  # a transport failure or a malformed answer: sent or not, unknown
@@ -365,8 +414,12 @@ class LiveExchange:
                     out[spec.ref] = Placed(spec.ref, "open", order_id=str(r.order_id), hash=h, salt=int(o.salt),
                                            matched=D(str(getattr(r, "taking_amount", 0) or 0)) if r.status == "matched" else D(0))
                 else:
-                    out[spec.ref] = Placed(spec.ref, "rejected", code=str(getattr(r, "code", "unknown")),
-                                           message=str(getattr(r, "message", "")), hash=h, salt=int(o.salt))
+                    message = str(getattr(r, "message", ""))
+                    code = str(getattr(r, "code", "unknown"))
+                    if code == "unknown":  # words the SDK does not map: the documented ones are
+                        code = refusal_code(message, code)
+                    out[spec.ref] = Placed(spec.ref, "unknown" if code == "duplicated" else "rejected", code=code,
+                                           message=message, hash=h, salt=int(o.salt))
         return [out[s.ref] for s in specs]
 
     async def cancel(self, ids: list[str]) -> Cancelled:
@@ -469,9 +522,16 @@ class LiveExchange:
         b = await self.client.get_balance_allowance(asset_type="COLLATERAL")
         return D(int(b.balance)) / D(1_000_000)
 
-    async def redeem(self, condition_id: str) -> str:
+    def redeem_problem(self) -> str:
+        """Why winnings cannot be claimed from here ("" when they can): a smart wallet (the website's) claims through
+        the Relayer, which takes a Relayer API key; an EOA sends its own transaction."""
         if self.wallet_type != "EOA" and not self.settings.relayer_key:
-            raise RuntimeError("缺少 POLY_RELAYER_API_KEY：智能钱包的领取要走 Relayer（或到网页上手动领取）")
+            return ("没配 Relayer Key，领取不了：网页钱包（智能钱包）领取要走 Relayer。到 polymarket.com → Settings → API Keys → Relayer API Keys 创建一个，把 API Key 和 Signer Address 填到 Railway 的 POLY_RELAYER_API_KEY 和 POLY_RELAYER_API_KEY_ADDRESS（重启后自动补领）；或者先到网页上手动领取")
+        return ""
+
+    async def redeem(self, condition_id: str) -> str:
+        if why := self.redeem_problem():
+            raise RuntimeError(why)
         handle = await self.client.redeem_positions(condition_id=condition_id)
         result = await asyncio.wait_for(handle.wait(), timeout=180)
         return str(getattr(result, "transaction_hash", "") or getattr(result, "state", "") or "ok")
@@ -479,9 +539,10 @@ class LiveExchange:
 
 class PaperExchange:
     """LIVE=off: orders are kept in memory and never fill; the discovery, the timing and the bookkeeping run as live.
-    The balance rule is Polymarket's: each market's open BUYs, a new one included, add up to at most the balance
-    (funds are not shared between markets); when fills take the balance below a market's open BUYs, that market's
-    orders are cancelled (CANCELED_NOT_ENOUGH_BALANCE)."""
+    The balance rule is Polymarket's (docs: concepts/order-lifecycle, maxOrderSize = balance − Σ(open size − filled)):
+    every open BUY, a new one included, adds up to at most the balance, whatever its market; an order over it is refused
+    with "not enough balance / allowance". Should the balance fall under the open BUYs, the newest are cancelled
+    (CANCELED_NOT_ENOUGH_BALANCE) until it covers them."""
     live = False
 
     def __init__(self, balance: D = D("1000"), clock=time.time):
@@ -495,6 +556,7 @@ class PaperExchange:
         self.cancel_calls: list[list[str]] = []
         self.market_cancels: list[str] = []
         self.reject: dict[str, tuple[str, str]] = {}   # ref -> (status, code) the next placement of that ref answers (tests)
+        self.refuse_market: dict[str, tuple[str, str]] = {}  # condition id -> (status, code) every order there answers (tests)
         self.fail_place: Exception | None = None
         self.fail_cancel: Exception | None = None
         self.fail_read: Exception | None = None      # set: every order() and fills() raises it (tests)
@@ -513,6 +575,9 @@ class PaperExchange:
     def identity(self) -> str:
         return "paper"
 
+    def redeem_problem(self) -> str:
+        return ""
+
     async def place(self, specs: list[OrderSpec], on_signed: OnSigned | None = None) -> list[Placed]:
         """As live: every order "signed" (its id, which is its hash, drawn) and handed to `on_signed` before any rests."""
         if self.fail_place is not None:
@@ -526,12 +591,12 @@ class PaperExchange:
             on_signed([(spec.ref, oid, salt) for spec, (oid, salt) in zip(specs, ids)])
         out = []
         for spec, (oid, salt) in zip(specs, ids):
-            if spec.ref in self.reject:
-                status, code = self.reject.pop(spec.ref)
+            if spec.ref in self.reject or (spec.market and spec.market in self.refuse_market):
+                status, code = self.reject.pop(spec.ref) if spec.ref in self.reject else self.refuse_market[spec.market]
                 out.append(Placed(spec.ref, status, code=code, message=code, hash=oid, salt=salt))
                 continue
             market = spec.market or self.markets.get(spec.asset, "")
-            if self.market_open(market) + spec.price * spec.size > self.cash:  # this market's BUYs against the balance
+            if self.open_usd() + spec.price * spec.size > self.cash:  # every open BUY against the one balance
                 out.append(Placed(spec.ref, "rejected", code="not_enough_balance", message="not enough balance / allowance",
                                   hash=oid, salt=salt))
                 continue
@@ -588,19 +653,19 @@ class PaperExchange:
     async def redeem(self, condition_id: str) -> str:
         return "paper"
 
-    def market_open(self, market: str) -> D:
-        return sum((r.price * (r.size - r.matched) for r in self.book.values() if r.market == market and r.side == "BUY"), D(0))
+    def open_usd(self) -> D:
+        return sum((r.price * (r.size - r.matched) for r in self.book.values() if r.side == "BUY"), D(0))
 
     def enforce(self) -> list[str]:
-        """The CLOB keeps checking: a market whose open BUYs add up to more than the balance has them cancelled."""
+        """The CLOB keeps checking: while the open BUYs add up to more than the balance, the newest are cancelled."""
         gone = []
-        for market in {r.market for r in self.book.values()}:
-            if self.market_open(market) > self.cash:
-                for oid in [i for i, r in self.book.items() if r.market == market]:
-                    row = self.book.pop(oid)
-                    row.status = "CANCELED_NOT_ENOUGH_BALANCE"
-                    self.gone[oid] = row
-                    gone.append(oid)
+        for oid in reversed(list(self.book)):  # the newest first
+            if self.open_usd() <= self.cash:
+                break
+            row = self.book.pop(oid)
+            row.status = "CANCELED_NOT_ENOUGH_BALANCE"
+            self.gone[oid] = row
+            gone.append(oid)
         return gone
 
     # --- test helpers ---
