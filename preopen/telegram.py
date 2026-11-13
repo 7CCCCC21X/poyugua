@@ -184,7 +184,12 @@ class Telegram:
                     result = f"操作出错：{error}"
         try:
             await self._post("answerCallbackQuery", callback_query_id=cb.get("id"), text=result[:190])
-            if mine and msg.get("message_id"):
+            if mine and msg.get("message_id") and data.startswith("set_"):
+                # a button under a report (the review): the report stays, its button goes, the result comes as a message
+                await self._post("editMessageReplyMarkup", chat_id=self.chat(), message_id=msg["message_id"],
+                                 reply_markup={"inline_keyboard": []})
+                self.send(result)
+            elif mine and msg.get("message_id"):
                 await self._post("editMessageText", chat_id=self.chat(), message_id=msg["message_id"], text=result[:MAX_LEN])
         except Exception as error:
             LOG.warning("Telegram 按钮应答失败：%s", error)

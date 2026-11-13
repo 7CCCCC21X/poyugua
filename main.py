@@ -76,7 +76,7 @@ def acquire_lock(ledger_path: str):
     return f
 
 
-def review(engine: Engine, args: list[str]) -> str:
+def review(engine: Engine, args: list[str]) -> Reply | str:
     """/review [days] [coin ...]: the analysis as a message, for the last days and the coins named (default: all)."""
     days, coins, bad = 0.0, set(), []
     for a in args:
@@ -95,7 +95,33 @@ def review(engine: Engine, args: list[str]) -> str:
     now = engine.now()
     records = [q for q in engine.all_records() if (not days or q["start"] >= now - days * 86400) and (not coins or q["coin"] in coins)]
     scope = "、".join(x for x in (" ".join(mk.name_of(c) for c in sorted(coins)), f"最近 {mk.fmt(D(str(days)))} 天" if days else "") if x)
-    return journal.review_text(records, now, engine.s.cancel_s, scope)
+    text = journal.review_text(records, now, engine.s.cancel_s, scope, float(engine.s.max_daily_loss_usd))
+    best = journal.cancel_review(records, now, engine.s.cancel_s)["best"]
+    if best and best != engine.s.cancel_s and not coins:  # one coin's sample is no reason to change them all
+        return Reply(text, {"inline_keyboard": [[{"text": f"改成开场前 {journal.secs_label(best)}撤单", "callback_data": f"set_cancel_{best}"}]]})
+    return text
+
+
+async def set_cancel(engine: Engine, console: Console | None, seconds: int) -> str:
+    """The review's button: the cancel time changed as on the web console (checked, saved, in force at once), with the
+    times tied to it: no new order within 60 s more than it, and the orders' own expiry moved close behind it (5 s
+    after it where the rules allow), so that an order whose cancel fails still dies soon after rather than resting
+    into the last seconds before the start. A changed expiry re-places the resting orders (about a minute)."""
+    if console is None:
+        return "这里改不了设置：控制台没启动"
+    s = engine.s
+    entry = max(s.entry_s, seconds + 60)
+    expiry = max(0, min(seconds - 5, entry - 150))
+    if (s.cancel_s, s.entry_s, s.expiry_s) == (seconds, entry, expiry):
+        return f"已经是开场前 {journal.secs_label(seconds)}撤单了"
+    ok, text = await console.change_many({"PREOPEN_CANCEL_SECONDS": str(seconds), "PREOPEN_ENTRY_SECONDS": str(entry),
+                                          "PREOPEN_EXPIRY_SECONDS": str(expiry)}, f"开场前 {journal.secs_label(seconds)}撤单")
+    if not ok:
+        return text
+    notes = [f"距开场不足 {journal.secs_label(entry)}不再新挂"] if entry != s.entry_s else []
+    if expiry != s.expiry_s:
+        notes.append(f"订单自己在开场前 {journal.secs_label(expiry)}到期（撤单万一失败也会失效），挂着的单按新到期时间重挂一遍，约 1 分钟")
+    return f"✅ 已改成开场前 {journal.secs_label(seconds)}撤单" + (f"；{'；'.join(notes)}" if notes else "") + "。立即生效"
 
 
 def export(engine: Engine, args: list[str]) -> Reply:
@@ -119,7 +145,7 @@ def export(engine: Engine, args: list[str]) -> Reply:
                  "（Excel 可以直接打开；成交时刻一栏是「开场前几秒:份数」）。", files=[(name, text.encode("utf-8")) for name, text in files])
 
 
-def commander(settings: config.Settings, engine: Engine, pub: PublicApi):
+def commander(settings: config.Settings, engine: Engine, pub: PublicApi, console: Console | None = None):
     """The Telegram commands and buttons: one reply each (the pause asks first)."""
     async def handle(cmd: str, args: list[str]) -> Reply | str:
         if cmd in ("/status", "/preopen"):
@@ -130,6 +156,12 @@ def commander(settings: config.Settings, engine: Engine, pub: PublicApi):
             return engine.check_text()
         if cmd == "/review":
             return review(engine, args)
+        if cmd.startswith("/set_cancel_"):
+            try:
+                seconds = int(cmd.removeprefix("/set_cancel_"))
+            except ValueError:
+                return "看不懂这个撤单时间"
+            return await set_cancel(engine, console, seconds)
         if cmd == "/export":
             return export(engine, args)
         if cmd == "/probe":
@@ -191,7 +223,7 @@ async def run(settings: config.Settings, env: dict[str, str] | None = None, over
             web = None
     side_tasks = []
     if tg:
-        side_tasks.append(asyncio.create_task(tg.run(commander(settings, engine, pub)), name="telegram"))
+        side_tasks.append(asyncio.create_task(tg.run(commander(settings, engine, pub, console)), name="telegram"))
     LOG.info("启动：%s，币种 %s，每边 %s，数据库 %s%s", settings.mode(), ",".join(settings.coins), settings.levels_text(),
              settings.ledger_path, f"，网页 {settings.web_url or '端口 ' + str(settings.web_port)}" if web else "")
     if settings.live:

@@ -112,6 +112,27 @@ class Console:
         self.notify("🛠 网页改了设置：" + text)
         return True, text
 
+    async def change_many(self, values: dict[str, str], what: str) -> tuple[bool, str]:
+        """Several settings at once, checked together (the rules tie the cancel, expiry and no-new-order times: one at
+        a time could pass through a combination they refuse), saved and applied in one step."""
+        if not values or any(name not in config.CONTROL_KEY_SET or name == "LIVE" for name in values):
+            return False, "这些设置不能这样改"
+        trial = {**self.overrides, **{k: str(v) for k, v in values.items()}}
+        try:
+            new = config.from_env({**self.env, **trial})
+        except ConfigError as error:
+            return False, f"没保存：{error}"
+        before, after = config.current_values(self.engine.s), config.current_values(new)
+        diff = [f"{k} {before[k] or '（空）'} → {after[k] or '（空）'}" for k in after if before.get(k) != after.get(k)]
+        config.save_overrides(self.path, trial)
+        self.overrides = trial
+        withdrawn = self.engine.apply_settings(new)
+        text = f"已保存：{what}" + (f"（{'；'.join(diff)}）" if diff else "（数值没变）")
+        if withdrawn:
+            text += f"；{withdrawn} 场的挂单按新的到期时间撤掉重挂"
+        self.notify("🛠 改了设置：" + text)
+        return True, text
+
     async def switch_live(self, new: config.Settings) -> str:
         """LIVE switched on the page: saved; leaving live trading, the bot's orders are cancelled (by id, an unknown one
         by its hash; with PREOPEN_KEY_EXCLUSIVE=on every open order of the API key at once) and the records withdrawn

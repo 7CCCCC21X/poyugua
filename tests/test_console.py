@@ -61,6 +61,37 @@ class ConsoleTest(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self.dir.cleanup()
 
+    async def test_the_reviews_button_sets_the_cancel_time_and_the_entry_with_it(self):
+        import main
+        from preopen.telegram import Telegram
+        handle = main.commander(self.e.s, self.e, self.pub, self.c)
+        self.assertEqual((self.e.s.cancel_s, self.e.s.entry_s), (60, 300))
+        text = await handle("/set_cancel_300", [])
+        self.assertIn("已改成开场前 5 分撤单", text)
+        self.assertIn("距开场不足 6 分不再新挂", text)
+        self.assertIn("开场前 210 秒到期", text)                  # an order whose cancel fails still dies early
+        self.assertEqual((self.e.s.cancel_s, self.e.s.entry_s, self.e.s.expiry_s), (300, 360, 210))
+        saved = config.load_overrides(self.path)                 # kept across restarts
+        self.assertEqual((saved["PREOPEN_CANCEL_SECONDS"], saved["PREOPEN_EXPIRY_SECONDS"]), ("300", "210"))
+        for _ in range(4):                                       # cancelled, read back, quoted again
+            await tick(self.e, 6)
+        active = quotes(self.e, phase="active")
+        self.assertEqual(len(active), 4)                         # re-placed with the new expiry
+        self.assertEqual({q["expiration"] - q["start"] for q in active}, {60 - 210})
+
+        class Tg(Telegram):
+            posts: list = []
+
+            async def _post(self, method, **payload):
+                self.posts.append((method, payload))
+                return True
+        tg = Tg("1:x", "7")
+        await tg.on_callback({"id": "c1", "data": "set_cancel_120", "from": {"id": 7},
+                              "message": {"chat": {"id": 7}, "message_id": 5}}, handle)
+        self.assertEqual((self.e.s.cancel_s, self.e.s.entry_s, self.e.s.expiry_s), (120, 360, 115))
+        self.assertEqual([m for m, _ in tg.posts], ["answerCallbackQuery", "editMessageReplyMarkup"])  # the review stays
+        self.assertIn("已改成开场前 2 分撤单", tg.outbox.get_nowait()[0])
+
     async def test_a_saved_setting_applies_at_once_and_is_kept(self):
         self.assertEqual(len(quotes(self.e, phase="active")), 4)
         ok, text = await self.c.change({"name": "PREOPEN_SHARES", "value": "20"})
@@ -177,7 +208,7 @@ class CancelReviewTest(unittest.TestCase):
         self.assertEqual((rows[10]["filled"], rows[10]["both"]), (2, 1))
         self.assertIsNone(c["best"])                             # four windows: too few to name one
         self.assertIn("样本还少", c["advice"])
-        quick = {t["bucket"]: t for t in c["by_fill_time"]}["开场前 15 秒内"]
+        quick = {t["bucket"]: t for t in c["by_fill_time"]}["开场前 0～15 秒"]
         self.assertEqual((quick["shares"], quick["won"]), (20.0, 10.0))  # eth down lost, sol down won
         self.assertAlmostEqual(quick["breakeven"], 0.47)
 
@@ -189,8 +220,8 @@ class CancelReviewTest(unittest.TestCase):
         finally:
             journal.CANCEL_SAMPLE = old
         self.assertEqual(c["best"], 10)
-        self.assertIn("开场前 10 秒撤单盈亏最好", c["advice"])
-        self.assertIn("现在的 15 秒是 +0.60", c["advice"])
+        self.assertIn("改成开场前 10 秒撤单最好", c["advice"])
+        self.assertIn("实际是 +1.20", c["advice"])               # btc +5.30, eth -4.70, sol +0.60
 
     def test_windows_cancelled_earlier_are_left_out_and_later_cancels_are_not_replayed(self):
         early = [settled("doge", T0 + 300 * i, "up", {"up": [(200, 10)]}, cancel_lead=60) for i in range(9)]
@@ -201,6 +232,30 @@ class CancelReviewTest(unittest.TestCase):
         csv_text = journal.cancel_csv(c)
         self.assertTrue(csv_text.startswith("\ufeff"))
         self.assertIn("开场前几秒撤单", csv_text)
+
+    def test_windows_ended_by_restarts_and_changes_never_push_the_comparison_out(self):
+        """11-13 20:02: thousands of records closed hours ahead by restarts and settings changes made the review
+        compare only 600 s ("同一批 1115 场 … 另有 4319 场没算"). They would have ended the same under any cancel time."""
+        noise = []
+        for i in range(200):
+            q = settled("bnb", T0 + 300 * i, "up", {})
+            q.update(cancel_lead=None, reason="设置不同（价格或份数）", closing_at=T0 + 300 * i - 20000, phase="settled")
+            noise.append(q)
+        late = [settled(c, T0 + 300 * (i + 1), "down", {"up": [(lead, 10)]}, cancel_lead=14.5)
+                for i, (c, lead) in enumerate([("btc", 20), ("eth", 25), ("sol", 40), ("xrp", 50)] * 6)]  # adverse: up lost
+        c = journal.cancel_review(noise + late + self.records, T0 + 300 * 300, current=15)
+        self.assertEqual(c["base"], 15)                           # the cancel rule's records ended 5-14.5 s ahead
+        self.assertEqual(c["excluded"], 0)
+        self.assertEqual(c["windows"], 200 + 24 + 4)
+        rows = {r["cancel_s"]: r for r in c["rows"]}
+        self.assertAlmostEqual(c["actual"]["pnl"], 1.20 - 24 * 4.70, places=2)
+        self.assertAlmostEqual(rows[60]["pnl"], 5.30, places=2)  # cancelling 60 s ahead drops every late fill
+        self.assertEqual(c["best"], 60)                          # the earliest of the best (90 s ... gives the same)
+        self.assertIn("改成开场前 60 秒撤单最好", c["advice"])
+        self.assertEqual(c["losses"][0]["bucket"], "15～30 秒")
+        text = journal.review_text(noise + late + self.records, T0 + 300 * 300, 15)
+        self.assertIn("亏在哪：15～30 秒", text.splitlines()[2])
+        self.assertIn("开场前 60 秒～", text)                      # equal rows merged into a range
 
     def test_snapshot_times_stand_in_and_are_flagged(self):
         q = settled("hype", T0, "up", {})

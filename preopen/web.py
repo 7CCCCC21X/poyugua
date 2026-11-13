@@ -559,10 +559,15 @@ async function loadJournal() {
   $("jHour").innerHTML = head.replace("<th></th>", "<th>开场</th>") + d.by_hour.map((x) => row(String(x.hour).padStart(2, "0") + ":00", x)).join("");
   $("jSide").innerHTML = "<tr><th>方向</th><th>成交份数</th><th>成本</th><th>赢回</th><th>盈亏</th></tr>" + d.by_side.map((x) => `<tr><td>${x.side}</td><td>${x.shares}</td><td>${money(x.cost)}</td><td>${money(x.won)}</td><td>${signed(x.pnl)}</td></tr>`).join("");
   const C = d.cancel || {rows: [], by_fill_time: []};
-  $("cAdvice").textContent = "结论：" + (C.advice || "—");
-  $("cRows").innerHTML = "<tr><th>开场前几秒撤</th><th>有成交的场次</th><th>双边</th><th>成交份数</th><th>成本</th><th>盈亏</th><th></th></tr>" + (C.rows.map((x) =>
-    `<tr><td>${x.cancel_s} 秒</td><td>${x.filled} / ${x.windows}</td><td>${x.both}</td><td>${x.shares}</td><td>${money(x.cost)}</td><td>${signed(x.pnl)}</td><td>${x.cancel_s === C.current ? "现在" : ""}${x.cancel_s === C.best ? " ★最好" : ""}</td></tr>`).join("") || '<tr><td colspan="7" class="muted">还没有结束的场次</td></tr>');
-  $("cNote").textContent = C.rows.length ? `把每一场按「如果开场前 X 秒撤单」重算（X 秒之后的成交当作没发生），同一批 ${C.windows - C.excluded} 场比较。比开场前 ${C.base} 秒更晚撤算不出来：那时单子已经撤了。${C.excluded ? `另有 ${C.excluded} 场当时撤得更早，没算。` : ""}${C.approx ? `${C.approx} 场的成交时刻是快照看到的时间（偏晚几秒）。` : ""}` : "";
+  const loss = (C.losses || []).map((t) => `${t.bucket} ${t.pnl >= 0 ? "+" : ""}${t.pnl.toFixed(2)}（赢 ${(t.win_rate * 100).toFixed(0)}%，保本 ${(t.breakeven * 100).toFixed(0)}%）`).join("；");
+  $("cAdvice").innerHTML = "<b>结论：" + esc(C.advice || "—") + "</b>" + (loss ? `<br>亏在哪：${esc(loss)}` : "") +
+    (C.after_start || C.after_cancel ? `<br><span class="warn">⚠️ ${C.after_start} 笔开场后成交、${C.after_cancel} 笔撤单确认后成交：撤单或到期没及时生效</span>` : "") +
+    (C.by_coin && C.by_coin.length ? `<br>按币种：${C.by_coin.map((x) => `${esc(x.coin)} ${x.pnl >= 0 ? "+" : ""}${x.pnl.toFixed(2)}`).join("，")}` : "");
+  const A = C.actual;
+  $("cRows").innerHTML = "<tr><th>开场前几秒撤</th><th>有成交的场次</th><th>双边</th><th>成交份数</th><th>成本</th><th>盈亏</th><th></th></tr>" +
+    (A ? `<tr><td><b>实际（${C.current} 秒）</b></td><td>${A.filled} / ${A.windows}</td><td>${A.both}</td><td>${A.shares}</td><td>${money(A.cost)}</td><td>${signed(A.pnl)}</td><td>实际发生的</td></tr>` : "") +
+    (C.rows.map((x) => `<tr><td>${x.cancel_s} 秒</td><td>${x.filled} / ${x.windows}</td><td>${x.both}</td><td>${x.shares}</td><td>${money(x.cost)}</td><td>${signed(x.pnl)}</td><td>${x.cancel_s === C.best ? "★最好" : ""}</td></tr>`).join("") || '<tr><td colspan="7" class="muted">还没有结束的场次</td></tr>');
+  $("cNote").textContent = C.rows.length ? `把每一场按「如果开场前 X 秒撤单」重算（X 秒之后的成交当作没发生），同一批 ${C.windows} 场比较。比开场前 ${C.base} 秒更晚撤算不出来：那时单子已经撤了。${C.excluded ? `另有 ${C.excluded} 场当时撤得更早，没算。` : ""}${C.approx ? `${C.approx} 条成交时刻是快照看到的时间（偏晚几秒）。` : ""}改撤单时间：「参数」页的撤单一项，或 Telegram 复盘消息下面的按钮。` : "";
   $("cTimes").innerHTML = "<tr><th>成交时距开场</th><th>份数</th><th>成本</th><th>盈亏</th><th>那一边赢的比例</th><th>保本线</th></tr>" + (C.by_fill_time.map((x) =>
     `<tr><td>${esc(x.bucket)}</td><td>${x.shares}</td><td>${money(x.cost)}</td><td>${signed(x.pnl)}</td><td class="${x.win_rate >= x.breakeven ? "good" : "bad"}">${(x.win_rate * 100).toFixed(0)}%</td><td>${(x.breakeven * 100).toFixed(0)}%</td></tr>`).join("") || '<tr><td colspan="6" class="muted">还没有成交</td></tr>');
   $("jDetail").innerHTML = "<tr><th>场次</th><th>档</th><th>价格</th><th>涨</th><th>跌</th><th>成本</th><th>结果</th><th>盈亏</th><th>挂上时距开场</th><th>撤单确认</th><th>首次成交距开场</th><th>第几次</th></tr>" + (d.detail.map((x) =>
