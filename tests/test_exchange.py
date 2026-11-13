@@ -1,0 +1,190 @@
+"""The live adapter's mapping of SDK answers (with a fake SDK client), the order hash, the public reads."""
+import unittest
+from decimal import Decimal as D
+
+import httpx
+from helpers import settings
+
+from polymarket import RateLimitError, RequestRejectedError, TransportError
+from polymarket.models.clob.cancel import CancelOrdersResponse
+from polymarket.models.clob.order_response import AcceptedOrder, RejectedOrder
+from polymarket.models.clob.orders import SignedOrder
+from preopen import gamma
+from preopen.exchange import Bucket, LiveExchange, OrderSpec, order_hash
+
+WALLET = "0x1111111111111111111111111111111111111111"
+ZERO32 = "0x" + "00" * 32
+
+
+def signed(asset: str, salt: int = 7) -> SignedOrder:
+    return SignedOrder(builder=ZERO32, expiration=1794624330, maker=WALLET, maker_amount=4_900_000, metadata=ZERO32,
+                       order_type="GTD", salt=salt, side="BUY", signature="0x" + "ab" * 65, signature_type=3, signer=WALLET,
+                       taker_amount=10_000_000, timestamp=1794537000123, token_id=asset, post_only=True)
+
+
+class FakeClient:
+    def __init__(self):
+        self.created = []
+        self.posted = []
+        self.answers = []      # one per post_orders call: a list of responses or an exception
+        self.sign_error = None
+
+    async def create_limit_order(self, **kw):
+        if self.sign_error:
+            raise self.sign_error
+        self.created.append(kw)
+        return signed(kw["asset_id"], salt=len(self.created))
+
+    async def post_orders(self, orders):
+        self.posted.append(list(orders))
+        answer = self.answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    async def cancel_orders(self, order_ids):
+        return CancelOrdersResponse(canceled=tuple(order_ids[:-1]), not_canceled={order_ids[-1]: "order not found"})
+
+
+def specs(n: int) -> list[OrderSpec]:
+    return [OrderSpec(ref=f"q{i}/{'up' if i % 2 == 0 else 'down'}", asset=str(10**70 + i), price=D("0.49"), size=D("10"),
+                      expiration=1794624330) for i in range(n)]
+
+
+def live() -> tuple[LiveExchange, FakeClient]:
+    x = LiveExchange(settings(), order_bucket=Bucket(1000, 1000), cancel_bucket=Bucket(1000, 1000))
+    client = FakeClient()
+    x.client = client
+    return x, client
+
+
+def accepted(oid: str) -> AcceptedOrder:
+    return AcceptedOrder(order_id=oid, status="live", making_amount=D(0), taking_amount=D(0), trade_ids=(), transactions_hashes=())
+
+
+class LiveExchangeTest(unittest.IsolatedAsyncioTestCase):
+    async def test_post_only_gtd_buy_and_mapping(self):
+        x, c = live()
+        c.answers = [[accepted("0x" + "01" * 32), RejectedOrder(code="post_only_would_cross", message="invalid post-only order: order crosses book")]]
+        out = await x.place(specs(2))
+        self.assertEqual(c.created[0], {"asset_id": str(10**70), "price": "0.49", "size": "10", "side": "BUY", "post_only": True,
+                                        "expiration": 1794624330})
+        self.assertEqual([r.status for r in out], ["open", "rejected"])
+        self.assertEqual(out[0].order_id, "0x" + "01" * 32)
+        self.assertEqual(out[1].code, "post_only_would_cross")
+        self.assertTrue(out[0].hash.startswith("0x") and len(out[0].hash) == 66)
+
+    async def test_batches_of_fifteen(self):
+        x, c = live()
+        c.answers = [[accepted(f"0x{i:064x}") for i in range(15)], [accepted(f"0x{i:064x}") for i in range(15, 20)]]
+        out = await x.place(specs(20))
+        self.assertEqual([len(b) for b in c.posted], [15, 5])
+        self.assertTrue(all(r.status == "open" for r in out))
+
+    async def test_rate_limit_marks_not_sent_and_stops_the_rest(self):
+        x, c = live()
+        c.answers = [RateLimitError("slow down", retry_after=7)]
+        out = await x.place(specs(20))
+        self.assertEqual(len(c.posted), 1)
+        self.assertEqual({r.status for r in out}, {"not_sent"})
+        self.assertEqual({r.wait for r in out}, {7.0})
+        self.assertEqual({r.code for r in out}, {"rate_limited"})
+
+    async def test_restart_and_auth_are_not_sent(self):
+        for error, code in [(RequestRejectedError("restarting", status=425, restriction="restarting", retry_after=1), "restarting"),
+                            (RequestRejectedError("unauthorized", status=401), "auth"),
+                            (RequestRejectedError("trading is disabled", status=503), "trading_disabled")]:
+            x, c = live()
+            c.answers = [error]
+            out = await x.place(specs(2))
+            with self.subTest(code=code):
+                self.assertEqual({r.status for r in out}, {"not_sent"})
+                self.assertEqual({r.code for r in out}, {code})
+                self.assertTrue(all(r.wait > 0 for r in out))
+
+    async def test_bad_request_rejects_and_server_error_is_unknown(self):
+        x, c = live()
+        c.answers = [RequestRejectedError("bad", status=400), RequestRejectedError("oops", status=502)]
+        out = await x.place(specs(16))
+        self.assertEqual({r.status for r in out[:15]}, {"rejected"})
+        self.assertEqual(out[15].status, "unknown")
+
+    async def test_transport_error_is_unknown_unless_never_connected(self):
+        x, c = live()
+        err = TransportError("timed out")
+        err.__cause__ = httpx.ReadTimeout("read")
+        c.answers = [err]
+        self.assertEqual((await x.place(specs(1)))[0].status, "unknown")
+        x, c = live()
+        err = TransportError("no route")
+        err.__cause__ = httpx.ConnectError("refused")
+        c.answers = [err]
+        self.assertEqual((await x.place(specs(1)))[0].status, "not_sent")
+
+    async def test_signing_failure_sends_nothing(self):
+        from polymarket import UnexpectedResponseError, UserInputError
+        x, c = live()
+        c.sign_error = UnexpectedResponseError("metadata")
+        out = await x.place(specs(2))
+        self.assertEqual({r.status for r in out}, {"not_sent"})
+        self.assertEqual(c.posted, [])
+        c.sign_error = UserInputError("price not on tick")
+        out = await x.place(specs(1))
+        self.assertEqual(out[0].status, "rejected")
+
+    async def test_cancel_maps_both_lists(self):
+        x, c = live()
+        r = await x.cancel(["a", "b", "c"])
+        self.assertEqual(r.canceled, {"a", "b"})
+        self.assertEqual(r.not_canceled, {"c": "order not found"})
+
+
+class OrderHashTest(unittest.TestCase):
+    def test_matches_the_sdk_struct_and_domain(self):
+        from eth_utils.crypto import keccak
+        from polymarket._internal.actions.orders.typed_data import _app_domain_separator, _order_contents_hash
+        from polymarket._internal.actions.orders.types import UnsignedOrder
+        s = signed(str(10**70 + 5), salt=123456789)
+        u = UnsignedOrder(chain_id=137, builder=s.builder, exchange_address="0xE111180000d2663C0091e4f400237545B87B996B",
+                          expiration=s.expiration, maker=s.maker, maker_amount=s.maker_amount, metadata=s.metadata,
+                          order_type="GTD", salt=s.salt, side="BUY", signature_type=3, signer=s.signer,
+                          taker_amount=s.taker_amount, timestamp=s.timestamp, token_id=s.token_id)
+        sdk = "0x" + keccak(b"\x19\x01" + bytes.fromhex(_app_domain_separator(u, protocol_version="2")[2:])
+                            + _order_contents_hash(u)).hex()
+        self.assertEqual(order_hash(s, neg_risk=False), sdk)
+        self.assertNotEqual(order_hash(s, neg_risk=True), sdk)  # another exchange, another domain
+
+    def test_garbage_gives_empty(self):
+        self.assertEqual(order_hash(object(), neg_risk=False), "")
+
+
+class PublicApiTest(unittest.IsolatedAsyncioTestCase):
+    async def test_listings_bust_the_cache_and_cover_the_limit(self):
+        seen = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.url)
+            slugs = request.url.params.get_list("slug")
+            return httpx.Response(200, json=[{"slug": s} for s in slugs if s.endswith("0")])
+        api = gamma.PublicApi(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+        slugs = [f"btc-updown-5m-{1794537000 + 300 * i}" for i in range(50)]
+        found = await api.listings(slugs)
+        self.assertEqual(len(seen), 2)  # 40 + 10
+        self.assertEqual(set(found), {s for s in slugs if s.endswith("0")})
+        for url in seen:
+            self.assertTrue(url.params.get("_"))
+            self.assertGreaterEqual(int(url.params["limit"]), len(url.params.get_list("slug")))
+        self.assertNotEqual(seen[0].params["_"], seen[1].params["_"])
+        await api.close()
+
+    async def test_accepting_reads_the_clob_flag(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"ao": request.url.path.endswith("yes")})
+        api = gamma.PublicApi(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+        self.assertTrue(await api.accepting("yes"))
+        self.assertFalse(await api.accepting("no"))
+        await api.close()
+
+
+if __name__ == "__main__":
+    unittest.main()
