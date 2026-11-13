@@ -5,6 +5,7 @@ Prices are in cents (PREOPEN_PRICE_CENTS=49 = $0.49 a share), sizes in shares, t
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -296,3 +297,129 @@ def from_env(env: dict[str, str] | None = None) -> Settings:
     if settings.order_burst < 2 * len(levels):
         raise ConfigError("PREOPEN_ORDER_BURST 要至少能装下一场的全部挂单")
     return settings
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The web console's settings (控制台在线改参数): each is an environment variable the page may set. A value saved on the
+# page beats the environment, survives restarts and is kept in <PREOPEN_DB stem>.control.json beside the ledger. Keys,
+# tokens, wallets and paths are not here: those stay in the environment.
+
+CONTROL_KEYS: tuple[tuple[str, str, str], ...] = (
+    ("LIVE", "真实交易", "on = 真实下单（需要 POLY_PRIVATE_KEY），off = 模拟盘。切换后程序自动重启；从实盘切走前先撤掉账户里本程序 API Key 的全部挂单"),
+    ("PREOPEN_MARKETS", "挂哪些币", "点亮要挂的币，可多选，全选 = all；一键全关 = none（已挂的撤掉，程序照常运行，再点亮就恢复）"),
+    ("PREOPEN_PRICE_CENTS", "每边价格（¢）", "0.1～50：涨跌两边都按这个价挂买单（默认 49）。超过 50 两边都成交就亏"),
+    ("PREOPEN_SHARES", "每边份数", "5～100000：每场每边挂这么多份（Polymarket 最少 5 份；≥50 份才可能拿流动性奖励）"),
+    ("PREOPEN_LEVELS", "更深的价格档位", "第 2 档起，价格x份数、逗号分隔、价格逐档递减、最多再 7 档，如 48x20,47x40；空 = 只挂第一档"),
+    ("PREOPEN_DEEP_AHEAD_MINUTES", "第 2 档起只挂几分钟内开始的场次", "0 = 和第一档一样；更深的档位离开场这么近才挂，少占资金"),
+    ("PREOPEN_AHEAD_MINUTES", "只挂几分钟内开始的场次", "10～1500：1440 = 发布即挂（约开场前 24 小时）；资金不够就调小，但那样就不是发布那一刻挂上的"),
+    ("PREOPEN_CANCEL_SECONDS", "开场前几秒撤单", "至少比到期多 5 秒；撤单发出后到开场每 2 秒催一次（默认 60）"),
+    ("PREOPEN_EXPIRY_SECONDS", "开场前几秒订单自动失效", "0～3600：撤单发不出去时的兜底（默认 30）"),
+    ("PREOPEN_ENTRY_SECONDS", "距开场不足几秒不再新挂", "至少比撤单多 60 秒、比到期多 150 秒（GTD 订单要求到期在 3 分钟后；默认 300）"),
+    ("PREOPEN_WEEKEND", "周末也挂", "off = 北京时间周六 00:00 到周一 08:00 开始的场次不挂"),
+    ("PREOPEN_MAX_OPEN_USD", "资金上限（$）", "0 = 不限，只受余额限制：本程序挂单最多占用这么多 pUSD（Polymarket 的挂买单占用余额）"),
+    ("PREOPEN_MAX_ATTEMPTS", "一档最多重报几次", "1～20：因这一场自身原因失败（单边被拒、被别人撤掉）后最多重新报价几次"),
+    ("PREOPEN_AUTO_REDEEM", "自动领取", "on = 结算后自动领取赢的一边（智能钱包需要 Relayer Key，EOA 需要 POL 付 gas）；off = 到网页上手动领取"),
+    ("PREOPEN_CANCEL_ON_EXIT", "退出时撤单", "on = 程序停止时撤掉全部挂单；off = 留在簿上，到期自动失效，重启后接管（保住排队位置）"),
+    ("PAPER_BALANCE_USD", "模拟盘余额（$）", "只在模拟盘用：假的 pUSD 余额"),
+    ("PREOPEN_POLL_SECONDS", "平时扫描间隔（秒）", "1～120：两次发布之间多久看一次下一场"),
+    ("PREOPEN_FAST_POLL_SECONDS", "发布前后扫描间隔（秒）", "0.2～10：预计发布时刻前后多久看一次"),
+    ("PREOPEN_SNAPSHOT_SECONDS", "读账户挂单间隔（秒）", "2～300"),
+    ("PREOPEN_ORDER_RATE", "本地下单限速（单/秒）", "Standard 档位 40/秒、突发 60；升档后可调高"),
+    ("PREOPEN_CANCEL_RATE", "本地撤单限速（单/秒）", "Standard 档位 80/秒、突发 120"),
+)
+CONTROL_KEY_SET = frozenset(k for k, _, _ in CONTROL_KEYS)
+CONTROL_FORMS: dict[str, dict] = {
+    "LIVE": {"kind": "choice", "group": "运行", "options": [["off", "off 模拟盘"], ["on", "on 真实下单"]], "restart": True},
+    "PREOPEN_MARKETS": {"kind": "multi", "group": "预挂", "options": [[c, c.upper()] for c in COINS], "none": "none"},
+    "PREOPEN_PRICE_CENTS": {"kind": "number", "group": "预挂", "presets": ["45", "47", "48", "49", "50"], "unit": "¢"},
+    "PREOPEN_SHARES": {"kind": "number", "group": "预挂", "presets": ["5", "10", "20", "50", "100"], "unit": "份"},
+    "PREOPEN_LEVELS": {"kind": "text", "group": "预挂", "presets": ["", "48x20", "48x20,47x40", "48x10,47x20,46x40"], "empty": "只挂第一档"},
+    "PREOPEN_DEEP_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["0", "60", "120", "240", "720"], "unit": "分钟", "zero": "和第一档一样"},
+    "PREOPEN_AHEAD_MINUTES": {"kind": "number", "group": "预挂", "presets": ["60", "120", "240", "720", "1440"], "unit": "分钟"},
+    "PREOPEN_CANCEL_SECONDS": {"kind": "number", "group": "预挂", "presets": ["45", "60", "90", "120", "240"], "unit": "秒"},
+    "PREOPEN_EXPIRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["10", "20", "30", "45"], "unit": "秒"},
+    "PREOPEN_ENTRY_SECONDS": {"kind": "number", "group": "预挂", "presets": ["180", "240", "300", "600"], "unit": "秒"},
+    "PREOPEN_WEEKEND": {"kind": "choice", "group": "预挂", "options": [["on", "on 周末照挂"], ["off", "off 周末不挂"]]},
+    "PREOPEN_MAX_OPEN_USD": {"kind": "number", "group": "资金", "presets": ["0", "50", "100", "500", "1000", "5000", "20000"], "unit": "$", "zero": "不限"},
+    "PREOPEN_MAX_ATTEMPTS": {"kind": "number", "group": "资金", "presets": ["1", "2", "3", "5"], "unit": "次"},
+    "PREOPEN_AUTO_REDEEM": {"kind": "choice", "group": "资金", "options": [["on", "on 自动领取"], ["off", "off 手动领取"]]},
+    "PREOPEN_CANCEL_ON_EXIT": {"kind": "choice", "group": "资金", "options": [["off", "off 留在簿上"], ["on", "on 退出时撤单"]]},
+    "PAPER_BALANCE_USD": {"kind": "number", "group": "高级", "presets": ["100", "1000", "10000", "100000"], "unit": "$"},
+    "PREOPEN_POLL_SECONDS": {"kind": "number", "group": "高级", "presets": ["2", "5", "10"], "unit": "秒"},
+    "PREOPEN_FAST_POLL_SECONDS": {"kind": "number", "group": "高级", "presets": ["0.3", "0.5", "1"], "unit": "秒"},
+    "PREOPEN_SNAPSHOT_SECONDS": {"kind": "number", "group": "高级", "presets": ["5", "10", "20"], "unit": "秒"},
+    "PREOPEN_ORDER_RATE": {"kind": "number", "group": "高级", "presets": ["20", "30", "60", "150"], "unit": "单/秒"},
+    "PREOPEN_CANCEL_RATE": {"kind": "number", "group": "高级", "presets": ["40", "60", "120", "300"], "unit": "单/秒"},
+}
+
+
+def control_path(db_path: str) -> Path:
+    p = Path(db_path or "data/preopen.sqlite3")
+    return p.with_name(p.stem + ".control.json")
+
+
+def load_overrides(path: Path) -> dict[str, str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        return {}
+    return {str(k): str(v) for k, v in (data.get("env") or {}).items() if str(k) in CONTROL_KEY_SET}
+
+
+def save_overrides(path: Path, overrides: dict[str, str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps({"env": overrides}, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def effective(env: dict[str, str], overrides: dict[str, str]) -> tuple[Settings, dict[str, str], list[str]]:
+    """The settings from the environment and the page's saved values (the page wins): all of them when they hold
+    together; otherwise one by one in the page's order, an override that cannot be used set aside with a note (a
+    saved LIVE=on without a key cannot stop the bot from starting). The environment alone must hold."""
+    try:
+        return from_env({**env, **overrides}), dict(overrides), []
+    except ConfigError:
+        pass
+    kept: dict[str, str] = {}
+    notes: list[str] = []
+    order = [k for k, _, _ in CONTROL_KEYS]
+    for key in sorted(overrides, key=lambda k: order.index(k) if k in order else len(order)):
+        trial = {**kept, key: overrides[key]}
+        try:
+            from_env({**env, **trial})
+        except ConfigError as error:
+            notes.append(f"网页保存的 {key}={overrides[key]} 现在用不了（{error}），已忽略")
+            continue
+        kept = trial
+    return from_env({**env, **kept}), kept, notes
+
+
+def current_values(s: Settings) -> dict[str, str]:
+    """The settings as the variables would be written (what the page shows as the value in force)."""
+    lv = s.levels
+    return {
+        "LIVE": "on" if s.live else "off",
+        "PREOPEN_MARKETS": "all" if s.coins == COINS else ("none" if not s.coins else ",".join(s.coins)),
+        "PREOPEN_PRICE_CENTS": fmt_num(lv[0].price * 100),
+        "PREOPEN_SHARES": fmt_num(lv[0].shares),
+        "PREOPEN_LEVELS": ",".join(f"{fmt_num(x.price * 100)}x{fmt_num(x.shares)}" for x in lv[1:]),
+        "PREOPEN_DEEP_AHEAD_MINUTES": str(s.deep_ahead_s // 60),
+        "PREOPEN_AHEAD_MINUTES": str(s.ahead_s // 60),
+        "PREOPEN_CANCEL_SECONDS": str(s.cancel_s),
+        "PREOPEN_EXPIRY_SECONDS": str(s.expiry_s),
+        "PREOPEN_ENTRY_SECONDS": str(s.entry_s),
+        "PREOPEN_WEEKEND": "on" if s.weekend else "off",
+        "PREOPEN_MAX_OPEN_USD": fmt_num(s.max_open_usd),
+        "PREOPEN_MAX_ATTEMPTS": str(s.max_attempts),
+        "PREOPEN_AUTO_REDEEM": "on" if s.auto_redeem else "off",
+        "PREOPEN_CANCEL_ON_EXIT": "on" if s.cancel_on_exit else "off",
+        "PAPER_BALANCE_USD": fmt_num(s.paper_balance),
+        "PREOPEN_POLL_SECONDS": fmt_num(D(str(s.poll_s))),
+        "PREOPEN_FAST_POLL_SECONDS": fmt_num(D(str(s.fast_poll_s))),
+        "PREOPEN_SNAPSHOT_SECONDS": fmt_num(D(str(s.snapshot_s))),
+        "PREOPEN_ORDER_RATE": fmt_num(D(str(s.order_rate))),
+        "PREOPEN_CANCEL_RATE": fmt_num(D(str(s.cancel_rate))),
+    }

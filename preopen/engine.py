@@ -122,6 +122,8 @@ class Engine:
         self._reserved: tuple[int, D] = (-1, D(0))
         self.budget_note = ""
         self.balance_hold_until = 0.0         # the CLOB said the balance was short: no new order until then
+        self.restart = False                  # set by the console (a LIVE switch): main() starts the process again
+        self._archive: tuple[int, list[dict]] = (-1, [])
         self.attempted: dict[str, tuple[str, int]] = {}  # condition id -> (slug, start) of every market an order was sent to
         self.strays: set[str] = set()         # order ids that came back after their record was judged: cancelled
         for q in ledger.rows.values():
@@ -703,6 +705,7 @@ class Engine:
                          note=r.not_canceled.get(oid, "已撤"))
                 if q["phase"] == "closing" and q["reason"] == "到点撤单" and oid in r.canceled:
                     self.cancel_lags.append(q["start"] - now)
+                    q["cancel_lead"] = round(q["start"] - now, 2)
             touched[q["key"]] = q
         if touched:
             self.save(*touched.values())
@@ -822,7 +825,7 @@ class Engine:
             o.update(state="final", final_at=self.now(), note=(o.get("note") or "") + "；最终记录读不到，按已知成交")
             self.save(q)
             return
-        self.note_fill(q, side, row.matched)
+        self.note_fill(q, side, row.matched, at=float(o.get("gone") or self.now()))
         if row.resting:  # still on the book: the cancel did not take (or the order never left)
             o.update(state="open", retry=0)
             self.save(q)
@@ -839,11 +842,14 @@ class Engine:
                 self.close(q, f"{mk.SIDES_CN[side]}方挂单被撤（{row.status}）", free=False, save=False)
         self.save(q)
 
-    def note_fill(self, q: dict, side: str, matched: D) -> None:
+    def note_fill(self, q: dict, side: str, matched: D, at: float | None = None) -> None:
+        """A fill seen (`at`: when it was first seen; an order gone from the book was filled by that snapshot)."""
         o = q["orders"][side]
         before = dnum(o.get("filled"))
         if matched > before:
             o["filled"] = str(matched)
+            if before <= 0:
+                o["first_fill"] = at if at is not None else self.now()
             ahead = q["start"] - self.now()
             self.fills_pending.append(f"{mk.window_name(q['coin'], q['start'])} {mk.SIDES_CN[side]} +{mk.fmt(matched - before)} 份"
                                       f" @{mk.fmt(dnum(q['price']) * 100)}¢（开场前 {mk.span(ahead)}）")
@@ -980,6 +986,53 @@ class Engine:
                     kept += 1
             self.save(q)
         return kept, changed
+
+    def apply_settings(self, new: Settings) -> int:
+        """New settings in force at once (the web console): a resting record that no longer fits them is withdrawn and
+        quoted again under the new ones; one that fits keeps its place in the queue. Returns the withdrawn count."""
+        self.s = new
+        if hasattr(self.x, "settings"):
+            self.x.settings = new
+        for name, rate, burst in (("orders", new.order_rate, new.order_burst), ("cancels", new.cancel_rate, new.cancel_burst)):
+            bucket = getattr(self.x, name, None)
+            if bucket is not None and hasattr(bucket, "rate"):
+                bucket.rate, bucket.burst = rate, burst
+        if not self.x.live and hasattr(self.x, "cash"):
+            self.x.cash = new.paper_balance
+            self.balance = new.paper_balance
+        changed = 0
+        for q in self.open_quotes():
+            if q["phase"] == "active" and (why := self.matches_settings(q)):
+                self.close(q, why, free=True)
+                changed += 1
+        self.full_scan_at = self.sweep_at = 0.0  # new coins, a wider range: looked for at the next poll
+        self.version += 1
+        return changed
+
+    def withdraw(self, key: str) -> str:
+        """One window level withdrawn by hand (the console's 撤): not quoted again."""
+        q = self.ledger.rows.get(key)
+        if q is None:
+            return "没有这条记录"
+        if q["phase"] != "active":
+            return f"这一场已经是 {q['phase']}，不用撤"
+        self.close(q, "网页手动撤单", free=True, save=False)
+        q["permanent"] = True
+        self.save(q)
+        return f"{mk.window_name(q['coin'], q['start'])} 第 {int(q['level']) + 1} 档在撤单，不再重挂"
+
+    async def emergency(self) -> str:
+        """Pause, and cancel every open order of this API key at once (the bot's own, tracked or not), then the usual
+        withdrawal of the records."""
+        n = self.pause()
+        try:
+            r = await self.x.cancel_all()
+        except Exception as error:
+            self.problem(f"紧急停止：撤掉全部挂单失败（{error}），按记录逐张撤", key="emergency")
+            return f"已暂停；按 API Key 一次撤光失败（{error}），{n} 场按记录逐张撤"
+        self.mark_cancelled(r)
+        self.notify(f"🛑 紧急停止：已暂停，撤掉 {len(r.canceled)} 张挂单")
+        return f"已暂停，撤掉 {len(r.canceled)} 张挂单" + (f"（{len(r.not_canceled)} 张没撤成，继续按记录撤）" if r.not_canceled else "")
 
     # ------------------------------------------------------------------ operator
     def pause(self) -> int:
@@ -1154,6 +1207,27 @@ class Engine:
                 pnl += float(q.get("pnl") or 0)
         return {"fills": fills, "both": both, "pnl": pnl, "settled": settled}
 
+    def all_records(self) -> list[dict]:
+        """The working records and the archived ones (the review reads both; the archive is read again only when it grew)."""
+        count = self.ledger.archive_count()
+        if self._archive[0] != count:
+            self._archive = (count, list(self.ledger.archived()))
+        return list(self.ledger.rows.values()) + self._archive[1]
+
+    def pending(self) -> list[dict[str, Any]]:
+        """What wants a look (the console's 待处理): orders of unknown state, withdrawals running late."""
+        now = self.now()
+        out = []
+        for q in self.open_quotes():
+            for side, o in q["orders"].items():
+                if o["state"] == "unknown":
+                    out.append({"what": "状态不明的单", "window": mk.window_name(q["coin"], q["start"]), "side": mk.SIDES_CN[side],
+                                "since": mk.span(now - float(o.get("sent") or now)), "note": o.get("note") or o.get("error") or ""})
+            if q["phase"] == "closing" and now > q["start"] - self.s.cancel_s + 60 and now < q["start"]:
+                out.append({"what": "撤单还没确认", "window": mk.window_name(q["coin"], q["start"]), "side": "",
+                            "since": mk.span(now - float(q.get("closing_at") or now)), "note": q.get("reason") or ""})
+        return out[:30]
+
     def report(self) -> dict[str, Any]:
         """Everything the web console shows, as plain JSON-able values (times also pre-formatted in Beijing time)."""
         now = self.now()
@@ -1203,7 +1277,9 @@ class Engine:
             "snapshot_age": round(now - self.snapshot_at, 1) if self.snapshot_at else None,
             "queue": self.queue.qsize(), "waiting": len(self.timers), "placing": len(self.placing),
             "id_is_hash": self.id_is_hash, "tier": getattr(self.x, "tier", "") or "", "lead_h": round(self.lead / 3600, 2),
-            "upcoming": upcoming, "fills": fills,
+            "upcoming": upcoming, "fills": fills, "pending": self.pending(),
+            "unmanaged_rows": [{"id": r.id[:10] + "…", "price": float(r.price) * 100, "size": float(r.size), "matched": float(r.matched)}
+                               for r in self.unmanaged[:10]],
             "errors": [{"when": mk.hms(ts), "text": text[:300]} for ts, text in list(self.errors)[-10:]][::-1],
         }
 

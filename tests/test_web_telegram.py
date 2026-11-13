@@ -41,14 +41,40 @@ class InitDataTest(unittest.TestCase):
         self.assertFalse(web.check_init_data(init_data(), TOKEN, ""))
 
 
-class WebServerTest(unittest.IsolatedAsyncioTestCase):
-    def server(self, key: str = "correct-horse-battery"):
+class FakeApp:
+    ACTIONS = ("pause",)
+
+    def __init__(self):
         self.calls = []
 
-        async def pause():
-            self.calls.append("pause")
-            return "paused"
-        return web.WebServer(0, lambda: {"ok": 1, "mode": "模拟"}, {"pause": pause}, web_key=key, bot_token=TOKEN, admin_id=ADMIN)
+    def report(self):
+        return {"ok": 1, "mode": "模拟"}
+
+    def settings(self):
+        return {"items": []}
+
+    def orders(self, tab, coin, limit):
+        return {"tab": tab, "coin": coin, "limit": limit}
+
+    def review(self):
+        return {"totals": {}}
+
+    def csv(self, kind):
+        return f"{kind}.csv", "\ufeffa,b\n1,2\n"
+
+    async def change(self, body):
+        self.calls.append(("change", body))
+        return body.get("name") == "PREOPEN_SHARES", "saved"
+
+    async def action(self, body):
+        self.calls.append(("action", body["action"]))
+        return "paused"
+
+
+class WebServerTest(unittest.IsolatedAsyncioTestCase):
+    def server(self, key: str = "correct-horse-battery"):
+        self.app = FakeApp()
+        return web.WebServer(0, self.app, web_key=key, bot_token=TOKEN, admin_id=ADMIN)
 
     async def test_routes_and_sign_in(self):
         s = self.server()
@@ -76,7 +102,25 @@ class WebServerTest(unittest.IsolatedAsyncioTestCase):
         auth["content-type"] = "application/json"
         self.assertEqual((await s.respond("POST", "/api/action", auth, b'{"action": "rm -rf"}'))[0], 400)
         status, _, body, _ = await s.respond("POST", "/api/action", auth, b'{"action": "pause"}')
-        self.assertEqual((status, json.loads(body)["message"], self.calls), (200, "paused", ["pause"]))
+        self.assertEqual((status, json.loads(body)["message"], self.app.calls), (200, "paused", [("action", "pause")]))
+
+    async def test_settings_orders_journal_routes(self):
+        s = self.server()
+        auth = {"x-telegram-init-data": init_data(), "content-type": "application/json"}
+        self.assertEqual((await s.respond("GET", "/api/settings", {}, b""))[0], 401)
+        self.assertEqual((await s.respond("GET", "/api/settings", auth, b""))[0], 200)
+        status, _, body, _ = await s.respond("POST", "/api/settings", auth, b'{"name": "PREOPEN_SHARES", "value": "20"}')
+        self.assertEqual((status, json.loads(body)["ok"]), (200, True))
+        status, _, body, _ = await s.respond("POST", "/api/settings", auth, b'{"name": "PREOPEN_PRICE_CENTS", "value": "99"}')
+        self.assertEqual((status, json.loads(body)["ok"]), (400, False))
+        status, _, body, _ = await s.respond("GET", "/api/orders?tab=filled&coin=btc&limit=5", auth, b"")
+        self.assertEqual(json.loads(body), {"tab": "filled", "coin": "btc", "limit": 5})
+        self.assertEqual((await s.respond("GET", "/api/journal", auth, b""))[0], 200)
+        status, ctype, body, extra = await s.respond("GET", "/api/journal.csv?kind=daily", auth, b"")
+        self.assertEqual((status, ctype.split(";")[0]), (200, "text/csv"))
+        self.assertIn("daily.csv", dict(extra)["Content-Disposition"])
+        for page in ("/", "/control", "/journal"):
+            self.assertEqual((await s.respond("GET", page, {}, b""))[0], 200)
 
     async def test_without_a_key_only_telegram_signs_in(self):
         s = self.server(key="")

@@ -111,6 +111,7 @@ class Exchange(Protocol):
     async def place(self, specs: list[OrderSpec]) -> list[Placed]: ...
     async def cancel(self, ids: list[str]) -> Cancelled: ...
     async def cancel_market(self, condition_id: str) -> Cancelled: ...
+    async def cancel_all(self) -> Cancelled: ...
     async def open_orders(self) -> list[Row]: ...
     async def order(self, order_id: str) -> Row | None: ...
     async def balance(self) -> D: ...
@@ -356,6 +357,16 @@ class LiveExchange:
             raise Throttled("撤单被限流（429）", error.retry_after or 5.0) from error
         return Cancelled(set(str(x) for x in r.canceled), {str(k): str(v) for k, v in r.not_canceled.items()})
 
+    async def cancel_all(self) -> Cancelled:
+        """Every open order of this API key (the emergency stop; a switch away from live trading)."""
+        from polymarket import RateLimitError
+        await self.cancels.take(1)
+        try:
+            r = await self.client.cancel_all()
+        except RateLimitError as error:
+            raise Throttled("撤单被限流（429）", error.retry_after or 5.0) from error
+        return Cancelled(set(str(x) for x in r.canceled), {str(k): str(v) for k, v in r.not_canceled.items()})
+
     async def open_orders(self) -> list[Row]:
         """The open orders. On a Deposit Wallet the wallet-wide list (every signer's: the website's too), so the
         budget sees all the pUSD resting buys hold; elsewhere, or if that list fails, this key's own orders."""
@@ -458,6 +469,9 @@ class PaperExchange:
         self.market_cancels.append(condition_id)
         ids = [oid for oid, row in self.book.items() if row.market == condition_id]
         return await self.cancel(ids) if ids else Cancelled()
+
+    async def cancel_all(self) -> Cancelled:
+        return await self.cancel(list(self.book)) if self.book else Cancelled()
 
     async def open_orders(self) -> list[Row]:
         return [Row(**vars(r)) for r in self.book.values()]

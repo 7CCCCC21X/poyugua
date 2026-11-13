@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import sys
 
@@ -21,6 +22,7 @@ from preopen.gamma import PublicApi
 from preopen.ledger import Ledger
 from preopen.probe import probe
 from preopen.telegram import CONFIRM_PAUSE, HELP, Reply, Telegram, confirm_markup, web_markup
+from preopen.console import Console
 from preopen.web import WebServer
 
 LOG = logging.getLogger("preopen")
@@ -71,32 +73,32 @@ def commander(settings: config.Settings, engine: Engine, pub: PublicApi):
     return handle
 
 
-async def run(settings: config.Settings) -> None:
+async def run(settings: config.Settings, env: dict[str, str] | None = None, overrides: dict[str, str] | None = None,
+              dropped: list[str] | None = None) -> bool:
+    """Run until stopped. True when the console asked for a restart (a LIVE switch)."""
+    env = dict(os.environ) if env is None else env
     ledger = Ledger(settings.ledger_path)
     pub = PublicApi()
     exchange = LiveExchange(settings) if settings.live else PaperExchange(settings.paper_balance)
     tg = (Telegram(settings.telegram_token, settings.telegram_chat, web_url=settings.web_url if settings.web_port else "")
           if settings.telegram_token and settings.telegram_chat else None)
     engine = Engine(settings, exchange, pub, ledger, notify=tg.send if tg else None)
-    for note in settings.notes:
+    for note in [*settings.notes, *(dropped or [])]:
         LOG.warning(note)
+    for note in dropped or []:
+        engine.notify(f"⚠️ {note}")
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(sig, engine.stop.set)
         except (NotImplementedError, RuntimeError):  # pragma: no cover - Windows
             pass
-
-    async def pause() -> str:
-        return f"已暂停：{engine.pause()} 场在撤单，不再新挂"
-
-    async def resume() -> str:
-        engine.resume()
-        return "已恢复挂单"
+    console = Console(engine, env, config.control_path(settings.db_path), overrides or {},
+                      notify=(lambda text: tg.send(text)) if tg else None)
     web = None
     if settings.web_port:
-        web = WebServer(settings.web_port, engine.report, {"pause": pause, "resume": resume}, web_key=settings.web_key,
-                        bot_token=settings.telegram_token, admin_id=settings.telegram_chat)
+        web = WebServer(settings.web_port, console, web_key=settings.web_key, bot_token=settings.telegram_token,
+                        admin_id=settings.telegram_chat)
         try:
             await web.start()
         except OSError as error:
@@ -132,6 +134,7 @@ async def run(settings: config.Settings) -> None:
         await exchange.close()
         await pub.close()
         ledger.close()
+    return engine.restart
 
 
 def offline_status(settings: config.Settings) -> str:
@@ -150,11 +153,17 @@ def offline_status(settings: config.Settings) -> str:
 
 def main(argv: list[str]) -> int:
     config.load_dotenv()
+    env = dict(os.environ)
     try:
-        settings = config.from_env()
+        config.from_env(env)  # the environment alone must hold
+        path = config.control_path((env.get("PREOPEN_DB") or "data/preopen.sqlite3").strip())
+        saved = config.load_overrides(path)
+        settings, kept, dropped = config.effective(env, saved)
     except config.ConfigError as error:
         print(f"设置有误：{error}", file=sys.stderr)
         return 2
+    if kept != saved:
+        config.save_overrides(path, kept)  # a saved value that no longer holds is dropped, once
     setup_logging(settings.log_level)
     cmd = argv[0] if argv else "run"
     if cmd == "probe":
@@ -174,7 +183,10 @@ def main(argv: list[str]) -> int:
     if cmd != "run":
         print(__doc__)
         return 2
-    asyncio.run(run(settings))
+    if asyncio.run(run(settings, env, kept, dropped)):
+        LOG.info("按网页的设置重启")
+        sys.stdout.flush()
+        os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
     return 0
 
 
