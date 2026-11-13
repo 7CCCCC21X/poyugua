@@ -77,7 +77,16 @@ ERRORS_KEPT = 30
 UNSURE = ("unknown", "placing", "prepared")   # sent (or maybe sent) and not answered for: looked for by the hash
 REFUSE_HOLD_S = 30        # the CLOB refused orders for a reason not the window's own: no new order this long, doubling
 REFUSE_HOLD_MAX_S = 600   # to this while it keeps refusing (an accepted order resets it); no window is struck off for it
-ACCOUNT_REFUSALS = {"invalid_expiration", "banned", "closed_only", "batch_too_large", "invalid_payload"}
+ACCOUNT_REFUSALS = {"invalid_expiration", "banned", "closed_only", "batch_too_large", "invalid_payload", "auth"}
+REFUSAL_HELP = {          # what an account-wide refusal means for the operator, said with it
+    "auth": "签名私钥和 API Key 不是同一个账户：Railway 里的 POLY_PRIVATE_KEY 和 POLY_API_KEY / POLY_API_SECRET / "
+            "POLY_API_PASSPHRASE 要属于同一个账户（最简单是删掉 POLY_API_ 这三项，程序会用私钥自己生成）",
+    "banned": "这个地址被 Polymarket 禁止交易",
+    "closed_only": "这个地址只能平仓、不能新挂单",
+    "invalid_expiration": "交易所说到期时间无效（检查撤单/到期秒数的设置）",
+    "invalid_payload": "交易所说订单格式不对",
+    "batch_too_large": "一次发的单超过了交易所的上限",
+}
 EXTERNAL_MASS = 3         # the bot's orders cancelled elsewhere (plain CANCELED: the website's 取消所有, another program
 EXTERNAL_WINDOW_S = 60    # with the key) in this many windows within this long: taken as "stop", and the bot pauses
 
@@ -146,9 +155,11 @@ class Engine:
         self.balance_hold_until = 0.0         # the CLOB said the balance was short: no new order until then
         self.refused_until = 0.0              # the CLOB refused orders for the account's sake, not the window's: no new
         self.refused_reason = ""              # order until then (doubling while it keeps refusing)
+        self.refused_code = ""
         self.refused_streak = 0
         self.refused_at: dict[str, float] = {}  # slug -> when its orders were last refused that way
         self.accepted_at = 0.0                # when the CLOB last accepted an order (ends a refusal streak)
+        self.last_refusal: tuple[float, str, str] | None = None   # (when, code, words) of the latest order refused
         self.recent_refusals: collections.deque = collections.deque(maxlen=500)  # (when, slug, code) of those refusals
         self.external: collections.deque = collections.deque(maxlen=200)         # (when, slug) of cancels made elsewhere
         self.restart = False                  # set by the console (a LIVE switch): main() starts the process again
@@ -260,7 +271,9 @@ class Engine:
         if now < self.balance_hold_until:
             return f"交易所说余额不够，{self.balance_hold_until - now:.0f} 秒后再试"
         if now < self.refused_until:
-            return f"交易所拒单（{self.refused_reason}），{self.refused_until - now:.0f} 秒后再试"
+            help_ = REFUSAL_HELP.get(self.refused_code, "")
+            return (f"交易所拒单：{help_}，{self.refused_until - now:.0f} 秒后再试（交易所原话见下）" if help_
+                    else f"交易所拒单（{self.refused_reason}），{self.refused_until - now:.0f} 秒后再试")
         if not self.snapshot_at:
             return "账户快照还没读到"
         if now - self.snapshot_at > self.stale_after():
@@ -357,8 +370,10 @@ class Engine:
         wait = min(REFUSE_HOLD_MAX_S, REFUSE_HOLD_S * 2 ** min(self.refused_streak - 1, 6))
         self.refused_until = max(self.refused_until, self.now() + wait)
         self.refused_reason = f"{code}：{message[:120]}" if message else code
-        self.problem(f"交易所拒单（{self.refused_reason}）：所有新挂暂停 {wait:.0f} 秒后再试（连续第 {self.refused_streak} 次），"
-                     f"场次不作废", key=f"refused-{code}")
+        self.refused_code = code
+        help_ = REFUSAL_HELP.get(code, "")
+        self.problem(f"交易所拒单（{self.refused_reason}）" + (f"。{help_}" if help_ else "")
+                     + f"。所有新挂暂停 {wait:.0f} 秒后再试（连续第 {self.refused_streak} 次），场次不作废", key=f"refused-{code}")
 
     def set_cooldown(self, reason: str, seconds: float) -> None:
         until = self.now() + max(1.0, min(float(seconds), 600.0))
@@ -743,6 +758,8 @@ class Engine:
                 self.apply_placed(q, side, r, done)
                 if r.status == "open":
                     self.accepted_at, self.refused_streak = done, 0
+                elif r.status in ("rejected", "not_sent") and r.code:
+                    self.last_refusal = (done, r.code, r.message)
                 if r.wait > 0:
                     self.set_cooldown(f"{r.code}：{r.message[:120]}", r.wait)
                 if r.code == "market_not_ready":
@@ -1731,8 +1748,10 @@ class Engine:
                     counts["unlisted"] += 1
                     continue
                 qs = self.quotes_of(slug)
-                if any(q["phase"] == "active" for q in qs):
+                if any(q["phase"] == "active" and any(o["state"] == "open" for o in q["orders"].values()) for q in qs):
                     counts["resting"] += 1
+                elif any(q["phase"] == "active" for q in qs):  # being sent, or its answer lost: not on the book yet
+                    counts["queued"] += 1
                 elif any(q["phase"] == "closing" for q in qs):
                     counts["closing"] += 1
                 elif not self.wanted(listing):
@@ -1808,11 +1827,12 @@ class Engine:
         return len(revived)
 
     def counts(self) -> dict[str, Any]:
+        """resting: orders the CLOB accepted and holds; sending: signed, the answer not back yet (not resting yet)."""
         active = [q for q in self.open_quotes() if q["phase"] == "active"]
-        resting = sum(1 for q in self.open_quotes() for o in q["orders"].values() if o["state"] in MAY_REST)
-        unknown = sum(1 for q in self.open_quotes() for o in q["orders"].values() if o["state"] == "unknown")
-        windows = {q["slug"] for q in active}
-        return {"active": len(active), "windows": len(windows), "resting": resting, "unknown": unknown,
+        states = [o["state"] for q in self.open_quotes() for o in q["orders"].values()]
+        windows = {q["slug"] for q in active if any(o["state"] == "open" for o in q["orders"].values())}
+        return {"active": len(active), "windows": len(windows), "resting": states.count("open"),
+                "sending": states.count("placing") + states.count("prepared"), "unknown": states.count("unknown"),
                 "closing": sum(1 for q in self.open_quotes() if q["phase"] == "closing")}
 
     def today(self) -> dict[str, Any]:
@@ -1997,14 +2017,22 @@ class Engine:
                  f"{'⚠️' if short else '✅'} 范围内：{cov['text']}"]
         timeouts = int(getattr(self.x, "_timeouts", 0) or 0)
         if now < self.refused_until:
-            lines.append(f"⚠️ 交易所拒单：{self.refused_reason}；所有新挂暂停，{self.refused_until - now:.0f} 秒后再试"
-                         f"（连续第 {self.refused_streak} 次）")
+            lines.append(f"⚠️ 交易所拒单（原话）：{self.refused_reason}；连续第 {self.refused_streak} 次，所有新挂暂停，"
+                         f"{self.refused_until - now:.0f} 秒后再试，场次不作废")
         elif now < self.cooldown_until:
             lines.append(f"⚠️ 冷却中：{self.cooldown_reason[:120]}（还有 {self.cooldown_until - now:.0f} 秒）")
         if timeouts:
             lines.append(f"⚠️ 下单超时（order timed out）连续 {timeouts} 次")
-        lines.append(f"✅ 下单：最近一次被交易所接受是 {mk.span(now - self.accepted_at)}前" if self.accepted_at
-                     else "ℹ️ 下单：这次启动后还没有新下的单（挂着的是接管的）")
+        if self.accepted_at:
+            lines.append(f"✅ 下单：最近一次被交易所接受是 {mk.span(now - self.accepted_at)}前")
+        elif self.last_refusal:
+            lines.append("⛔ 下单：这次启动后交易所一张都没接受" + (f"（已启动 {mk.span(now - self.started_at)}）" if self.started_at else ""))
+        else:
+            lines.append("ℹ️ 下单：这次启动后还没有新下的单（挂着的是接管的）")
+        if self.last_refusal and now >= self.refused_until and (not self.accepted_at or self.last_refusal[0] > self.accepted_at):
+            when, code, words = self.last_refusal
+            help_ = REFUSAL_HELP.get(code, "")
+            lines.append(f"⚠️ 最近一次被拒（{mk.span(now - when)}前）：{code} {words[:120]}" + (f"。{help_}" if help_ else ""))
         unknown = [now - float(o.get("unknown_at") or now) for q in self.open_quotes() for o in q["orders"].values()
                    if o["state"] == "unknown"]
         lines.append(f"⚠️ 状态不明的单：{len(unknown)} 张，最久 {mk.span(max(unknown))}（按订单哈希核对中，约 2 分钟内有结论）"
@@ -2041,6 +2069,11 @@ class Engine:
                      + (f"（上限 ${self.s.max_exposure_usd}）" if self.s.max_exposure_usd else "（未设上限）")
                      + f"；今天已结算 {self.day_pnl():+.2f}" + (f"；{risk}" if risk else ""))
         lines.append("【账户与接口】")
+        if self.x.live:
+            wallet = str(getattr(self.x, "wallet", "") or "")
+            signer = str(getattr(getattr(self.x, "client", None), "signer", "") or "")
+            lines.append(f"ℹ️ 账户：钱包 {wallet}（{getattr(self.x, 'wallet_type', '') or '?'}），签名地址 {signer}；API Key："
+                         + ("Railway 里填的 POLY_API_KEY" if self.s.clob_key else "用私钥生成") + "。钱包要和网页右上角个人资料里的地址一样")
         lines.append(f"⛔ 账本账户：{self.blocked}" if self.blocked else
                      "✅ 账本账户：一致；撤单范围：" + ("整个 API Key" if self.s.key_exclusive else "只撤本程序签的单"))
         if not self.snapshot_at:

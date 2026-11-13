@@ -98,6 +98,8 @@ Polymarket 按**市场**核对挂买单：同一个市场（一场）里的挂�
    - `POLY_WALLET`：polymarket.com 右上角个人菜单里显示的钱包地址；
    - `POLY_PRIVATE_KEY`：这个账户的签名私钥（邮箱/Google 登录的账户可在网页设置里导出；MetaMask 等外部钱包就是那个钱包的私钥），
      或者一把已授权给这个 Deposit Wallet 的 **Session Key**（只能交易、不能提现，更安全；但可能不能自动领取，领取可在网页上做）；
+   - `POLY_API_KEY` / `POLY_API_SECRET` / `POLY_API_PASSPHRASE` **一般不填**：程序用私钥自动生成。填了就必须是同一把私钥生成的，
+     否则每张单都会被拒（`the order signer address has to be the address of the API KEY`，🩺 体检会直接提示）；
    - 自动领取：在 设置 → API Keys → Relayer API Keys 建一个 Key，填 `POLY_RELAYER_API_KEY` 和 `POLY_RELAYER_API_KEY_ADDRESS`；
    - 账户里要有 **pUSD**，并在网页上至少交易过一次或完成交易授权（SDK 也会在缺授权时尝试补上）。
 5. 先在本地或 Railway 上跑 `python main.py probe`（只读，不需要私钥）确认市场都找得到、资金需求，再设 `LIVE=on`。

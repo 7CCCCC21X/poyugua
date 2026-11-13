@@ -490,7 +490,7 @@ class RefusalTest(unittest.IsolatedAsyncioTestCase):
         await drain(e)
         self.assertEqual(len(x.placed), 0)
         self.assertEqual(quotes(e), [])                  # no record, no attempt used
-        self.assertIn("交易所拒单（invalid_expiration", e.hold())
+        self.assertIn("交易所拒单：交易所说到期时间无效", e.hold())
         self.assertIn("暂停中", e.coverage()["text"])
         x.reject.clear()
         await tick(e, 31)  # the 30 s hold over: every window placed
@@ -836,8 +836,8 @@ class OperatorTest(unittest.IsolatedAsyncioTestCase):
         m = pub.list_window("btc", mk.window_starts(clock.t, e.s)[0])
         x.refuse_market[m["conditionId"]] = ("rejected", "invalid_expiration")
         await tick(e)
-        self.assertTrue(verdict(e).startswith("⛔ 暂不新挂：交易所拒单（invalid_expiration"))
-        self.assertIn("⚠️ 交易所拒单：invalid_expiration", e.check_text())
+        self.assertTrue(verdict(e).startswith("⛔ 暂不新挂：交易所拒单：交易所说到期时间无效"))
+        self.assertIn("⚠️ 交易所拒单（原话）：invalid_expiration", e.check_text())
         self.assertLess(len(e.check_text()), 4000)  # one Telegram message
 
     async def test_deep_levels_only_near_the_start(self):

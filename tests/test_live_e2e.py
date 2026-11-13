@@ -59,6 +59,7 @@ class FakeClob:
         self.elsewhere = D(0)   # held in every market by orders this key does not list (another key): counted all the same
         self.refused = 0
         self.redeemed: list[str] = []
+        self.signer_mismatch = False
         self.balance_error: Exception | None = None
         self.missing = "404"
         self.market_cancels: list[str] = []
@@ -87,6 +88,8 @@ class FakeClob:
     async def post_orders(self, orders):
         answer = self.answers.pop(0) if self.answers else "ok"
         self.posted += len(orders)
+        if self.signer_mismatch:   # the API key belongs to another address than the orders' signer (docs: POST /order)
+            raise RequestRejectedError("the order signer address has to be the address of the API KEY", status=400)
         if answer == "timed_out":  # docs: rejected before reaching the book, safe to send again
             raise RequestRejectedError("order timed out", status=500)
         # each market's open BUYs against the balance on its own (11-13: three $49 orders in three markets rest on
@@ -490,6 +493,38 @@ class SenderTest(unittest.IsolatedAsyncioTestCase):
         fake.answers = ["timed_out"]
         self.assertEqual((await x.place(groups[1]))[0].wait, 5.0)
         await x.close()
+
+
+class CredentialsTest(unittest.IsolatedAsyncioTestCase):
+    async def test_an_api_key_of_another_account_stops_everything_loudly_and_strikes_off_nothing(self):
+        """11-13 15:30: every order refused with "the order signer address has to be the address of the API KEY",
+        windows retried every 5 s without a word, /check saying ⏳ 正在挂."""
+        clock = Clock()
+        fake, pub = FakeClob(clock), FakePublic(clock)
+        fake.balance_usd = D("75.10")
+        s = seven_coins(clock, fake, pub)
+        e = make_engine(s, clock=clock, exchange=adapter(fake, s), public=pub)[0]
+        fake.signer_mismatch = True
+        await tick(e)
+        sent = fake.posted
+        for _ in range(5):
+            await tick(e, 5)
+        self.assertLess(fake.posted - sent, 30)                       # held, not hammering every 5 s
+        report = e.check_text()
+        verdict = report.splitlines()[1]
+        self.assertTrue(verdict.startswith("⛔ 暂不新挂：交易所拒单：签名私钥和 API Key 不是同一个账户"))
+        self.assertIn("the order signer address has to be the address of the API KEY", report)  # the exchange's words
+        self.assertIn("POLY_API_KEY", verdict)                        # what to change, in the first line
+        self.assertIn("⛔ 下单：这次启动后交易所一张都没接受", report)
+        self.assertIn("签名地址", report)
+        self.assertNotIn("挂着", e.coverage()["text"])               # windows being sent are not counted as resting
+        self.assertTrue(any("refused-auth" in k for k in e.notified))  # said on Telegram
+        self.assertEqual([q for q in quotes(e) if q.get("counted") or q.get("permanent")], [])
+        fake.signer_mismatch = False                                  # the variables fixed
+        for _ in range(30):
+            await tick(e, 10)
+        self.assertGreater(len(fake.live()), 100)
+        self.assertTrue(e.check_text().splitlines()[1].startswith("✅"))
 
 
 class RefusalWordsTest(unittest.IsolatedAsyncioTestCase):
