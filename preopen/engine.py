@@ -1,9 +1,11 @@
 """The controller: find each window the moment it is listed, quote it post-only on both sides, withdraw before the start.
 
 Loops (all in one asyncio process):
-    discovery   every coin's next listing (fast around the expected moment), plus a full pass over the range a minute
-    workers     place the queued windows: the freshest listings first, then the soonest starts
-    cancel      every second: the windows at their cancel time (and any closing record) withdrawn, sprinting to the expiry
+    discovery   every coin's next listing by the direct path (fast around the expected moment), a full pass a minute
+    workers     place the queued windows: the freshest listings first (armed until the CLOB opens), then the soonest
+    cancel      every second: the windows at their cancel time (and any closing record) withdrawn by id, then swept
+                by market; failed cancels sprint every 2 s to the expiry
+    reconcile   orders off the book get their final record read; unknown placements are looked for
     account     the open orders and the balance: fills, orders gone from the book, the budget
     settle      the fills of a closed window valued by the official result; the winning side redeemed
 
@@ -24,7 +26,7 @@ from typing import Any, Callable
 
 from . import markets as mk
 from .config import GTD_THRESHOLD_S, Settings
-from .exchange import Cancelled, Exchange, OrderSpec, Placed, RETRYABLE_CODES, Row, Throttled
+from .exchange import Cancelled, Exchange, OrderSpec, Placed, Row, Throttled, retryable
 from .ledger import ENDED, MAY_REST, NEVER_PLACED, Ledger, quote_key
 
 LOG = logging.getLogger(__name__)
@@ -53,6 +55,8 @@ RESULT_RETRY_S = 30
 REDEEM_RETRY_S = 600
 REDEEM_TRIES = 6
 STALE_EXTRA_S = 15
+BALANCE_HOLD_S = 60       # the CLOB refused or cancelled an order for the balance: no new order this long
+RECONCILE_BUDGET_S = 20   # a reconcile pass is cut off after this (its reads are retried next pass)
 ERRORS_KEPT = 30
 PERMANENT_CODES = {"invalid", "http_400", "invalid_expiration"}  # refusals that would recur: the level is not quoted again
 
@@ -117,6 +121,9 @@ class Engine:
         self.version = 0                      # bumped on every record change: reserved() is cached by it
         self._reserved: tuple[int, D] = (-1, D(0))
         self.budget_note = ""
+        self.balance_hold_until = 0.0         # the CLOB said the balance was short: no new order until then
+        self.attempted: dict[str, tuple[str, int]] = {}  # condition id -> (slug, start) of every market an order was sent to
+        self.strays: set[str] = set()         # order ids that came back after their record was judged: cancelled
         for q in ledger.rows.values():
             self._index(q)
 
@@ -189,6 +196,8 @@ class Engine:
             return "已暂停（/resume 恢复）"
         if self.now() < self.cooldown_until:
             return f"接口冷却中（{self.cooldown_reason}，还有 {self.cooldown_until - self.now():.0f} 秒）"
+        if self.now() < self.balance_hold_until:
+            return f"交易所说余额不够，{self.balance_hold_until - self.now():.0f} 秒后再试"
         if not self.snapshot_at:
             return "账户快照还没读到"
         if self.now() - self.snapshot_at > self.stale_after():
@@ -197,6 +206,13 @@ class Engine:
 
     def stale_after(self) -> float:
         return 3 * max(self.s.snapshot_s, self.snapshot_took) + STALE_EXTRA_S
+
+    def hold_balance(self, text: str) -> None:
+        """The CLOB refused or cancelled an order for the balance: every placement waits a minute and the balance is
+        read again (the local budget does not see orders placed elsewhere, e.g. on the website, nor the allowance)."""
+        self.balance_hold_until = self.now() + BALANCE_HOLD_S
+        self.balance_at = 0.0
+        self.problem(text, key="balance")
 
     def set_cooldown(self, reason: str, seconds: float) -> None:
         until = self.now() + max(1.0, min(float(seconds), 600.0))
@@ -315,13 +331,13 @@ class Engine:
                 continue
             new += 1
             self.skipped.pop(slug, None)
-            self.listings[slug] = listing
+            self.listings[slug] = listing  # kept (the coin's next window moves on); wanted() refuses a maker-fee market
             if listing.created:
                 self.leads.append(start - listing.created)
                 if seen - listing.created < 120:
                     self.listing_lags.append(seen - listing.created)
             if listing.maker_fee:
-                self.skipped[slug] = (seen, "挂单方也收手续费（feeSchedule.takerOnly=false）")
+                self.problem(f"{mk.window_name(coin, start)} 挂单方也收手续费（feeSchedule.takerOnly=false）：不挂", key="maker-fee")
                 continue
             self.enqueue(slug)
         return new
@@ -384,6 +400,8 @@ class Engine:
             return []
         if listing.coin not in self.s.coins or (not self.s.weekend and mk.on_weekend(listing.start)):
             return []
+        if listing.maker_fee:  # makers would pay a fee on every fill: the pair's 2¢ margin gone; not quoted
+            return []
         out = []
         for i, lv in enumerate(self.s.levels):
             if i and self.s.deep_ahead_s and listing.start - now > self.s.deep_ahead_s:
@@ -442,9 +460,6 @@ class Engine:
             return None
         if why := self.hold():
             return Hold(why, None if self.paused else HOLD_RETRY_S)
-        need = self.need_of(levels)
-        if why := self.budget_problem(need):
-            return Hold(why, None)
         if not listing.accepting:
             try:
                 accepting = await self.pub.accepting(listing.condition_id)
@@ -457,6 +472,16 @@ class Engine:
                 return Hold("市场还没开放下单", retry)
             listing.accepting = True
             listing.opened = self.now()
+            levels = self.wanted(listing)  # judged again after the await
+            if not levels:
+                return None
+            if why := self.hold():
+                return Hold(why, None if self.paused else HOLD_RETRY_S)
+        # from here to the records' save nothing awaits: the budget check and the reservation are one step (the seven
+        # coins' fresh listings open together and must not all pass against the same reservation)
+        need = self.need_of(levels)
+        if why := self.budget_problem(need):
+            return Hold(why, None)
         now = self.now()
         if now > listing.start - self.s.entry_s:
             return None
@@ -478,6 +503,7 @@ class Engine:
                 specs.append(OrderSpec(ref=f"{q['key']}/{side}", asset=listing.asset(side), price=lv.price, size=lv.shares,
                                        expiration=q["expiration"], neg_risk=listing.neg_risk, market=listing.condition_id))
         self.save(*quotes)  # durable before anything is sent
+        self.attempted[listing.condition_id] = (slug, listing.start)
         self.x.prime(listing)
         try:
             results = await self.x.place(specs)
@@ -498,11 +524,13 @@ class Engine:
                     hold = Hold("市场还没开放下单", ARM_RETRY_S)
                 if r.code == "not_enough_balance":
                     hold = Hold("余额或授权不足（交易所拒单）", None)
-                    self.balance_at = 0.0  # read the balance again before the next placement
-                    self.problem("交易所拒单：余额或授权不足（到 Polymarket 核对 pUSD 余额和交易授权）", key="balance")
+                    self.hold_balance("交易所拒单：余额或授权不足（到 Polymarket 核对 pUSD 余额和交易授权）")
             states = {o["state"] for o in q["orders"].values()}
-            if states <= {"not_sent"}:
-                self.forget(q)  # nothing was placed: no record, the window is placed afresh later
+            codes = [o.get("code", "") for o in q["orders"].values() if o["state"] != "open"]
+            if states <= {"not_sent", "rejected"} and all(retryable(c) for c in codes):
+                # nothing rests and nothing was the window's own doing (not ready yet, the balance, a rate limit): no
+                # record, no attempt used; the window is placed afresh (re-armed at once when the market was not ready)
+                self.forget(q)
                 hold = hold or Hold(next((o["error"] for o in q["orders"].values() if o["error"]), "没发出"), HOLD_RETRY_S)
                 continue
             if states == {"open"}:
@@ -516,18 +544,23 @@ class Engine:
                 codes = [o.get("code", "") for o in q["orders"].values() if o["state"] != "open"]
                 self.close(q, "单边没挂上：" + "；".join(f"{mk.SIDES_CN[s]} {o['state']} {o.get('code', '')} {o['error'][:80]}".strip()
                                                     for s, o in q["orders"].items() if o["state"] != "open"),
-                           free=all(c in RETRYABLE_CODES for c in codes), save=False)
+                           free=all(retryable(c) for c in codes), save=False)
                 if any(c in PERMANENT_CODES for c in codes):
                     q["permanent"] = True
             self.save(q)
             for side, o in q["orders"].items():
-                if o["state"] in ("rejected", "unknown") and o.get("code") not in RETRYABLE_CODES:
+                if o["state"] in ("rejected", "unknown") and not retryable(str(o.get("code") or "")):
                     self.problem(f"{mk.window_name(q['coin'], q['start'])} {mk.SIDES_CN[side]} {o['state']}：{o.get('code')} {o['error'][:120]}",
                                  key=f"reject-{o.get('code')}")
         return hold
 
     def apply_placed(self, q: dict, side: str, r: Placed, at: float) -> None:
         o = q["orders"][side]
+        if o["state"] != "placing":  # judged meanwhile (cannot happen while its window is in `placing`): never revived
+            if r.status == "open" and r.order_id:
+                self.strays.add(r.order_id)
+                self.problem(f"{q['key']} {side} 的应答来得太晚，已撤掉它挂上的单 {r.order_id}", key="stray")
+            return
         o.update(hash=r.hash, salt=r.salt, code=r.code, error=r.message[:300], sent=at)
         if r.status == "open":
             o.update(state="open", id=r.order_id, filled=str(r.matched))
@@ -562,7 +595,11 @@ class Engine:
                 n += 1
         return n
 
-    async def cancel_pass(self) -> None:
+    async def cancel_pass(self, sweep_all: bool = False) -> None:
+        """Withdraw what is due: each record at its cancel time (or paused) closes; its open orders are cancelled by id,
+        the soonest windows first; then each window at its cancel time is swept once by market (cancel-market-orders:
+        an order the bot lost track of cannot outlive the start), and again every SWEEP_EVERY_S while an order of it is
+        of unknown state."""
         now = self.now()
         due: list[tuple[dict, str]] = []
         sweep: dict[str, dict] = {}
@@ -575,26 +612,55 @@ class Engine:
                     self.close(q, "暂停", free=True)
                 else:
                     continue
-            if q["phase"] != "closing":
+            if q["phase"] not in ("closing", "closed"):
                 continue
-            for side, o in q["orders"].items():
-                if o["state"] == "open" and now >= float(o.get("retry") or 0):
-                    due.append((q, side))
-                elif o["state"] in ("unknown", "placing", "prepared") and at_cancel and now < q["start"]:
-                    sweep[q["condition_id"]] = q
+            if q["phase"] == "closing":
+                for side, o in q["orders"].items():
+                    if o["state"] == "open" and now >= float(o.get("retry") or 0):
+                        due.append((q, side))
+                    elif (o["state"] in ("unknown", "placing", "prepared") and (at_cancel or sweep_all) and now < q["start"]
+                          and q["slug"] not in self.placing):
+                        sweep[q["condition_id"]] = q
+            if at_cancel and now < q["start"] and not q.get("swept"):
+                sweep.setdefault(q["condition_id"], q)
+        for cid, (slug, start) in list(self.attempted.items()):  # a market an order was sent to, record or not
+            if now >= start:
+                del self.attempted[cid]
+            elif now >= start - self.s.cancel_s and not any(p.get("swept") for p in self.quotes_of(slug)):
+                sweep.setdefault(cid, {"slug": slug, "condition_id": cid})
+        if self.strays:
+            ids, self.strays = list(self.strays), set()
+            try:
+                r = await self.x.cancel(ids)
+                self.strays |= {i for i in ids if i not in r.canceled and i not in r.not_canceled}
+            except Exception as error:
+                self.strays |= set(ids)
+                LOG.warning("撤迟到的单失败：%s", error)
         if due:
+            due.sort(key=lambda d: d[0]["start"])
             await self.cancel_orders(due)
         for cid, q in sweep.items():
-            if now - self.swept.get(cid, 0.0) >= SWEEP_EVERY_S:
-                self.swept[cid] = now
-                try:
-                    r = await self.x.cancel_market(cid)
-                    LOG.info("%s 有状态未知的单：按市场撤 %d 张", q["slug"], len(r.canceled))
-                    self.mark_cancelled(r)
-                except Throttled as t:
-                    self.set_cooldown(t.reason, t.seconds)
-                except Exception as error:
-                    self.problem(f"按市场撤单失败 {q['slug']}：{error}")
+            if now - self.swept.get(cid, 0.0) < SWEEP_EVERY_S:
+                continue
+            self.swept[cid] = now
+            try:
+                r = await self.x.cancel_market(cid)
+            except Throttled as t:
+                self.set_cooldown(t.reason, t.seconds)
+                continue
+            except Exception as error:
+                self.problem(f"按市场撤单失败 {q['slug']}：{error}", key="sweep-error")
+                continue
+            same = [p for p in self.quotes_of(q["slug"]) if p["phase"] != "settled"]
+            for p in same:
+                p["swept"] = True
+            if same:
+                self.save(*same)
+            else:
+                self.attempted.pop(cid, None)  # no record left to carry the flag: swept once is enough
+            if r.canceled:
+                LOG.info("%s 按市场撤单：撤掉 %d 张", q["slug"], len(r.canceled))
+            self.mark_cancelled(r)
 
     async def cancel_orders(self, due: list[tuple[dict, str]]) -> None:
         ids = [q["orders"][side]["id"] for q, side in due]
@@ -603,21 +669,25 @@ class Engine:
             r = await self.x.cancel(ids)
         except Throttled as t:
             self.set_cooldown(t.reason, t.seconds)
-            self.retry_later(due, now)
+            self.retry_later(due, now, t.seconds)
             return
         except Exception as error:
             self.problem(f"撤单失败（{len(ids)} 张）：{error}", key="cancel-error")
             self.retry_later(due, now)
             return
+        if r.throttle:
+            self.set_cooldown(*r.throttle)
         touched = self.mark_cancelled(r)
         missing = [(q, side) for q, side in due if q["orders"][side]["id"] not in r.canceled and q["orders"][side]["id"] not in r.not_canceled]
         if missing:
-            self.retry_later(missing, now)
+            self.retry_later(missing, now, r.throttle[1] if r.throttle else 0.0)
         for q, side in due:
             if q["key"] not in touched:
                 self.save(q)
 
     def mark_cancelled(self, r: Cancelled) -> set[str]:
+        """Orders the CLOB cancelled, or would not cancel (already matched, already gone): off the book, their final
+        record read soon (sooner past the cancel time: one that is somehow still live is cancelled again)."""
         now = self.now()
         touched: dict[str, dict] = {}
         for oid in list(r.canceled) + list(r.not_canceled):
@@ -627,7 +697,9 @@ class Engine:
             q = self.ledger.rows[ref[0]]
             o = q["orders"][ref[1]]
             if o["state"] in ("open", "unknown"):
-                o.update(state="gone", gone=now, note=r.not_canceled.get(oid, "已撤"))
+                late = now >= q["start"] - self.s.cancel_s
+                o.update(state="gone", gone=now, read_at=now + (1 if late and oid in r.not_canceled else FINAL_DELAY_S),
+                         note=r.not_canceled.get(oid, "已撤"))
                 if q["phase"] == "closing" and q["reason"] == "到点撤单" and oid in r.canceled:
                     self.cancel_lags.append(q["start"] - now)
             touched[q["key"]] = q
@@ -635,14 +707,17 @@ class Engine:
             self.save(*touched.values())
         return set(touched)
 
-    def retry_later(self, due: list[tuple[dict, str]], now: float) -> None:
+    def retry_later(self, due: list[tuple[dict, str]], now: float, wait: float = 0.0) -> None:
+        """A failed cancel is tried again: past the cancel time every SPRINT_S (or the server's wait, at most 10 s);
+        before it with a doubling backoff that never reaches past the cancel time."""
         for q, side in due:
             o = q["orders"][side]
-            if now >= q["start"] - self.s.cancel_s:
-                o["retry"] = now + SPRINT_S
+            cancel_at = q["start"] - self.s.cancel_s
+            if now >= cancel_at:
+                o["retry"] = now + max(SPRINT_S, min(wait, 10.0))
             else:
                 o["tries"] = int(o.get("tries") or 0) + 1
-                o["retry"] = now + min(RETRY_MAX_S, RETRY_S * 2 ** (o["tries"] - 1))
+                o["retry"] = min(now + max(wait, min(RETRY_MAX_S, RETRY_S * 2 ** (o["tries"] - 1))), cancel_at)
         self.save(*{q["key"]: q for q, _ in due}.values())
 
     # ------------------------------------------------------------------ reconciliation
@@ -653,8 +728,11 @@ class Engine:
         reads: list[tuple[dict, str]] = []
         lookups: list[tuple[dict, str]] = []
         for q in self.open_quotes():
+            if q["slug"] in self.placing:
+                continue  # its POST is in flight: its orders are judged by the answer, not looked for
             for side, o in q["orders"].items():
-                if o["state"] == "gone" and now >= float(o.get("gone") or 0) + FINAL_DELAY_S and now >= float(o.get("retry") or 0):
+                read_at = float(o.get("read_at") or float(o.get("gone") or 0) + FINAL_DELAY_S)
+                if o["state"] == "gone" and now >= read_at and now >= float(o.get("retry") or 0):
                     reads.append((q, side))
                 elif o["state"] in ("unknown", "placing", "prepared") and now >= float(o.get("sent") or 0) + SEEN_MARGIN_S:
                     if not self.claim(q, side) and now >= float(o.get("lookup_at") or 0):
@@ -669,7 +747,12 @@ class Engine:
             async with gate:
                 await self.look_up(q, side)
         if reads or lookups:
-            await asyncio.gather(*(one(q, side) for q, side in reads[:60]), *(look(q, side) for q, side in lookups[:20]))
+            reads.sort(key=lambda d: d[0]["start"])
+            try:
+                await asyncio.wait_for(asyncio.gather(*(one(q, side) for q, side in reads[:60]),
+                                                      *(look(q, side) for q, side in lookups[:20])), RECONCILE_BUDGET_S)
+            except asyncio.TimeoutError:
+                LOG.warning("核对超过 %d 秒，余下的下一轮再读", RECONCILE_BUDGET_S)
         now = self.now()
         for q in self.open_quotes():
             if q["phase"] in ("closing", "active") and all(o["state"] in ENDED for o in q["orders"].values()):
@@ -686,13 +769,14 @@ class Engine:
         for row in self.snapshot.values():
             if (row.id not in claimed and row.asset == o["asset"] and row.side == "BUY" and row.price == dnum(q["price"])
                     and row.size == dnum(q["shares"])):
-                self.adopt(q, side, row, "按挂单列表认领")
+                self.adopt(q, side, row, "按挂单列表认领", resting=True)  # in the open orders: resting, whatever its status reads
                 return True
         return False
 
-    def adopt(self, q: dict, side: str, row: Row, note: str) -> None:
+    def adopt(self, q: dict, side: str, row: Row, note: str, resting: bool | None = None) -> None:
         o = q["orders"][side]
-        o.update(state="open" if row.resting else "gone", id=row.id, note=note, gone=self.now(), retry=0)
+        live = row.resting if resting is None else resting
+        o.update(state="open" if live else "gone", id=row.id, note=note, gone=self.now(), read_at=self.now(), retry=0)
         self.by_id[row.id] = (q["key"], side)
         self.note_fill(q, side, row.matched)
         LOG.info("认领状态未知的单 %s %s -> %s（%s）", q["key"], side, row.id, note)
@@ -707,9 +791,10 @@ class Engine:
         if o.get("hash") and self.id_is_hash is not False:
             try:
                 row = await self.x.order(o["hash"])
-            except Exception as error:
+            except Exception as error:  # no answer is no evidence: nothing concluded, asked again in 5 s
                 LOG.debug("按哈希查单失败 %s：%s", o["hash"], error)
-                row = None
+                self.save(q)
+                return
             if row is not None:
                 self.adopt(q, side, row, "按订单哈希找到")
                 return
@@ -739,13 +824,18 @@ class Engine:
         self.note_fill(q, side, row.matched)
         if row.resting:  # still on the book: the cancel did not take (or the order never left)
             o.update(state="open", retry=0)
-            if q["phase"] == "active" and row.matched > 0:
-                pass
             self.save(q)
             return
         o.update(state="final", final_at=self.now(), status=row.status)
         if q["phase"] == "active" and row.matched < row.size and self.now() < q["start"] - self.s.cancel_s:
-            self.close(q, f"{mk.SIDES_CN[side]}方挂单被撤或到期（{row.status}）", free=False, save=False)
+            state = row.state
+            if state == "CANCELED_NOT_ENOUGH_BALANCE":  # the CLOB withdrew it for the balance: not the window's doing
+                self.close(q, f"{mk.SIDES_CN[side]}方挂单因余额不足被交易所撤掉", free=True, save=False)
+                self.hold_balance("交易所因余额不足撤掉了挂单：暂停新挂一分钟（核对 pUSD 余额）")
+            elif state.startswith("CANCELED_"):  # the market resolved, vanished, the order timed out or expired
+                self.close(q, f"{mk.SIDES_CN[side]}方挂单被交易所撤掉（{row.status}）", free=True, save=False)
+            else:  # cancelled by someone else (the website, another program): counted, quoted again up to the cap
+                self.close(q, f"{mk.SIDES_CN[side]}方挂单被撤（{row.status}）", free=False, save=False)
         self.save(q)
 
     def note_fill(self, q: dict, side: str, matched: D) -> None:
@@ -821,8 +911,9 @@ class Engine:
                 continue
             price = dnum(q["price"])
             cost = sum((v * price for v in filled.values()), D(0))
+            auto = self.s.auto_redeem and self.x.live
             q.update(phase="settled", result=win, pnl=float(filled[win] - cost), settled_at=now,
-                     redeem="pending" if filled[win] > 0 else "none")
+                     redeem=("pending" if auto else "manual") if filled[win] > 0 else "none")
             self.save(q)
             self.notify(f"结算 {mk.window_name(q['coin'], q['start'])}：结果{mk.SIDES_CN[win]}，"
                         f"成交 涨 {mk.fmt(filled['up'])} / 跌 {mk.fmt(filled['down'])}，盈亏 {q['pnl']:+.2f} 美元")
@@ -911,7 +1002,7 @@ class Engine:
             for q in self.open_quotes():
                 for o in q["orders"].values():
                     o.pop("retry", None)
-            await self.cancel_pass()
+            await self.cancel_pass(sweep_all=True)
             left = sum(1 for q in self.open_quotes() for o in q["orders"].values() if o["state"] in ("open",))
             if not left:
                 break
@@ -933,16 +1024,25 @@ class Engine:
             await self.sleep(self.poll_wait())
 
     async def cancel_loop(self) -> None:
+        """Alone in its task: a slow reconcile (its reads time out after 15 s) never holds a cancel back."""
         while not self.stop.is_set():
             try:
                 await self.cancel_pass()
+            except Exception as error:
+                LOG.exception("撤单循环出错")
+                self.problem(f"撤单循环出错：{error}", key="cancel-loop")
+            await self.sleep(1.0)
+
+    async def reconcile_loop(self) -> None:
+        while not self.stop.is_set():
+            try:
                 await self.reconcile_pass()
                 if self.fills_pending:
                     lines, self.fills_pending = self.fills_pending, []
                     self.notify("成交：\n" + "\n".join(lines[:30]) + (f"\n……共 {len(lines)} 笔" if len(lines) > 30 else ""))
             except Exception as error:
-                LOG.exception("撤单循环出错")
-                self.problem(f"撤单循环出错：{error}", key="cancel-loop")
+                LOG.exception("核对循环出错")
+                self.problem(f"核对循环出错：{error}", key="reconcile-loop")
             await self.sleep(1.0)
 
     async def account_loop(self) -> None:
@@ -1006,6 +1106,7 @@ class Engine:
             self.problem(f"首次读账户失败：{error}")
         tasks = [asyncio.create_task(self.discovery_loop(), name="discovery"),
                  asyncio.create_task(self.cancel_loop(), name="cancel"),
+                 asyncio.create_task(self.reconcile_loop(), name="reconcile"),
                  asyncio.create_task(self.account_loop(), name="account"),
                  asyncio.create_task(self.settle_loop(), name="settle")]
         tasks += [asyncio.create_task(self.worker(), name=f"worker{i}") for i in range(self.s.workers)]
@@ -1089,6 +1190,8 @@ class Engine:
             lines.append(f"暂不新挂：{why}")
         elif self.hold_note and self.queue.qsize() + len(self.timers):
             lines.append(f"等候：{len(self.timers)} 场（{self.hold_note}）")
+        if self.budget_note:
+            lines.append(f"资金：{self.budget_note}（{self.budget_problem(self.s.window_usd) or '余额/上限已用完'}）")
         if self.errors:
             ts, text = self.errors[-1]
             lines.append(f"最近问题（{mk.hms(ts)}）：{text[:200]}")

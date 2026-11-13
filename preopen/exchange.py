@@ -19,9 +19,16 @@ from typing import Any, Protocol
 
 LOG = logging.getLogger(__name__)
 BATCH = 15                      # POST /orders takes 1 to 15 orders
-CANCEL_CHUNK = 200              # DELETE /orders takes up to 1000 ids; smaller chunks keep within the cancel bucket's burst
-RETRYABLE_CODES = {"market_not_ready", "post_only_mode", "rate_limited", "restarting", "cancel_only", "trading_disabled",
-                   "auth", "sign_failed", "not_enough_balance"}  # a refusal that is not the window's own doing: placed again, not counted
+CANCEL_CHUNK = 200              # DELETE /orders takes up to 1000 ids; a chunk is also kept within the local cancel bucket's burst
+RETRYABLE_CODES = {"market_not_ready", "post_only_mode", "post_only", "rate_limited", "restarting", "cancel_only",
+                   "trading_disabled", "auth", "sign_failed", "not_enough_balance", "transport", "exception", "malformed",
+                   "missing"}
+# ^ a refusal (or a lost answer) that is not the window's own doing: placed again, not counted
+
+
+def retryable(code: str) -> bool:
+    return code in RETRYABLE_CODES or code.startswith("http_5")
+TERMINAL = {"MATCHED", "INVALID", "EXPIRED", "FILLED", "REJECTED"}  # ...and every CANCELED* status
 
 STANDARD_EXCHANGE = "0xE111180000d2663C0091e4f400237545B87B996B"
 NEG_RISK_EXCHANGE = "0xe2222d279d744050d28e00520010520000310F59"
@@ -66,14 +73,24 @@ class Row:
     created: float | None = None
 
     @property
+    def state(self) -> str:
+        return self.status.upper().removeprefix("ORDER_STATUS_")
+
+    @property
     def resting(self) -> bool:
-        return self.status.upper() in {"LIVE", "DELAYED", "OPEN", ""}
+        """Whether the order may still rest. An unknown status counts as resting while anything is unfilled: wrongly
+        thinking an order gone stops it being cancelled; wrongly thinking it rests only costs another cancel."""
+        state = self.state
+        if self.matched >= self.size or state in TERMINAL or state.startswith("CANCEL"):
+            return False
+        return True
 
 
 @dataclass
 class Cancelled:
     canceled: set[str] = field(default_factory=set)
     not_canceled: dict[str, str] = field(default_factory=dict)
+    throttle: tuple[str, float] | None = None   # a later chunk was refused (429, restart): (reason, seconds); its ids are in neither list
 
 
 class Throttled(Exception):
@@ -187,6 +204,7 @@ class LiveExchange:
         self.wallet_type = ""
         self.tier = ""
         self.rate_warning = False
+        self.wallet_list_off_until = 0.0
         self.orders = order_bucket or Bucket(settings.order_rate, settings.order_burst)
         self.cancels = cancel_bucket or Bucket(settings.cancel_rate, settings.cancel_burst)
 
@@ -301,19 +319,30 @@ class LiveExchange:
         return [out[s.ref] for s in specs]
 
     async def cancel(self, ids: list[str]) -> Cancelled:
+        """Cancel by id in chunks the local bucket admits whole. A refusal before processing (429, a restart) ends the
+        call with what earlier chunks did kept and `throttle` set; the ids not answered are in neither list."""
         from polymarket import RateLimitError, RequestRejectedError
         result = Cancelled()
-        for i in range(0, len(ids), CANCEL_CHUNK):
-            chunk = ids[i:i + CANCEL_CHUNK]
+        size = max(1, min(CANCEL_CHUNK, self.cancels.burst))
+        for i in range(0, len(ids), size):
+            chunk = ids[i:i + size]
             await self.cancels.take(len(chunk))
             try:
                 r = await self.client.cancel_orders(order_ids=chunk)
             except RateLimitError as error:
-                raise Throttled("撤单被限流（429）", error.retry_after or 5.0) from error
+                result.throttle = ("撤单被限流（429）", float(error.retry_after or 5.0))
+                return result
             except RequestRejectedError as error:
                 if error.restriction == "restarting" or error.status in (425, 503):
-                    raise Throttled(f"撤单被拒（{error.status}）：{error}", error.retry_after or 2.0, error.restriction or "restarting") from error
-                raise
+                    result.throttle = (f"撤单被拒（{error.status}）：{error}", float(error.retry_after or 2.0))
+                    return result
+                if not result.canceled and not result.not_canceled:
+                    raise
+                return result  # the rest is retried by the caller
+            except Exception:
+                if not result.canceled and not result.not_canceled:
+                    raise
+                return result
             result.canceled.update(str(x) for x in r.canceled)
             result.not_canceled.update({str(k): str(v) for k, v in r.not_canceled.items()})
         return result
@@ -328,7 +357,16 @@ class LiveExchange:
         return Cancelled(set(str(x) for x in r.canceled), {str(k): str(v) for k, v in r.not_canceled.items()})
 
     async def open_orders(self) -> list[Row]:
-        rows: list[Row] = []
+        """The open orders. On a Deposit Wallet the wallet-wide list (every signer's: the website's too), so the
+        budget sees all the pUSD resting buys hold; elsewhere, or if that list fails, this key's own orders."""
+        if self.wallet_type == "DEPOSIT_WALLET" and time.monotonic() >= self.wallet_list_off_until:
+            try:
+                rows = [_row(o) async for o in self.client.list_wallet_open_orders().iter_items()]
+                return rows
+            except Exception as error:
+                self.wallet_list_off_until = time.monotonic() + 600
+                LOG.warning("钱包级挂单列表读不到（%s），十分钟内改读本凭证的挂单", error)
+        rows = []
         async for page in self.client.list_open_orders():
             rows.extend(_row(o) for o in page.items)
         return rows

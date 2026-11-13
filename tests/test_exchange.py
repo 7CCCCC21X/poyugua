@@ -139,6 +139,76 @@ class LiveExchangeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.not_canceled, {"c": "order not found"})
 
 
+class _Page:
+    def __init__(self, items):
+        self.items = items
+
+
+class _Paginator:
+    def __init__(self, items, fail=False):
+        self.items, self.fail = items, fail
+
+    async def _gen(self):
+        if self.fail:
+            raise RuntimeError("nope")
+        for item in self.items:
+            yield item
+
+    def iter_items(self):
+        return self._gen()
+
+    def __aiter__(self):
+        async def pages():
+            yield _Page(self.items)
+        return pages()
+
+
+class OpenOrdersTest(unittest.IsolatedAsyncioTestCase):
+    async def test_deposit_wallet_lists_every_signers_orders_and_falls_back(self):
+        from types import SimpleNamespace
+        import datetime as dt
+        o = lambda oid: SimpleNamespace(id=oid, asset_id="1", condition_id="0xc", side="BUY", price="0.49", original_size="10",
+                                        size_matched="0", status="LIVE", created_at=dt.datetime.now(dt.timezone.utc))
+        x, c = live()
+        x.wallet_type = "DEPOSIT_WALLET"
+        c.list_wallet_open_orders = lambda: _Paginator([o("w1"), o("w2")])
+        c.list_open_orders = lambda: _Paginator([o("k1")])
+        self.assertEqual([r.id for r in await x.open_orders()], ["w1", "w2"])
+        c.list_wallet_open_orders = lambda: _Paginator([], fail=True)
+        self.assertEqual([r.id for r in await x.open_orders()], ["k1"])
+        x.wallet_type = "EOA"
+        x.wallet_list_off_until = 0
+        self.assertEqual([r.id for r in await x.open_orders()], ["k1"])
+
+
+class RowAndCancelTest(unittest.IsolatedAsyncioTestCase):
+    def test_resting(self):
+        from preopen.exchange import Row
+        row = lambda status, matched="0": Row("0x1", "1", "0xc", "BUY", D("0.49"), D("10"), D(matched), status)
+        self.assertTrue(row("LIVE").resting)
+        self.assertTrue(row("ORDER_STATUS_LIVE").resting)
+        self.assertTrue(row("SOMETHING_NEW").resting)  # unknown: assumed resting (another cancel costs nothing)
+        for status in ("MATCHED", "CANCELED", "CANCELED_NOT_ENOUGH_BALANCE", "CANCELED_EXPIRED_ORDER", "INVALID"):
+            self.assertFalse(row(status).resting, status)
+        self.assertFalse(row("LIVE", "10").resting)
+
+    async def test_a_429_midway_keeps_the_earlier_chunks(self):
+        x, c = live()
+        x.cancels = Bucket(1000, 2)  # chunks of two ids
+        calls = []
+
+        async def cancel_orders(order_ids):
+            calls.append(list(order_ids))
+            if len(calls) == 2:
+                raise RateLimitError("slow down", retry_after=3)
+            return CancelOrdersResponse(canceled=tuple(order_ids), not_canceled={})
+        c.cancel_orders = cancel_orders
+        r = await x.cancel(["a", "b", "c", "d", "e"])
+        self.assertEqual(calls, [["a", "b"], ["c", "d"]])
+        self.assertEqual(r.canceled, {"a", "b"})
+        self.assertEqual(r.throttle, ("撤单被限流（429）", 3.0))
+
+
 class OrderHashTest(unittest.TestCase):
     def test_matches_the_sdk_struct_and_domain(self):
         from eth_utils.crypto import keccak

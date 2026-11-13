@@ -9,8 +9,8 @@ A record (a "quote") is a dict stored whole as JSON:
     order      {asset, state, id, hash, salt, filled, error, sent, gone, ...}
                state: prepared | placing | open | unknown | gone | final | rejected | not_sent | not_found
 
-Finished records with nothing filled move to the table `archive` two days after their window, so the working set the
-loops walk stays a couple of days long.
+Settled records move to the table `archive` two days after their window (one with winnings once they were
+redeemed), so the working set the loops walk stays a couple of days long.
 """
 from __future__ import annotations
 
@@ -31,8 +31,11 @@ def quote_key(slug: str, level: int, attempt: int) -> str:
 
 
 def archivable(q: dict, before: float) -> bool:
-    return (q.get("phase") == "settled" and int(q.get("start") or 0) + 300 < before and not float(q.get("pnl") or 0)
-            and all(o.get("state") in ENDED and float(o.get("filled") or 0) <= 0 for o in (q.get("orders") or {}).values()))
+    """Settled two days ago, every order ended, nothing left to redeem (a record with fills goes too once its
+    winnings were redeemed, or there were none): the working set stays a couple of days long."""
+    return (q.get("phase") == "settled" and int(q.get("start") or 0) + 300 < before
+            and q.get("redeem") not in ("pending", "retry")
+            and all(o.get("state") in ENDED for o in (q.get("orders") or {}).values()))
 
 
 class Ledger:

@@ -1,4 +1,5 @@
 """The engine on a paper book: discovery, placement, the cancel before the start, fills, results, restarts."""
+import asyncio
 import unittest
 from decimal import Decimal as D
 
@@ -183,11 +184,28 @@ class CancelTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(e.reserved(), D(0))
         self.assertTrue(e.cancel_lags)
 
+    async def test_failed_cancel_is_backed_by_the_market_sweep(self):
+        e, clock, pub, x = make_engine()
+        start = T0 + 1800
+        m = pub.list_window("btc", start)
+        await tick(e)
+        clock.t = start - 60
+        x.fail_cancel = RuntimeError("boom")  # the cancel by id fails...
+        await e.cancel_pass()
+        self.assertEqual(x.market_cancels, [m["conditionId"]])  # ...the sweep of the market at its cancel time withdraws them
+        self.assertEqual({o["state"] for o in quotes(e)[0]["orders"].values()}, {"gone"})
+        await e.cancel_pass()
+        self.assertEqual(len(x.market_cancels), 1)  # once
+
     async def test_failed_cancel_sprints_every_two_seconds(self):
         e, clock, pub, x = make_engine()
         start = T0 + 1800
         pub.list_window("btc", start)
         await tick(e)
+
+        async def down(cid):
+            raise RuntimeError("sweep down")
+        x.cancel_market = down
         clock.t = start - 60
         x.fail_cancel = RuntimeError("boom")
         await tick(e)
@@ -199,6 +217,28 @@ class CancelTest(unittest.IsolatedAsyncioTestCase):
         await tick(e, 1)
         self.assertEqual(len(x.cancel_calls), 1)
         self.assertEqual({o["state"] for o in quotes(e)[0]["orders"].values()}, {"gone"})
+
+    async def test_backoff_before_the_cancel_time_never_passes_it(self):
+        e, clock, pub, x = make_engine(settings(PREOPEN_MARKETS="btc"))
+        start = T0 + 1800
+        pub.list_window("btc", start)
+        await tick(e)
+        e.pause()  # closes it long before its cancel time
+
+        async def failing(ids):
+            raise RuntimeError("cancel down")
+        x.cancel = failing
+
+        async def down(cid):
+            raise RuntimeError("sweep down")
+        x.cancel_market = down
+        for _ in range(8):  # the backoff doubles: 15, 30, 60, 120 s...
+            await e.cancel_pass()
+            o = quotes(e)[0]["orders"]["up"]
+            clock.t = max(clock.t + 1, float(o["retry"]))
+        o = quotes(e)[0]["orders"]["up"]
+        self.assertLessEqual(float(o["retry"]), start - 60 + 10)  # capped at the cancel time, then sprinting
+        self.assertLess(clock.t, start)
 
     async def test_fill_then_result_and_pnl(self):
         e, clock, pub, x = make_engine()
@@ -219,12 +259,17 @@ class CancelTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(q["phase"], "closed")
         clock.t = start + 300 + 61
         pub.results[m["slug"]] = {**m, "closed": True, "outcomePrices": '["1", "0"]'}
+        x.live = True  # the redeem path (the paper exchange answers it)
         await tick(e)
         q = quotes(e)[0]
         self.assertEqual(q["phase"], "settled")
         self.assertEqual(q["result"], "up")
         self.assertAlmostEqual(q["pnl"], 4 - 4 * 0.49)
         self.assertEqual(q["redeem"], "pending")
+        await e.redeem_pass()
+        self.assertEqual(quotes(e)[0]["redeem"], "done")
+        clock.advance(2 * 86400 + 600)  # settled and redeemed: archived two days on
+        self.assertEqual(e.ledger.archive_old(clock.t), 1)
 
     async def test_full_fill_leaves_the_other_side_resting(self):
         e, clock, pub, x = make_engine()
@@ -359,6 +404,104 @@ class UnknownTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({o["state"] for o in q["orders"].values()}, {"not_found"})
         await e.reconcile_pass()
         self.assertEqual(quotes(e)[0]["phase"], "closed")
+
+
+class ReviewRegressionTest(unittest.IsolatedAsyncioTestCase):
+    async def test_balance_refusal_keeps_no_record_and_holds_every_placement(self):
+        e, clock, pub, x = make_engine()
+        starts = mk.window_starts(clock.t, e.s)[:3]
+        pub.list_range(["btc"], starts)
+        first = mk.slug_of("btc", starts[0])
+        x.reject[f"{first}#0@0/up"] = ("rejected", "not_enough_balance")
+        x.reject[f"{first}#0@0/down"] = ("rejected", "not_enough_balance")
+        await e.account_once()
+        await e.discover()
+        await drain(e)
+        self.assertNotIn(first, {q["slug"] for q in quotes(e)})  # nothing rested: no record, no attempt used
+        self.assertIn("余额", e.hold())
+        placed = len(x.placed)
+        for _ in range(10):  # within the minute's hold nothing more is sent, whatever the sweep finds
+            await tick(e, 5)
+        self.assertEqual(len(x.placed), placed)
+        await tick(e, 30)
+        self.assertEqual(e.hold(), "")
+        self.assertEqual(len(quotes(e, phase="active")), 3)
+        self.assertLess(len(e.ledger.rows), 6)
+
+    async def test_maker_fee_market_is_never_quoted(self):
+        e, clock, pub, x = make_engine()
+        start = T0 + 1800
+        pub.list_window("btc", start, feeSchedule={"rate": 0.07, "exponent": 1, "takerOnly": False})
+        await tick(e)
+        await tick(e, 6)
+        self.assertEqual(x.placed, [])
+        self.assertIn(mk.slug_of("btc", start), e.listings)
+
+    async def test_market_not_ready_is_rearmed_within_a_fifth_of_a_second(self):
+        e, clock, pub, x = make_engine()
+        start = T0 + 1800
+        slug = mk.slug_of("btc", start)
+        pub.list_window("btc", start, created=clock.t - 80)
+        x.reject[f"{slug}#0@0/up"] = ("rejected", "market_not_ready")
+        x.reject[f"{slug}#0@0/down"] = ("rejected", "market_not_ready")
+        await e.account_once()
+        await e.discover()
+        await drain(e)
+        self.assertEqual(quotes(e), [])
+        self.assertIn(slug, e.timers)
+        self.assertLessEqual(e.timers[slug].when() - asyncio.get_running_loop().time(), 0.25)
+        unpark(e)
+        await drain(e)
+        self.assertEqual(len(quotes(e, phase="active")), 1)
+
+    async def test_fresh_listings_opening_together_respect_the_cap(self):
+        e, clock, pub, x = make_engine(settings(PREOPEN_MARKETS="btc,eth,sol,xrp,doge,hype,bnb", PREOPEN_MAX_OPEN_USD="20"))
+        start = mk.window_starts(clock.t, e.s)[-1]
+        for coin in e.s.coins:
+            m = pub.list_window(coin, start, created=clock.t - 60, accepting=None)
+            pub.not_accepting.add(m["conditionId"])
+        await e.account_once()
+        await e.discover()
+        await drain(e)
+        pub.not_accepting.clear()  # they all open at once
+        unpark(e)
+        slugs = []
+        while not e.queue.empty():
+            slugs.append(e.queue.get_nowait()[2])
+        for s_ in slugs:
+            e.queued.discard(s_)
+        await asyncio.gather(*(e.process(s_) for s_ in slugs))  # seven workers side by side
+        self.assertLessEqual(e.reserved(), D("20"))
+        self.assertEqual(len(quotes(e, phase="active")), 2)
+
+    async def test_an_answer_in_flight_is_not_given_up(self):
+        e, clock, pub, x = make_engine()
+        start = T0 + 1800
+        pub.list_window("btc", start)
+        await e.account_once()
+        await e.discover()
+        gate = asyncio.Event()
+        real = x.place
+
+        async def slow(specs):
+            await gate.wait()  # the POST takes a long while
+            return await real(specs)
+        x.place = slow
+        slug = mk.slug_of("btc", start)
+        e.queue.get_nowait()
+        e.queued.discard(slug)
+        task = asyncio.create_task(e.process(slug))
+        await asyncio.sleep(0)
+        for _ in range(20):  # 200 s of reconcile passes while it is in flight
+            clock.advance(10)
+            await e.account_once()
+            await e.reconcile_pass()
+        q = quotes(e)[0]
+        self.assertEqual({o["state"] for o in q["orders"].values()}, {"placing"})
+        gate.set()
+        await task
+        q = quotes(e)[0]
+        self.assertEqual({o["state"] for o in q["orders"].values()}, {"open"})
 
 
 class HashLookupTest(unittest.IsolatedAsyncioTestCase):
