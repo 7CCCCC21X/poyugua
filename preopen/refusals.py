@@ -18,7 +18,8 @@ from . import markets as mk
 EXPLAIN: dict[str, tuple[str, str, str]] = {
     "token_not_ready": ("交易所撮合引擎还不认这个代币",
                         "市场刚开放时常见：市场显示能下单了，撮合引擎要再过一会儿才登记这一场的代币",
-                        "只把这一场 1 秒后再挂，其他场次照常；连续 20 次还不认就重新读一遍这一场的市场信息"),
+                        "只把这一场半秒后再挂（开放那一刻只挂第一档，被拒也不浪费多少额度），其他场次照常；"
+                        "连续 20 次还不认就重新读一遍这一场的市场信息"),
     "market_not_ready": ("市场还没开放下单", "新发布的场次在创建后约 75～90 秒才开放", "每 0.2 秒问一次，开放了马上挂"),
     "not_enough_balance": ("余额或授权不够",
                            "交易所看到这一场已有的挂单加上新单超过了余额；或者账户没做交易授权；成交多了余额变少也会这样",
@@ -35,7 +36,8 @@ EXPLAIN: dict[str, tuple[str, str, str]] = {
     "closed_only": ("这个地址只能平仓", "账户被限制为只能平仓、不能新挂单", "全部新挂暂停；联系 Polymarket"),
     "rate_limited": ("下单太快被限流（429）",
                      "交易所给每个签名地址（私钥）的下单速度有上限（Standard 档每秒 40 张、一次最多 60 张），用同一个私钥的程序共用这个额度",
-                     "按交易所给的秒数暂停后继续，并把自己的速度减半、之后慢慢恢复；设置的速度超过档位上限时自动压到上限以下。"
+                     "按交易所给的秒数暂停后继续，并把自己的速度减半、之后慢慢恢复；设置的速度超过档位上限时自动压到上限以下；"
+                     "新场次开放那一刻只挂第一档，深档 30 秒后再挂，减少开放时的瞬间下单量。"
                      "如果本程序自己发得不多还被限流，就是同一个私钥还有别的程序在下单（另一个机器人、脚本），只留一个"),
     "restarting": ("交易所撮合引擎在重启（425）", "交易所维护或重启", "几秒后自动重试"),
     "trading_disabled": ("交易所暂停了交易", "交易所维护", "等交易所恢复，自动重试"),
@@ -77,8 +79,12 @@ def summary(log: Iterable[dict], now: float, hours: float = 24, rate: dict | Non
         opened = [float(e["opened_ago"]) for e in es if e.get("opened_ago") is not None]
         listed = [float(e["listed_ago"]) for e in es if e.get("listed_ago") is not None]
         evidence = []
-        if code in ACCOUNT_WIDE:
-            opened = listed = []  # the window's timing tells nothing about a refusal of the account's
+        if code in ACCOUNT_WIDE:  # the window's timing tells something only when it clusters at the openings
+            near = [x for x in opened if x < 5]
+            if opened and 2 * len(near) >= len(es):
+                evidence.append(f"{len(near)}/{len(es)} 次在新场次开放后 5 秒内（中位 {statistics.median(near):.1f} 秒）"
+                                "：开放那一刻同时下单太多")
+            opened = listed = []
         if opened:
             soon = sum(1 for x in opened if x < 5)
             evidence.append(f"{soon}/{len(es)} 次在市场开放后 5 秒内（中位 {statistics.median(opened):.1f} 秒）")

@@ -257,6 +257,17 @@ class CancelReviewTest(unittest.TestCase):
         self.assertIn("亏在哪：15～30 秒", text.splitlines()[2])
         self.assertIn("开场前 60 秒～", text)                      # equal rows merged into a range
 
+    def test_429s_at_the_openings_are_named_as_such(self):
+        from preopen import refusals
+        now = T0 + 1000
+        log = [{"at": now - 10 * i, "slug": "btc-updown-5m-1", "coin": "btc", "start": T0 + 3000, "code": "rate_limited",
+                "words": "下单被限流（429）", "status": "not_sent", "whole": True, "batch": 14, "http": 429,
+                "opened_ago": 1.2 if i < 9 else None, "listed_ago": 76.0} for i in range(12)]
+        (g,) = refusals.summary(log, now, 24)
+        self.assertIn("9/12 次在新场次开放后 5 秒内（中位 1.2 秒）：开放那一刻同时下单太多", g["evidence"])
+        quiet = [dict(x, opened_ago=None) for x in log]
+        self.assertNotIn("开放后", refusals.summary(quiet, now, 24)[0]["evidence"])
+
     def test_snapshot_times_stand_in_and_are_flagged(self):
         q = settled("hype", T0, "up", {})
         q["orders"]["up"].update(filled="10", first_fill=T0 - 40)

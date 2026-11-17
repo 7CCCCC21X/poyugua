@@ -90,7 +90,10 @@ REFUSAL_HELP = {          # what an account-wide refusal means for the operator,
     "invalid_payload": "交易所说订单格式不对",
     "batch_too_large": "一次发的单超过了交易所的上限",
 }
-TOKEN_RETRY_S = 1.0       # a market whose tokens the matching engine does not know yet ("invalid token id", common in
+DEEP_AFTER_OPEN_S = 30    # a market just opened: only its nearest level goes at once (the race for the queue is at the
+                          # best price); the deeper ones this long after the opening, so the opening burst stays small
+                          # (11-17: seven coins x three levels x two sides = 42 orders in one instant, then 429s)
+TOKEN_RETRY_S = 0.5       # a market whose tokens the matching engine does not know yet ("invalid token id", common in
 TOKEN_FAST_TRIES = 20     # the seconds after a market opens): its window alone is tried again this often, this many times;
 TOKEN_SLOW_RETRY_S = 10   # then this often, and the listing is read again from Gamma once (its tokens may have changed)
 TWINS_ALERT = 6           # this many of the bot's own kind of orders on the account, not the bot's: another copy runs
@@ -743,6 +746,11 @@ class Engine:
                 return None
             if why := self.hold():
                 return Hold(why, None if self.paused else HOLD_RETRY_S)
+        opened_ago = self.now() - listing.opened if listing.opened else None
+        if opened_ago is not None and opened_ago < DEEP_AFTER_OPEN_S and len(self.s.levels) > 1:
+            if levels[0] != 0:  # the nearest level rests: the deeper ones once the opening's rush is over
+                return Hold(f"深档在市场开放 {DEEP_AFTER_OPEN_S} 秒后再挂（开放那一刻只抢第一档）", DEEP_AFTER_OPEN_S - opened_ago)
+            levels = levels[:1]
         # from here to the records' save nothing awaits: the budget check and the reservation are one step (the seven
         # coins' fresh listings open together and must not all pass against the same reservation)
         fitting = self.fit(levels, min(self.market_room(listing), self.cap_room()))
@@ -813,7 +821,7 @@ class Engine:
                     hold = Hold("市场还没开放下单", ARM_RETRY_S)
                 if r.code == "token_not_ready" and side == "up":  # once a window: its two orders were in one request
                     tries = self.token_refusals[slug] = self.token_refusals.get(slug, 0) + 1
-                    hold = Hold("交易所撮合引擎还不认这个代币（刚开放的市场常见），这一场稍后再挂",
+                    hold = Hold("交易所撮合引擎还不认这个代币（刚开放的市场常见），这一场半秒后再挂",
                                 TOKEN_RETRY_S if tries < TOKEN_FAST_TRIES else TOKEN_SLOW_RETRY_S)
                     if tries == TOKEN_FAST_TRIES:  # its tokens may have changed: the listing read afresh
                         self.listings.pop(slug, None)

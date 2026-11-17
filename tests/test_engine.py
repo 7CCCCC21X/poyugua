@@ -156,6 +156,31 @@ class PlacementTest(unittest.IsolatedAsyncioTestCase):
                 await tick(e)
                 self.assertEqual([{q["level"] for q in quotes(e, mk.slug_of("btc", t))} for t in starts], levels)
 
+    async def test_a_market_just_opened_gets_its_first_level_now_and_the_deeper_ones_later(self):
+        """11-17: seven coins x three levels x two sides at the instant of the opening (42 orders), then 429s."""
+        e, clock, pub, x = make_engine(settings(PREOPEN_LEVELS="40x20,36x40"))
+        start = mk.window_starts(clock.t, e.s)[-1]
+        m = pub.list_window("btc", start, created=clock.t - 60, accepting=None)
+        pub.not_accepting.add(m["conditionId"])
+        await tick(e)
+        self.assertEqual(x.placed, [])                               # not open yet
+        pub.not_accepting.clear()                                    # it opens
+        await tick(e, 0.2)
+        self.assertEqual({q["level"] for q in quotes(e, phase="active")}, {0})   # the race: the nearest level only
+        self.assertEqual(len(x.placed), 2)
+        await tick(e, 10)
+        self.assertEqual(len(x.placed), 2)                           # the deeper ones wait out the opening's rush
+        await tick(e, 21)
+        await tick(e, 1)
+        self.assertEqual({q["level"] for q in quotes(e, phase="active")}, {0, 1, 2})
+        self.assertEqual(len(x.placed), 6)
+
+    async def test_a_backlog_window_gets_every_level_at_once(self):
+        e, clock, pub, x = make_engine(settings(PREOPEN_LEVELS="40x20,36x40"))
+        pub.list_window("btc", mk.window_starts(clock.t, e.s)[0])       # listed long ago, open for hours
+        await tick(e)
+        self.assertEqual({q["level"] for q in quotes(e, phase="active")}, {0, 1, 2})
+
     async def test_another_strategys_orders_count_in_their_own_market_only(self):
         e, clock, pub, x = make_engine(balance="15")
         a, b = mk.window_starts(clock.t, e.s)[:2]
