@@ -94,7 +94,7 @@ DEEP_AFTER_OPEN_S = 30    # a market just opened: only its nearest level goes at
                           # best price); the deeper ones this long after the opening, so the opening burst stays small
                           # (11-17: seven coins x three levels x two sides = 42 orders in one instant, then 429s)
 TOKEN_RETRY_S = 0.5       # a market whose tokens the matching engine does not know yet ("invalid token id", common in
-TOKEN_FAST_TRIES = 20     # the seconds after a market opens): its window alone is tried again this often, this many times;
+TOKEN_FAST_TRIES = 40     # the seconds after a market opens): its window alone is tried again this often, this many times (20 s);
 TOKEN_SLOW_RETRY_S = 10   # then this often, and the listing is read again from Gamma once (its tokens may have changed)
 TWINS_ALERT = 6           # this many of the bot's own kind of orders on the account, not the bot's: another copy runs
 REFUSALS_KEPT = 300       # the latest refusals kept for /rejects (also across restarts)

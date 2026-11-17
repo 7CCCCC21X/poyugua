@@ -578,9 +578,11 @@ class InvalidTokenTest(unittest.IsolatedAsyncioTestCase):
         fake.unknown_tokens = set(json.loads(m["clobTokenIds"]))
         s = settings()
         e = make_engine(s, clock=clock, exchange=adapter(fake, s), public=pub)[0]
-        for _ in range(25):
-            await tick(e, 1.1)
-        self.assertGreaterEqual(e.token_refusals.get(m["slug"], 0), 20)
+        from preopen.engine import TOKEN_FAST_TRIES, TOKEN_RETRY_S
+        for _ in range(TOKEN_FAST_TRIES + 5):
+            await tick(e, TOKEN_RETRY_S + 0.1)
+        self.assertGreaterEqual(e.token_refusals.get(m["slug"], 0), TOKEN_FAST_TRIES)
+        self.assertGreaterEqual(clock.t - T0, 20)          # the fast tries cover the first 20 s, as before
         self.assertTrue(any("重新读一遍" in text for _, text in e.errors))
         self.assertEqual(e.hold(), "")
 
