@@ -33,8 +33,10 @@ EXPLAIN: dict[str, tuple[str, str, str]] = {
              "全部新挂暂停并告警；删掉 POLY_API_ 三项（程序会自己生成）或换成同一个账户的"),
     "banned": ("这个地址被禁止交易", "Polymarket 封了这个地址", "全部新挂暂停；联系 Polymarket"),
     "closed_only": ("这个地址只能平仓", "账户被限制为只能平仓、不能新挂单", "全部新挂暂停；联系 Polymarket"),
-    "rate_limited": ("下单太快被限流（429）", "超过了交易所给这个账户的下单速度",
-                     "按交易所给的时间暂停后继续；偶尔一次正常，频繁出现就在「参数」里把下单速度调低"),
+    "rate_limited": ("下单太快被限流（429）",
+                     "交易所给每个签名地址（私钥）的下单速度有上限（Standard 档每秒 40 张、一次最多 60 张），用同一个私钥的程序共用这个额度",
+                     "按交易所给的秒数暂停后继续，并把自己的速度减半、之后慢慢恢复；设置的速度超过档位上限时自动压到上限以下。"
+                     "如果本程序自己发得不多还被限流，就是同一个私钥还有别的程序在下单（另一个机器人、脚本），只留一个"),
     "restarting": ("交易所撮合引擎在重启（425）", "交易所维护或重启", "几秒后自动重试"),
     "trading_disabled": ("交易所暂停了交易", "交易所维护", "等交易所恢复，自动重试"),
     "cancel_only": ("交易所只许撤单", "交易所维护", "等交易所恢复，自动重试"),
@@ -51,6 +53,8 @@ EXPLAIN: dict[str, tuple[str, str, str]] = {
 DEFAULT = ("交易所的原话没见过", "看下面交易所的原话",
            "先当成账户层面的问题：全部新挂暂停 30 秒再试；如果别的场次都能挂、只有这一场一直被拒，就只算这一场的问题。把原话发给开发者")
 NUMBERS = "❶❷❸❹❺❻❼❽❾❿"
+ACCOUNT_WIDE = {"rate_limited", "restarting", "timed_out", "insert_failed", "auth", "banned", "closed_only", "trading_disabled",
+                "cancel_only", "post_only_mode", "not_enough_balance"}
 
 
 def explain(code: str) -> tuple[str, str, str]:
@@ -61,8 +65,9 @@ def recent(log: Iterable[dict], now: float, hours: float) -> list[dict]:
     return [e for e in log if now - float(e.get("at") or 0) <= hours * 3600]
 
 
-def summary(log: Iterable[dict], now: float, hours: float = 24) -> list[dict[str, Any]]:
-    """The refusals of the last `hours` by cause, the most frequent first: what it means, the evidence, the coins."""
+def summary(log: Iterable[dict], now: float, hours: float = 24, rate: dict | None = None) -> list[dict[str, Any]]:
+    """The refusals of the last `hours` by cause, the most frequent first: what it means, the evidence, the coins.
+    `rate` (the exchange's rate_status) adds the bot's own pace to a 429's evidence."""
     groups: dict[str, list[dict]] = defaultdict(list)
     for e in recent(log, now, hours):
         groups[str(e.get("code") or "")].append(e)
@@ -72,6 +77,8 @@ def summary(log: Iterable[dict], now: float, hours: float = 24) -> list[dict[str
         opened = [float(e["opened_ago"]) for e in es if e.get("opened_ago") is not None]
         listed = [float(e["listed_ago"]) for e in es if e.get("listed_ago") is not None]
         evidence = []
+        if code in ACCOUNT_WIDE:
+            opened = listed = []  # the window's timing tells nothing about a refusal of the account's
         if opened:
             soon = sum(1 for x in opened if x < 5)
             evidence.append(f"{soon}/{len(es)} 次在市场开放后 5 秒内（中位 {statistics.median(opened):.1f} 秒）")
@@ -82,6 +89,18 @@ def summary(log: Iterable[dict], now: float, hours: float = 24) -> list[dict[str
             many = sum(1 for e in whole if int(e.get("batch") or 0) > 2)
             evidence.append(f"{len(whole)} 次是整个请求被拒（HTTP {Counter(e.get('http') for e in whole).most_common(1)[0][0]}）"
                             + (f"，其中 {many} 次同一请求里还有别的场次" if many else ""))
+        caught = sum(int(e.get("windows") or 1) for e in es)
+        if caught > len(es):
+            evidence.append(f"一共挡住了 {caught} 场（一次拒单挡住同一请求里的好几场）")
+        if code == "rate_limited" and rate and rate.get("limited_hour"):
+            last_429 = rate.get("last") or {}
+            if rate.get("others"):
+                evidence.append(f"被限流时本程序 10 秒内自己只发了 {last_429.get('own10')} 张，交易所允许 {last_429.get('allowance')} 张"
+                                "：额度是被别的程序用掉的")
+            else:
+                evidence.append(f"被限流时本程序 10 秒内发了 {last_429.get('own10')} 张（交易所允许 {last_429.get('allowance')} 张）")
+            if rate.get("configured", 0) > rate.get("cap", 0):
+                evidence.append(f"「参数」里的下单速度 {rate['configured']:g} 超过 {rate.get('tier')} 档上限，已按 {rate['cap']:g} 跑")
         last = max(es, key=lambda e: float(e["at"]))
         out.append({"code": code, "title": title, "why": why, "action": action, "count": len(es),
                     "last": float(last["at"]), "last_text": mk.hms(float(last["at"])), "words": str(last.get("words") or ""),
@@ -89,13 +108,13 @@ def summary(log: Iterable[dict], now: float, hours: float = 24) -> list[dict[str
     return out
 
 
-def text(log: Iterable[dict], now: float, hours: float = 24) -> str:
+def text(log: Iterable[dict], now: float, hours: float = 24, rate: dict | None = None) -> str:
     """/rejects: by cause (meaning, evidence, cause, what the bot does), then the latest ones one by one."""
     entries = recent(log, now, hours)
     span = f"最近 {hours:g} 小时"
     if not entries:
         return f"🧾 拒单 · {span}：没有被拒的单 ✅"
-    groups = summary(entries, now, hours)
+    groups = summary(entries, now, hours, rate)
     lines = [f"🧾 拒单 · {span} · 北京时间 {mk.hms(now)}", f"共 {len(entries)} 次，{len(groups)} 种原因；被拒的场次都没作废，会自动重挂", ""]
     for i, g in enumerate(groups):
         coins = "、".join(f"{c} {n}" for c, n in g["coins"])
@@ -113,6 +132,8 @@ def text(log: Iterable[dict], now: float, hours: float = 24) -> str:
             when.append(f"发布后 {mk.span(float(e['listed_ago']))}")
         if e.get("batch"):
             when.append(f"同一请求 {e['batch']} 张单")
+        if int(e.get("windows") or 1) > 1:
+            when.append(f"一次挡住 {e['windows']} 场")
         lines.append(f"  {mk.hms(float(e['at']))} {mk.window_name(e['coin'], int(e['start']))} {explain(str(e.get('code') or ''))[0]}"
                      + (f"（{'，'.join(when)}）" if when else ""))
     lines += ["", "点「🔬 现场检测」，现在就去交易所查这些场次认不认"]

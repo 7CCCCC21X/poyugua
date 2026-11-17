@@ -162,7 +162,8 @@ def commander(settings: config.Settings, engine: Engine, pub: PublicApi, console
             except ValueError:
                 return "用法：/rejects（最近 24 小时）、/rejects 1（最近 1 小时）"
             hours = max(0.1, min(hours, 24 * 7))
-            text = refusals.text(engine.refusal_log, engine.now(), hours)
+            rate = engine.x.rate_status() if hasattr(engine.x, "rate_status") else None
+            text = refusals.text(engine.refusal_log, engine.now(), hours, rate)
             if refusals.recent(engine.refusal_log, engine.now(), hours):
                 return Reply(text, {"inline_keyboard": [[{"text": "🔬 现场检测", "callback_data": "chk_rejects"}]]})
             return text

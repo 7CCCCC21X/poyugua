@@ -443,6 +443,9 @@ function renderOverview(d) {
     ["订单号=哈希", d.id_is_hash == null ? "未知" : (d.id_is_hash ? "是" : "否")], ["限流档位", d.tier || "未知"], ["发布提前量", d.lead_h + " 小时"],
   ].map(([k, v]) => `<div>${esc(k)}</div><div>${esc(v)}</div>`).join("");
   const pend = (d.pending || []).map((p) => `<div>⚠️ ${esc(p.what)}：${esc(p.window)} ${esc(p.side)}（${esc(p.since)}）<span class="muted small">${esc(p.note)}</span></div>`);
+  if (d.twins >= 6) pend.push(`<div class="warn">⛔ 账户里有 ${d.twins} 张和本程序一模一样、但不是本程序下的挂单：很可能还有另一个机器人在用这个账户（Railway 上另一个服务、电脑上本地跑的），只留一个</div>`);
+  if (d.rate && d.rate.limited_hour) pend.push(`<div>⚠️ 最近 1 小时下单被限流（429）${d.rate.limited_hour} 次，现在 ${d.rate.rate} 单/秒（设置 ${d.rate.configured}${d.rate.tier_rate ? `，${esc(d.rate.tier)} 档上限 ${d.rate.tier_rate}` : ""}）` +
+    (d.rate.others ? `<span class="muted small">：其中 ${d.rate.others} 次本程序自己只发了 ${d.rate.last.own10} 张（交易所允许 ${d.rate.last.allowance}），额度是被同一个私钥的别的程序用掉的</span>` : "") + `</div>`);
   (d.refusals || []).forEach((r) => pend.push(`<div>🧾 拒单：${esc(r.title)} × ${r.count}（最近 ${esc(r.last_text)}）<span class="muted small">交易所原话：${esc(r.words.slice(0, 100))}${r.evidence ? "；" + esc(r.evidence) : ""}。机器人：${esc(r.action)}</span></div>`));
   if (d.unmanaged) pend.push(`<div>账户里另有 ${d.unmanaged} 张本程序没记录的挂单（${money(d.unmanaged_usd)}），只占用它们各自那一场的余额</div>`);
   if (d.cooldown) pend.push(`<div>接口冷却：${esc(d.cooldown)}</div>`);

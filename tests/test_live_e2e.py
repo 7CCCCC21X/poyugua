@@ -15,7 +15,7 @@ from types import SimpleNamespace as N
 import httpx
 from helpers import T0, Clock, FakePublic, drain, make_engine, settings, tick
 
-from polymarket import RequestRejectedError, TransportError
+from polymarket import RateLimitError, RequestRejectedError, TransportError
 from polymarket.models.clob.cancel import CancelOrdersResponse
 from polymarket.models.clob.order_response import AcceptedOrder
 from polymarket.models.clob.orders import SignedOrder
@@ -95,6 +95,9 @@ class FakeClob:
             raise RequestRejectedError("invalid token id", status=400)
         if self.signer_mismatch:   # the API key belongs to another address than the orders' signer (docs: POST /order)
             raise RequestRejectedError("the order signer address has to be the address of the API KEY", status=400)
+        if answer == "429":        # the signer's order bucket empty (docs: trading rate limits)
+            raise RateLimitError("Request to https://clob.polymarket.com/orders was rate limited", retry_after=1.0,
+                                 rate_limit=N(remaining=-2, reset=None, tier="standard", warning=False))
         if answer == "timed_out":  # docs: rejected before reaching the book, safe to send again
             raise RequestRejectedError("order timed out", status=500)
         # each market's open BUYs against the balance on its own (11-13: three $49 orders in three markets rest on
@@ -580,6 +583,75 @@ class InvalidTokenTest(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(e.token_refusals.get(m["slug"], 0), 20)
         self.assertTrue(any("重新读一遍" in text for _, text in e.errors))
         self.assertEqual(e.hold(), "")
+
+
+class RateLimitTest(unittest.IsolatedAsyncioTestCase):
+    """11-17 18:54: ten lines "接口冷却 … rate_limited … 429" in two seconds: one 429 answered for a request of many
+    windows, each window saying it again. The bot's own bucket is under the Standard tier's: a 429 means something else
+    spends the same signer's tokens, or the speed setting is above the tier."""
+
+    async def test_one_429_is_one_line_one_entry_and_the_pace_backs_off(self):
+        clock = Clock()
+        fake, pub = FakeClob(clock), FakePublic(clock)
+        s = seven_coins(clock, fake, pub)
+        x = adapter(fake, s)
+        x.configured = (30.0, 50)
+        x._on_rate(N(tier="standard", remaining=50, reset=None, warning=False))
+        e = make_engine(s, clock=clock, exchange=x, public=pub)[0]
+        await e.account_once()
+        await e.discover()
+        slugs = []
+        while not e.queue.empty() and len(slugs) < 5:
+            slugs.append(e.queue.get_nowait()[-1])
+            e.queued.discard(slugs[-1])
+        fake.answers = ["429"]
+        await asyncio.gather(*(e.process(slug) for slug in slugs))          # five workers' windows in one request
+        cooldowns = [t for _, t in e.errors if "接口冷却" in t]
+        self.assertEqual(len(cooldowns), 1)                                  # one event, one line
+        (entry,) = [x_ for x_ in e.refusal_log if x_["code"] == "rate_limited"]
+        self.assertEqual(entry.get("windows"), 5)                            # however many windows it held up
+        self.assertEqual(x.orders.rate, 15.0)                                # halved
+        status = x.rate_status()
+        self.assertEqual((status["limited_hour"], status["others"]), (1, 1))  # the bot had sent nearly nothing itself
+        report = e.check_text()
+        self.assertIn("同一个私钥还有别的程序在下单", report)
+        self.assertIn("额度是被别的程序用掉的", refusals.text(e.refusal_log, clock.t, 24, status))
+        x.backoff_at -= 31                                                   # half a minute quiet: half again
+        x.recover()
+        self.assertEqual(x.orders.rate, 22.5)
+        x.orders.rate = x.orders.burst = x.orders.tokens = 1000              # the rest at test speed
+        for _ in range(3):
+            await tick(e, 2)
+        self.assertGreater(len(fake.live()), 100)                            # placed after the wait
+        self.assertIn("一次挡住 5 场", refusals.text(e.refusal_log, clock.t, 24, status))
+
+    async def test_a_speed_above_the_tier_is_capped(self):
+        clock = Clock()
+        fake, pub = FakeClob(clock), FakePublic(clock)
+        s = settings(PREOPEN_ORDER_RATE="150", PREOPEN_ORDER_BURST="200")
+        x = adapter(fake, s)
+        x.configured = (150.0, 200)
+        x._on_rate(N(tier="standard", remaining=50, reset=None, warning=False))
+        self.assertEqual((x.orders.rate, x.orders.burst), (36.0, 55))       # Standard 40/s, burst 60, kept under
+        e = make_engine(s, clock=clock, exchange=x, public=pub)[0]
+        self.assertIn("设置超过档位上限，按 36 跑", e.check_text())
+
+    async def test_another_bot_on_the_account_is_named(self):
+        clock = Clock()
+        fake, pub = FakeClob(clock), FakePublic(clock)
+        s = seven_coins(clock, fake, pub)
+        e = make_engine(s, clock=clock, exchange=adapter(fake, s), public=pub)[0]
+        await tick(e)
+        twin = 0
+        for m in list(pub.listed.values())[:4]:                              # another copy quoting the same way
+            for token in json.loads(m["clobTokenIds"]):
+                fake.book(await fake.create_limit_order(asset_id=token, price="0.47", size="10", side="BUY", post_only=True,
+                                                        expiration=int(clock.t) + 3000))
+                twin += 1
+        await tick(e, 5)
+        self.assertEqual(e.twins(), twin)
+        self.assertTrue(any("另一个机器人" in t for _, t in e.errors))
+        self.assertIn("很可能还有另一个机器人在用这个账户", e.check_text())
 
 
 class RefusalWordsTest(unittest.IsolatedAsyncioTestCase):

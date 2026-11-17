@@ -93,6 +93,7 @@ REFUSAL_HELP = {          # what an account-wide refusal means for the operator,
 TOKEN_RETRY_S = 1.0       # a market whose tokens the matching engine does not know yet ("invalid token id", common in
 TOKEN_FAST_TRIES = 20     # the seconds after a market opens): its window alone is tried again this often, this many times;
 TOKEN_SLOW_RETRY_S = 10   # then this often, and the listing is read again from Gamma once (its tokens may have changed)
+TWINS_ALERT = 6           # this many of the bot's own kind of orders on the account, not the bot's: another copy runs
 REFUSALS_KEPT = 300       # the latest refusals kept for /rejects (also across restarts)
 REFUSALS_SAVE_S = 10      # ...written to the ledger at most this often
 EXTERNAL_MASS = 3         # the bot's orders cancelled elsewhere (plain CANCELED: the website's 取消所有, another program
@@ -379,7 +380,12 @@ class Engine:
 
     def log_refusal(self, listing: mk.Listing, q: dict, r: Placed, at: float) -> None:
         """A window's orders refused: kept with the exchange's words and the circumstances (how long after the listing
-        and the opening, how many orders the request held), for /rejects to tell the real cause."""
+        and the opening, how many orders the request held), for /rejects to tell the real cause. A refusal of the whole
+        request before processing (429, a restart) is one entry however many windows it caught."""
+        last = self.refusal_log[-1] if self.refusal_log else None
+        if r.wait > 0 and last and last.get("code") == r.code and at - float(last["at"]) <= 2:
+            last["windows"] = int(last.get("windows") or 1) + 1
+            return
         self.refusal_log.append({
             "at": round(at, 2), "slug": q["slug"], "coin": q["coin"], "start": q["start"], "level": int(q["level"]),
             "code": r.code, "words": (r.message or "")[:300], "status": r.status, "http": r.http, "batch": r.batch,
@@ -410,10 +416,15 @@ class Engine:
                      + f"。所有新挂暂停 {wait:.0f} 秒后再试（连续第 {self.refused_streak} 次），场次不作废", key=f"refused-{code}")
 
     def set_cooldown(self, reason: str, seconds: float) -> None:
-        until = self.now() + max(1.0, min(float(seconds), 600.0))
+        """A refusal before processing (429, a restart, a timeout): every placement waits. Said once per cooldown: one
+        refused request answers for every window in it, and each would say it again."""
+        now = self.now()
+        fresh = now >= self.cooldown_until
+        until = now + max(1.0, min(float(seconds), 600.0))
         if until > self.cooldown_until:
             self.cooldown_until, self.cooldown_reason = until, reason
-        self.problem(f"接口冷却 {seconds:.0f} 秒：{reason}", key="cooldown")
+        if fresh:
+            self.problem(f"接口冷却 {seconds:.0f} 秒：{reason}", key="cooldown")
 
     def reserved(self) -> D:
         """The bot's own resting money: every order that may rest, at its price, for what is not filled."""
@@ -1385,6 +1396,10 @@ class Engine:
                     changed[q["key"]] = q
         self.unmanaged = [r for r in rows if r.id not in self.by_id and r.id not in self.by_hash]
         self.snapshot_at = self.now()
+        twins = self.twins()
+        if twins >= TWINS_ALERT:
+            self.problem(f"账户里有 {twins} 张和本程序一模一样、但不是本程序下的挂单：同一个账户很可能还有另一个机器人在跑"
+                         "（Railway 上的另一个服务、电脑上本地运行的）。两个一起跑会重复挂单、互相抢下单限速，请只留一个", key="twins")
         if changed:
             self.save(*changed.values())
 
@@ -1543,7 +1558,9 @@ class Engine:
             self.x.settings = new
         for name, rate, burst in (("orders", new.order_rate, new.order_burst), ("cancels", new.cancel_rate, new.cancel_burst)):
             bucket = getattr(self.x, name, None)
-            if bucket is not None and hasattr(bucket, "rate"):
+            if name == "orders" and hasattr(self.x, "set_order_limits"):
+                self.x.set_order_limits(rate, burst)  # kept under the account's tier
+            elif bucket is not None and hasattr(bucket, "rate"):
                 bucket.rate, bucket.burst = rate, burst
         if not self.x.live and hasattr(self.x, "cash"):
             self.x.cash = new.paper_balance
@@ -1899,6 +1916,14 @@ class Engine:
                          key="revived")
         return len(revived)
 
+    def twins(self) -> int:
+        """Open orders on the account the bot did not place yet quotes like it (its prices, sizes and markets): another
+        copy of the bot on the same account, doubling the orders and the rate."""
+        prices = {lv.price for lv in self.s.levels}
+        sizes = {lv.shares for lv in self.s.levels}
+        tokens = {t for listing in self.listings.values() for t in (listing.up, listing.down)}
+        return sum(1 for r in self.unmanaged if r.side == "BUY" and r.asset in tokens and r.price in prices and r.size in sizes)
+
     def counts(self) -> dict[str, Any]:
         """resting: orders the CLOB accepted and holds; sending: signed, the answer not back yet (not resting yet)."""
         active = [q for q in self.open_quotes() if q["phase"] == "active"]
@@ -1988,6 +2013,7 @@ class Engine:
             "buffer": float(self.balance - self.s.window_usd) if self.balance is not None else None,
             "refused": self.refused_reason if now < self.refused_until else "",
             "coverage": self.coverage(),
+            "rate": self.x.rate_status() if hasattr(self.x, "rate_status") else None, "twins": self.twins(),
             "refusals": [{k: g[k] for k in ("code", "title", "count", "last_text", "words", "evidence", "action")}
                          for g in refusals.summary(self.refusal_log, now, 24)[:6]],
             "unmanaged": len(self.unmanaged), "unmanaged_usd": float(self.unmanaged_usd()),
@@ -2088,7 +2114,12 @@ class Engine:
             verdict = f"⏳ 正在挂：范围内 {total} 场，挂上 {resting} 场，{pending} 场在排队或等开放"
         else:
             verdict = f"✅ 正常：{cov['text']}"
-        lines = [f"🩺 体检 {mk.hms(now)} · {self.s.mode()}", verdict, "", "【挂单】",
+        twins = self.twins()
+        lines = [f"🩺 体检 {mk.hms(now)} · {self.s.mode()}", verdict]
+        if twins >= TWINS_ALERT:
+            lines.append(f"⛔ 账户里有 {twins} 张和本程序一模一样、但不是本程序下的挂单：很可能还有另一个机器人在用这个账户"
+                         "（Railway 上另一个服务、电脑上本地跑的）。只留一个")
+        lines += ["", "【挂单】",
                  f"{'⚠️' if short else '✅'} 范围内：{cov['text']}"]
         timeouts = int(getattr(self.x, "_timeouts", 0) or 0)
         if now < self.refused_until:
@@ -2164,6 +2195,18 @@ class Engine:
         lines.append(f"ℹ️ 订单号=哈希：{'是' if self.id_is_hash else '否' if self.id_is_hash is False else '未知'}；"
                      f"限流档位：{getattr(self.x, 'tier', '') or '未知'}"
                      + ("；⚠️ 交易所发过限流警告" if getattr(self.x, "rate_warning", False) else ""))
+        rs = self.x.rate_status() if hasattr(self.x, "rate_status") else None
+        if rs:
+            line = (f"{'⚠️' if rs['limited_hour'] else '✅'} 下单速度：现在 {rs['rate']:g} 单/秒（设置 {rs['configured']:g}"
+                    + (f"，{rs['tier']} 档上限 {rs['tier_rate']}" if rs["tier_rate"] else "") + "）")
+            if rs["configured"] > rs["cap"]:
+                line += f"；设置超过档位上限，按 {rs['cap']:g} 跑"
+            if rs["limited_hour"]:
+                line += f"；最近 1 小时被限流（429）{rs['limited_hour']} 次，每次自动减速、之后慢慢恢复"
+            if rs["others"] and rs["last"]:
+                line += (f"。其中 {rs['others']} 次本程序 10 秒内自己只发了 {rs['last']['own10']} 张（交易所允许 {rs['last']['allowance']} 张）"
+                         "：同一个私钥还有别的程序在下单（另一个机器人、脚本）")
+            lines.append(line)
         listed_until = max((l.start for l in self.listings.values()), default=0)
         front = self.frontier(mk.window_starts(now, self.s))
         lines.append(("✅" if listed_until else "⚠️") + " 发现市场："

@@ -16,6 +16,7 @@ hash, cancelled by it and its fills read from the trades.
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import logging
 import time
@@ -28,6 +29,12 @@ BATCH = 15                      # POST /orders takes 1 to 15 orders
 POSTS_IN_FLIGHT = 1             # the account's order POSTs at a time: the CLOB times out bursts of concurrent submissions
                                 # from one account ("order timed out", docs); what waits meanwhile goes in the next batch
 TIMED_OUT_WAIT_S, TIMED_OUT_MAX_S = 5.0, 60.0   # after "order timed out": no new order this long, doubling while it lasts
+# the per-signer order bucket of each tier (docs: api-reference/trading-rate-limits): tokens/s, burst
+TIER_LIMITS = {"standard": (40, 60), "copper": (60, 90), "bronze": (80, 120), "silver": (200, 300), "gold": (400, 600),
+               "platinum": (450, 675), "diamond": (525, 787), "elite": (600, 900)}
+RATE_MARGIN = 0.9         # the local order bucket never above this share of the tier's rate (nor its burst less 5)
+MIN_ORDER_RATE = 5.0      # a 429 halves the local order rate down to this...
+RATE_RECOVER_S = 30       # ...and every this long without one it grows half again, back to the cap
 CANCEL_CHUNK = 200              # DELETE /orders takes up to 1000 ids; a chunk is also kept within the local cancel bucket's burst
 # The CLOB's refusal messages (docs: resources/error-codes, "Order Processing Errors"). They come per order in a 200, or
 # for the whole request as a 400 (`not enough balance / allowance` among them): the words decide the code, not the status.
@@ -306,16 +313,67 @@ class LiveExchange:
         self.wallet_list_off_until = 0.0
         self.orders = order_bucket or Bucket(settings.order_rate, settings.order_burst)
         self.cancels = cancel_bucket or Bucket(settings.cancel_rate, settings.cancel_burst)
+        self.configured = (float(settings.order_rate), int(settings.order_burst))   # the settings' order bucket
+        self.sent: collections.deque = collections.deque(maxlen=4000)   # (monotonic, orders) of every order request
+        self.limited: collections.deque = collections.deque(maxlen=200)  # each 429 of the order bucket, with the bot's own pace
+        self.backoff_at = 0.0
         self._outbox: list[tuple[list[tuple[OrderSpec, Any, str]], asyncio.Future]] = []   # signed, waiting for the sender
         self._senders: list[asyncio.Task] = []
         self._wake: asyncio.Event | None = None
         self._timeouts = 0              # "order timed out" answers in a row
 
     def _on_rate(self, update: Any) -> None:
-        if getattr(update, "tier", None):
+        if getattr(update, "tier", None) and str(update.tier) != self.tier:
             self.tier = str(update.tier)
+            self.set_order_limits(*self.configured)  # the tier known: the local bucket kept under it
         if getattr(update, "warning", False):
             self.rate_warning = True
+
+    def order_cap(self) -> tuple[float, int]:
+        """The settings' order bucket, kept under the tier's own (its rate x 0.9, its burst less 5) once it is known."""
+        rate, burst = self.configured
+        tier = TIER_LIMITS.get(self.tier.lower())
+        if tier:
+            rate, burst = min(rate, tier[0] * RATE_MARGIN), min(burst, tier[1] - 5)
+        return rate, burst
+
+    def set_order_limits(self, rate: float, burst: int) -> None:
+        """New settings (or the tier learned): the local order bucket at them, capped by the tier."""
+        self.configured = (float(rate), int(burst))
+        cap_rate, cap_burst = self.order_cap()
+        self.orders.rate, self.orders.burst = cap_rate, cap_burst
+        self.orders.tokens = min(self.orders.tokens, float(cap_burst))
+
+    def note_limited(self, error: Any) -> None:
+        """A 429 on an order request: the local rate halved, the bucket emptied; and what the bot itself had sent in the
+        last 10 s against what the tier admits, which tells whether something else spends this signer's tokens."""
+        now = time.monotonic()
+        own = sum(n for t, n in self.sent if now - t <= 10)
+        tier = TIER_LIMITS.get(self.tier.lower(), TIER_LIMITS["standard"])
+        state = getattr(error, "rate_limit", None)
+        self.limited.append({"at": time.time(), "own10": own, "allowance": tier[1] + 10 * tier[0],
+                             "remaining": getattr(state, "remaining", None), "retry": float(error.retry_after or 0),
+                             "rate": round(self.orders.rate, 1)})
+        self.orders.rate = max(MIN_ORDER_RATE, self.orders.rate / 2)
+        self.orders.tokens = 0.0
+        self.backoff_at = now
+
+    def recover(self) -> None:
+        cap, _ = self.order_cap()
+        now = time.monotonic()
+        if self.orders.rate < cap and now - self.backoff_at >= RATE_RECOVER_S:
+            self.orders.rate = min(cap, self.orders.rate * 1.5)
+            self.backoff_at = now
+
+    def rate_status(self) -> dict[str, Any]:
+        """The order pace for /check and 🧾 拒单: now, the cap, the tier, the 429s of the last hour and how many of them
+        came while the bot itself sent well under the tier's allowance (something else spending the same signer's)."""
+        hour = [x for x in self.limited if time.time() - x["at"] <= 3600]
+        cap, _ = self.order_cap()
+        tier = TIER_LIMITS.get(self.tier.lower())
+        return {"rate": round(self.orders.rate, 1), "cap": round(cap, 1), "configured": self.configured[0], "tier": self.tier,
+                "tier_rate": tier[0] if tier else None, "limited_hour": len(hour),
+                "others": sum(1 for x in hour if x["own10"] < 0.5 * x["allowance"]), "last": hour[-1] if hour else None}
 
     async def start(self) -> None:
         from polymarket import ApiKeyCreds, AsyncSecureClient, RelayerApiKey
@@ -463,10 +521,13 @@ class LiveExchange:
                     out[spec.ref] = Placed(spec.ref, "not_sent", code=stopped.code, message="前一批被拒，没发", hash=h,
                                            salt=int(o.salt), wait=stopped.wait)
                 continue
+            self.recover()
             await self.orders.take(len(batch))
+            self.sent.append((time.monotonic(), len(batch)))
             try:
                 responses = await self.client.post_orders([o for _, o, _ in batch])
             except RateLimitError as error:  # refused at the gate: nothing processed
+                self.note_limited(error)
                 stopped = Placed("", "not_sent", code="rate_limited", message=f"下单被限流（429）：{error}",
                                  wait=float(error.retry_after or 10.0))
                 for spec, o, h in batch:
