@@ -20,7 +20,7 @@ from pathlib import Path
 
 from decimal import Decimal as D
 
-from preopen import config, journal, region
+from preopen import config, journal, refusals, region
 from preopen import markets as mk
 from preopen.engine import Engine
 from preopen.exchange import LiveExchange, PaperExchange
@@ -156,6 +156,18 @@ def commander(settings: config.Settings, engine: Engine, pub: PublicApi, console
             return engine.check_text()
         if cmd == "/review":
             return review(engine, args)
+        if cmd == "/rejects":
+            try:
+                hours = float(args[0]) if args else 24.0
+            except ValueError:
+                return "用法：/rejects（最近 24 小时）、/rejects 1（最近 1 小时）"
+            hours = max(0.1, min(hours, 24 * 7))
+            text = refusals.text(engine.refusal_log, engine.now(), hours)
+            if refusals.recent(engine.refusal_log, engine.now(), hours):
+                return Reply(text, {"inline_keyboard": [[{"text": "🔬 现场检测", "callback_data": "chk_rejects"}]]})
+            return text
+        if cmd == "/chk_rejects":
+            return await refusals.live_check(engine)
         if cmd.startswith("/set_cancel_"):
             try:
                 seconds = int(cmd.removeprefix("/set_cancel_"))

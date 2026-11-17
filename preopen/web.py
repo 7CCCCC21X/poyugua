@@ -443,6 +443,7 @@ function renderOverview(d) {
     ["订单号=哈希", d.id_is_hash == null ? "未知" : (d.id_is_hash ? "是" : "否")], ["限流档位", d.tier || "未知"], ["发布提前量", d.lead_h + " 小时"],
   ].map(([k, v]) => `<div>${esc(k)}</div><div>${esc(v)}</div>`).join("");
   const pend = (d.pending || []).map((p) => `<div>⚠️ ${esc(p.what)}：${esc(p.window)} ${esc(p.side)}（${esc(p.since)}）<span class="muted small">${esc(p.note)}</span></div>`);
+  (d.refusals || []).forEach((r) => pend.push(`<div>🧾 拒单：${esc(r.title)} × ${r.count}（最近 ${esc(r.last_text)}）<span class="muted small">交易所原话：${esc(r.words.slice(0, 100))}${r.evidence ? "；" + esc(r.evidence) : ""}。机器人：${esc(r.action)}</span></div>`));
   if (d.unmanaged) pend.push(`<div>账户里另有 ${d.unmanaged} 张本程序没记录的挂单（${money(d.unmanaged_usd)}），只占用它们各自那一场的余额</div>`);
   if (d.cooldown) pend.push(`<div>接口冷却：${esc(d.cooldown)}</div>`);
   $("pending").innerHTML = pend.length ? pend.join("") : '<span class="muted">无</span>';

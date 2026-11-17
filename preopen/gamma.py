@@ -143,9 +143,14 @@ class PublicApi:
                 raise a
         return {s: a for s, a in zip(slugs, answers) if isinstance(a, dict) and a.get("slug") == s}
 
+    async def clob_market(self, condition_id: str) -> dict | None:
+        """The CLOB's own record of a market: `ao` (accepting orders), `t` (its tokens), None when it has none."""
+        data = await self._get(f"{CLOB}/clob-markets/{condition_id}", params={"_": str(time.time_ns())})
+        return data if isinstance(data, dict) else None
+
     async def accepting(self, condition_id: str) -> bool | None:
         """Whether the CLOB accepts orders on this market now (its own flag, ahead of Gamma's)."""
-        data = await self._get(f"{CLOB}/clob-markets/{condition_id}", params={"_": str(time.time_ns())})
+        data = await self.clob_market(condition_id)
         if not isinstance(data, dict):
             return None
         value = data.get("ao", data.get("accepting_orders"))

@@ -20,6 +20,7 @@ from polymarket.models.clob.cancel import CancelOrdersResponse
 from polymarket.models.clob.order_response import AcceptedOrder
 from polymarket.models.clob.orders import SignedOrder
 import preopen.markets as mk
+from preopen import refusals
 from preopen.exchange import Bucket, LiveExchange, OrderSpec, order_hash
 from preopen.ledger import Ledger
 
@@ -60,6 +61,7 @@ class FakeClob:
         self.refused = 0
         self.redeemed: list[str] = []
         self.signer_mismatch = False
+        self.unknown_tokens: set[str] = set()   # tokens the matching engine refuses ("invalid token id")
         self.balance_error: Exception | None = None
         self.missing = "404"
         self.market_cancels: list[str] = []
@@ -88,6 +90,9 @@ class FakeClob:
     async def post_orders(self, orders):
         answer = self.answers.pop(0) if self.answers else "ok"
         self.posted += len(orders)
+        if any(str(o.token_id) in self.unknown_tokens for o in orders):  # the matching engine has not registered it yet
+            self.refused += len(orders)
+            raise RequestRejectedError("invalid token id", status=400)
         if self.signer_mismatch:   # the API key belongs to another address than the orders' signer (docs: POST /order)
             raise RequestRejectedError("the order signer address has to be the address of the API KEY", status=400)
         if answer == "timed_out":  # docs: rejected before reaching the book, safe to send again
@@ -526,6 +531,55 @@ class CredentialsTest(unittest.IsolatedAsyncioTestCase):
             await tick(e, 10)
         self.assertGreater(len(fake.live()), 100)
         self.assertTrue(e.check_text().splitlines()[1].startswith("✅"))
+
+
+class InvalidTokenTest(unittest.IsolatedAsyncioTestCase):
+    """11-17: "invalid token id" around each fresh listing, each one pausing every placement 30 s; the window's request
+    held other windows' orders, all refused with it."""
+
+    async def test_one_windows_token_holds_back_nothing_else_and_it_is_placed_when_known(self):
+        clock = Clock()
+        fake, pub = FakeClob(clock), FakePublic(clock)
+        s = seven_coins(clock, fake, pub)
+        e = make_engine(s, clock=clock, exchange=adapter(fake, s), public=pub)[0]
+        starts = mk.window_starts(clock.t, s)
+        fresh = pub.listed[mk.slug_of("eth", starts[0])]
+        fake.unknown_tokens = set(json.loads(fresh["clobTokenIds"]))
+        await tick(e)
+        await tick(e, 1)
+        self.assertEqual(e.hold(), "")                                          # nothing paused for it
+        on_book = {o.condition_id for o in fake.live()}
+        self.assertNotIn(fresh["conditionId"], on_book)
+        self.assertEqual(len(on_book), 7 * len(starts) - 1)                     # every other window placed
+        self.assertEqual(e.refused_streak, 0)
+        log = [x for x in e.refusal_log if x["slug"] == fresh["slug"]]
+        self.assertEqual({x["code"] for x in log}, {"token_not_ready"})
+        self.assertTrue(any(x["whole"] for x in log))
+        fake.unknown_tokens = set()                                             # the engine knows it now
+        for _ in range(3):
+            await tick(e, 1)
+        self.assertIn(fresh["conditionId"], {o.condition_id for o in fake.live()})
+        text = refusals.text(e.refusal_log, clock.t, 24)
+        self.assertIn("交易所撮合引擎还不认这个代币", text)
+        self.assertIn("交易所原话：invalid token id", text)
+        check = await refusals.live_check(e)
+        self.assertIn("ETH", check)
+        self.assertIn("现在挂着 ✅", check)
+        e.save_refusals()
+        self.assertIn("token_not_ready", e.ledger.get("refusals"))              # kept across a restart
+
+    async def test_a_token_never_known_is_read_again_and_waits_longer(self):
+        clock = Clock()
+        fake, pub = FakeClob(clock), FakePublic(clock)
+        m = fake.know(pub.list_window("btc", T0 + 1800))
+        fake.unknown_tokens = set(json.loads(m["clobTokenIds"]))
+        s = settings()
+        e = make_engine(s, clock=clock, exchange=adapter(fake, s), public=pub)[0]
+        for _ in range(25):
+            await tick(e, 1.1)
+        self.assertGreaterEqual(e.token_refusals.get(m["slug"], 0), 20)
+        self.assertTrue(any("重新读一遍" in text for _, text in e.errors))
+        self.assertEqual(e.hold(), "")
 
 
 class RefusalWordsTest(unittest.IsolatedAsyncioTestCase):

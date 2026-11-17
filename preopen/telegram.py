@@ -30,15 +30,17 @@ BUTTONS = {  # keyboard button text -> command
     "▶️ 恢复": "/resume",
     "📈 复盘": "/review",
     "📤 导出": "/export",
+    "🧾 拒单": "/rejects",
 }
 COMMANDS = [("status", "状态"), ("check", "体检"), ("probe", "只读探测接下来的场次"), ("web", "打开网页控制台"),
             ("pause", "暂停并撤掉全部挂单"), ("resume", "恢复挂单"), ("review", "复盘结论：/review 7 = 最近 7 天，/review btc = 只看 BTC"),
-            ("export", "导出记录（CSV 文件）：/export 7 = 最近 7 天"), ("help", "说明和按钮")]
+            ("export", "导出记录（CSV 文件）：/export 7 = 最近 7 天"),
+            ("rejects", "拒单：真实原因、证据和现场检测（/rejects 1 = 最近 1 小时）"), ("help", "说明和按钮")]
 CONFIRM_PAUSE = "pause!"  # callback data of the inline 确认 button: the handler is asked "/pause!"
 CANCEL = "cancel"
 
-HELP = ("按钮：📊 状态、🩺 体检、🔎 探测、🌐 网页、📈 复盘、📤 导出、⏸ 暂停（会先确认）、▶️ 恢复；左下角菜单按钮打开网页控制台。\n"
-        "命令：/status 状态 /check 体检 /probe [小时] 只读探测 /review [天数] [币种] 复盘 /export [天数] 导出 CSV /web 网页 "
+HELP = ("按钮：📊 状态、🩺 体检、🧾 拒单、📈 复盘、📤 导出、🔎 探测、🌐 网页、⏸ 暂停（会先确认）、▶️ 恢复；左下角菜单按钮打开网页控制台。\n"
+        "命令：/status 状态 /check 体检 /rejects [小时] 拒单原因 /probe [小时] 只读探测 /review [天数] [币种] 复盘 /export [天数] 导出 CSV /web 网页 "
         "/pause 暂停并撤单 /resume 恢复 /help 本说明")
 
 
@@ -73,10 +75,9 @@ class Telegram:
         self.keyboard_sent = False
 
     def keyboard(self) -> dict:
-        return {"keyboard": [[{"text": "📊 状态"}, {"text": "🩺 体检"}],
-                             [{"text": "📈 复盘"}, {"text": "📤 导出"}],
-                             [{"text": "🔎 探测"}, {"text": "🌐 网页"}],
-                             [{"text": "⏸ 暂停"}, {"text": "▶️ 恢复"}]],
+        return {"keyboard": [[{"text": "📊 状态"}, {"text": "🩺 体检"}, {"text": "🧾 拒单"}],
+                             [{"text": "📈 复盘"}, {"text": "📤 导出"}, {"text": "🔎 探测"}],
+                             [{"text": "🌐 网页"}, {"text": "⏸ 暂停"}, {"text": "▶️ 恢复"}]],
                 "resize_keyboard": True, "is_persistent": True}
 
     def send(self, text: str, key: str = "", markup: dict | None = None) -> None:
@@ -184,7 +185,7 @@ class Telegram:
                     result = f"操作出错：{error}"
         try:
             await self._post("answerCallbackQuery", callback_query_id=cb.get("id"), text=result[:190])
-            if mine and msg.get("message_id") and data.startswith("set_"):
+            if mine and msg.get("message_id") and data.startswith(("set_", "chk_")):
                 # a button under a report (the review): the report stays, its button goes, the result comes as a message
                 await self._post("editMessageReplyMarkup", chat_id=self.chat(), message_id=msg["message_id"],
                                  reply_markup={"inline_keyboard": []})

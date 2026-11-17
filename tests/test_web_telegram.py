@@ -273,6 +273,32 @@ class TelegramTest(unittest.IsolatedAsyncioTestCase):
         week = await handle("/export", ["7"])
         self.assertIn("最近 7 天", week.text)
 
+    async def test_rejects_explains_the_refusals_and_checks_them_live(self):
+        e, clock, pub, x = make_engine()
+        start = mk.window_starts(clock.t, e.s)[0]
+        m = pub.list_window("btc", start)
+        handle = main.commander(settings(), e, pub)
+        self.assertIn("没有被拒的单", await handle("/rejects", []))
+        x.refuse_market[m["conditionId"]] = ("rejected", "token_not_ready")
+        await tick(e)
+        await tick(e, 2)
+        reply = await handle("/rejects", [])
+        self.assertIsInstance(reply, Reply)
+        self.assertIn("交易所撮合引擎还不认这个代币", reply.text)
+        self.assertIn("机器人：只把这一场 1 秒后再挂", reply.text)
+        self.assertEqual(reply.markup["inline_keyboard"][0][0]["callback_data"], "chk_rejects")
+        self.assertIn("最近 1 小时拒单", e.check_text())
+        self.assertEqual(e.hold(), "")
+        tg = FakeTelegram()
+        await tg.on_callback({"id": "c", "data": "chk_rejects", "from": {"id": int(ADMIN)},
+                              "message": {"chat": {"id": int(ADMIN)}, "message_id": 3}}, handle)
+        self.assertEqual([m_ for m_, _ in tg.posts], ["answerCallbackQuery", "editMessageReplyMarkup"])  # the report stays
+        check = tg.outbox.get_nowait()[0]
+        self.assertIn("🔬 现场检测", check)
+        self.assertIn("交易所接受下单 ✅", check)
+        self.assertIn("/rejects", main.HELP) if hasattr(main, "HELP") else None
+        self.assertIn("🧾 拒单", BUTTONS)
+
     async def test_web_command(self):
         e, clock, pub, x = make_engine()
         no_domain = await main.commander(settings(), e, pub)("/web", [])

@@ -49,6 +49,8 @@ REFUSALS = (
     ("owner of the api key", "auth"),
     ("address of the api key", "auth"),
     ("order timed out", "timed_out"),
+    ("invalid token id", "token_not_ready"),       # the matching engine has not registered the market's tokens yet
+    ("no orderbook exists", "token_not_ready"),
     ("could not insert order", "insert_failed"),
     ("cancel-only", "cancel_only"),
     ("post-only mode", "post_only_mode"),
@@ -63,6 +65,7 @@ WINDOW_CODES = {"post_only_would_cross", "invalid_tick", "invalid_size", "invali
 
 
 TRANSIENT_WAIT = {"insert_failed": 5.0}   # the exchange's own hiccup under load: not inserted; sent again after this
+NO_SPLIT = {"auth", "banned", "closed_only"}   # a whole request refused for these: the account's, not one window's
 
 
 def refusal_code(message: str, fallback: str) -> str:
@@ -113,6 +116,9 @@ class Placed:
     salt: int = 0
     matched: D = D(0)
     wait: float = 0.0           # > 0: the request was refused before processing (429, restart): hold this long
+    whole: bool = False         # the refusal was for the whole request (an HTTP error), not for this order alone
+    batch: int = 0              # orders in the request it went in
+    http: int = 0               # the HTTP status of a refused request
 
 
 @dataclass
@@ -404,6 +410,11 @@ class LiveExchange:
             items = [item for signed, _ in groups for item in signed]
             try:
                 results = await self._post(items)
+                if len(groups) > 1 and any(r.whole and r.status == "rejected" and r.code not in NO_SPLIT for r in results.values()):
+                    # the whole request refused, perhaps for one window's order alone (a token the matching engine
+                    # does not know yet, one market's balance): each window goes again on its own, so that the others
+                    # are not held back by it. A request refused as a whole was not processed: sending again is safe.
+                    results = await self._post_apart([signed for signed, _ in groups])
             except asyncio.CancelledError:
                 for _, future in groups:
                     future.cancel()
@@ -424,6 +435,21 @@ class LiveExchange:
                         future.set_result({spec.ref: Placed(spec.ref, "not_sent", code=stopped.code, message="前一批被拒，没发",
                                                             hash=h, salt=int(o.salt), wait=stopped.wait)
                                            for spec, o, h in signed})
+
+    async def _post_apart(self, groups: list[list[tuple[OrderSpec, Any, str]]]) -> dict[str, Placed]:
+        """Each group (a window's orders) in a request of its own; after a refusal before processing (429, a restart)
+        the rest is not sent."""
+        out: dict[str, Placed] = {}
+        stopped: Placed | None = None
+        for signed in groups:
+            if stopped is not None:
+                out.update({spec.ref: Placed(spec.ref, "not_sent", code=stopped.code, message="前一批被拒，没发", hash=h,
+                                             salt=int(o.salt), wait=stopped.wait) for spec, o, h in signed})
+                continue
+            got = await self._post(signed)
+            out.update(got)
+            stopped = next((r for r in got.values() if r.status == "not_sent" and r.wait > 0), None)
+        return out
 
     async def _post(self, signed: list[tuple[OrderSpec, Any, str]]) -> dict[str, Placed]:
         """POST signed orders in batches of 15 and read each answer."""
@@ -454,7 +480,7 @@ class LiveExchange:
                     stopped = Placed("", "not_sent", code=code, message=f"下单被拒（{error.status} {code}）：{error}", wait=wait)
                     for spec, o, h in batch:
                         out[spec.ref] = Placed(spec.ref, "not_sent", code=code, message=stopped.message, hash=h,
-                                               salt=int(o.salt), wait=wait)
+                                               salt=int(o.salt), wait=wait, whole=True, batch=len(batch), http=error.status)
                     continue
                 code = refusal_code(str(error), f"http_{error.status}")
                 if code == "timed_out":  # 500 "order timed out": rejected before reaching the book, safe to send again
@@ -472,7 +498,8 @@ class LiveExchange:
                 refused = 400 <= error.status < 500 and error.status not in (408, 409) and code != "duplicated"
                 for spec, o, h in batch:
                     out[spec.ref] = Placed(spec.ref, "rejected" if refused else "unknown", code=code,
-                                           message=str(error), hash=h, salt=int(o.salt), wait=TRANSIENT_WAIT.get(code, 0.0))
+                                           message=str(error), hash=h, salt=int(o.salt), wait=TRANSIENT_WAIT.get(code, 0.0),
+                                           whole=True, batch=len(batch), http=error.status)
                 continue
             except PolymarketError as error:  # a transport failure or a malformed answer: sent or not, unknown
                 status = "not_sent" if _cause_not_sent(error) else "unknown"
@@ -496,7 +523,8 @@ class LiveExchange:
                     if code == "unknown":  # words the SDK does not map: the documented ones are
                         code = refusal_code(message, code)
                     out[spec.ref] = Placed(spec.ref, "unknown" if code == "duplicated" else "rejected", code=code,
-                                           message=message, hash=h, salt=int(o.salt), wait=TRANSIENT_WAIT.get(code, 0.0))
+                                           message=message, hash=h, salt=int(o.salt), wait=TRANSIENT_WAIT.get(code, 0.0),
+                                           batch=len(batch))
         return out
 
     async def cancel(self, ids: list[str]) -> Cancelled:

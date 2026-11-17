@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -32,6 +33,7 @@ from decimal import Decimal as D
 from typing import Any, Callable
 
 from . import markets as mk
+from . import refusals
 from .config import GTD_THRESHOLD_S, Settings
 from .exchange import WINDOW_CODES, Cancelled, Exchange, OrderSpec, Placed, Row, Throttled, refusal_code, retryable, unrecognised
 from .gamma import PublicThrottled
@@ -88,6 +90,11 @@ REFUSAL_HELP = {          # what an account-wide refusal means for the operator,
     "invalid_payload": "交易所说订单格式不对",
     "batch_too_large": "一次发的单超过了交易所的上限",
 }
+TOKEN_RETRY_S = 1.0       # a market whose tokens the matching engine does not know yet ("invalid token id", common in
+TOKEN_FAST_TRIES = 20     # the seconds after a market opens): its window alone is tried again this often, this many times;
+TOKEN_SLOW_RETRY_S = 10   # then this often, and the listing is read again from Gamma once (its tokens may have changed)
+REFUSALS_KEPT = 300       # the latest refusals kept for /rejects (also across restarts)
+REFUSALS_SAVE_S = 10      # ...written to the ledger at most this often
 EXTERNAL_MASS = 3         # the bot's orders cancelled elsewhere (plain CANCELED: the website's 取消所有, another program
 EXTERNAL_WINDOW_S = 60    # with the key) in this many windows within this long: taken as "stop", and the bot pauses
 
@@ -161,6 +168,13 @@ class Engine:
         self.refused_at: dict[str, float] = {}  # slug -> when its orders were last refused that way
         self.accepted_at = 0.0                # when the CLOB last accepted an order (ends a refusal streak)
         self.last_refusal: tuple[float, str, str] | None = None   # (when, code, words) of the latest order refused
+        self.token_refusals: dict[str, int] = {}  # slug -> "invalid token id" answers in a row
+        self.refusal_log: collections.deque = collections.deque(maxlen=REFUSALS_KEPT)  # every refusal, for /rejects
+        try:
+            self.refusal_log.extend(json.loads(ledger.get("refusals") or "[]"))
+        except ValueError:
+            pass
+        self.refusals_saved_at = 0.0
         self.recent_refusals: collections.deque = collections.deque(maxlen=500)  # (when, slug, code) of those refusals
         self.external: collections.deque = collections.deque(maxlen=200)         # (when, slug) of cancels made elsewhere
         self.restart = False                  # set by the console (a LIVE switch): main() starts the process again
@@ -362,6 +376,25 @@ class Engine:
         self.balance_hold_until = self.now() + BALANCE_HOLD_S
         self.balance_at = 0.0
         self.problem(text, key="balance")
+
+    def log_refusal(self, listing: mk.Listing, q: dict, r: Placed, at: float) -> None:
+        """A window's orders refused: kept with the exchange's words and the circumstances (how long after the listing
+        and the opening, how many orders the request held), for /rejects to tell the real cause."""
+        self.refusal_log.append({
+            "at": round(at, 2), "slug": q["slug"], "coin": q["coin"], "start": q["start"], "level": int(q["level"]),
+            "code": r.code, "words": (r.message or "")[:300], "status": r.status, "http": r.http, "batch": r.batch,
+            "whole": r.whole, "listed_ago": round(at - listing.created, 1) if listing.created else None,
+            "opened_ago": round(at - listing.opened, 2) if listing.opened else None,
+            "up": listing.up, "down": listing.down, "cid": listing.condition_id})
+        if at - self.refusals_saved_at >= REFUSALS_SAVE_S:
+            self.save_refusals()
+
+    def save_refusals(self) -> None:
+        self.refusals_saved_at = self.now()
+        try:
+            self.ledger.put("refusals", json.dumps(list(self.refusal_log)[-200:], ensure_ascii=False))
+        except Exception as error:  # the log is a convenience
+            LOG.debug("拒单记录保存失败：%s", error)
 
     def refuse(self, code: str, message: str) -> None:
         """The CLOB refused orders for a reason that is not the window's own (an exchange rule, the account, words not
@@ -759,6 +792,7 @@ class Engine:
                 self.apply_placed(q, side, r, done)
                 if r.status == "open":
                     self.accepted_at, self.refused_streak = done, 0
+                    self.token_refusals.pop(slug, None)
                 elif r.status in ("rejected", "not_sent") and r.code:
                     self.last_refusal = (done, r.code, r.message)
                 if r.wait > 0:
@@ -766,12 +800,25 @@ class Engine:
                 if r.code == "market_not_ready":
                     listing.accepting = False
                     hold = Hold("市场还没开放下单", ARM_RETRY_S)
+                if r.code == "token_not_ready" and side == "up":  # once a window: its two orders were in one request
+                    tries = self.token_refusals[slug] = self.token_refusals.get(slug, 0) + 1
+                    hold = Hold("交易所撮合引擎还不认这个代币（刚开放的市场常见），这一场稍后再挂",
+                                TOKEN_RETRY_S if tries < TOKEN_FAST_TRIES else TOKEN_SLOW_RETRY_S)
+                    if tries == TOKEN_FAST_TRIES:  # its tokens may have changed: the listing read afresh
+                        self.listings.pop(slug, None)
+                        self.problem(f"{mk.window_name(listing.coin, listing.start)} 连续 {tries} 次 invalid token id："
+                                     f"重新读一遍这一场的市场信息再挂", key="token-refresh")
                 if r.code == "not_enough_balance":
                     hold = Hold("余额或授权不足（交易所拒单）", None)
                     self.hold_balance("交易所拒单：余额或授权不足（到 Polymarket 核对 pUSD 余额和交易授权）")
             states = {o["state"] for o in q["orders"].values()}
             codes = [o.get("code", "") for o in q["orders"].values() if o["state"] != "open"]
             account = [c for c in codes if c in ACCOUNT_REFUSALS or unrecognised(c)]
+            refused = next((by_ref.get(f"{q['key']}/{side}") for side in mk.SIDES
+                            if (by_ref.get(f"{q['key']}/{side}") or Placed("", "")).status in ("rejected", "not_sent")
+                            and (by_ref.get(f"{q['key']}/{side}") or Placed("", "")).code), None)
+            if refused is not None:
+                self.log_refusal(listing, q, refused, done)
             if states <= {"not_sent", "rejected"} and all(retryable(c) for c in codes):
                 prev = self.refused_at.get(slug)
                 words = next((c for c in codes if unrecognised(c)), "")
@@ -1941,6 +1988,8 @@ class Engine:
             "buffer": float(self.balance - self.s.window_usd) if self.balance is not None else None,
             "refused": self.refused_reason if now < self.refused_until else "",
             "coverage": self.coverage(),
+            "refusals": [{k: g[k] for k in ("code", "title", "count", "last_text", "words", "evidence", "action")}
+                         for g in refusals.summary(self.refusal_log, now, 24)[:6]],
             "unmanaged": len(self.unmanaged), "unmanaged_usd": float(self.unmanaged_usd()),
             "windows": c["windows"], "resting": c["resting"], "unknown": c["unknown"], "closing": c["closing"],
             "listed_until": mk.hm(listed_until) if listed_until else "",
@@ -2059,6 +2108,10 @@ class Engine:
             when, code, words = self.last_refusal
             help_ = REFUSAL_HELP.get(code, "")
             lines.append(f"⚠️ 最近一次被拒（{mk.span(now - when)}前）：{code} {words[:120]}" + (f"。{help_}" if help_ else ""))
+        hour = refusals.summary(self.refusal_log, now, 1)
+        if hour:
+            lines.append(f"⚠️ 最近 1 小时拒单 {sum(g['count'] for g in hour)} 次："
+                         + "，".join(f"{g['title']} × {g['count']}" for g in hour[:3]) + "（点 🧾 拒单 看原因和证据）")
         unknown = [now - float(o.get("unknown_at") or now) for q in self.open_quotes() for o in q["orders"].values()
                    if o["state"] == "unknown"]
         lines.append(f"⚠️ 状态不明的单：{len(unknown)} 张，最久 {mk.span(max(unknown))}（按订单哈希核对中，约 2 分钟内有结论）"
