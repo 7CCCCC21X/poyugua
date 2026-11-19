@@ -103,7 +103,10 @@ def _finish(t: dict[str, Any]) -> dict[str, Any]:
 
 def journal(records: Iterable[dict], now: float, current: int | None = None) -> dict[str, Any]:
     """The review: totals (today, 7 days, all), by day, coin, starting hour, side and how long before the start the
-    fills came, and the filled windows one by one."""
+    fills came, and the filled windows one by one. Windows are counted as windows (its levels and attempts together:
+    quoted, filled, both sides, won or lost once each; 11-19 review: fills were counted per level and attempt, a window
+    filled on two levels made 200%); the money adds up record by record; each fill goes to the time it came (not the
+    side's first fill's)."""
     records = list(records)
     today = day_of(now)
     week = {day_of(now - 86400 * i) for i in range(7)}
@@ -113,22 +116,21 @@ def journal(records: Iterable[dict], now: float, current: int | None = None) -> 
     by_hour: dict[int, dict] = defaultdict(_blank)
     by_side = {s: {"side": mk.SIDES_CN[s], "shares": D(0), "cost": D(0), "won": D(0)} for s in mk.SIDES}
     by_lead: dict[str, dict] = {name: {"bucket": name, "fills": 0, "shares": D(0), "cost": D(0), "won": D(0)} for _, name in LEAD_BUCKETS}
-    quoted: set[tuple[str, str]] = set()
+    windows: dict[tuple[str, str], dict[str, Any]] = {}
     detail = []
     for q in records:
         if not q.get("placed") and not any(filled(q).values()):
             continue  # never rested: not a quote
         day = day_of(q["start"])
-        buckets = [totals["all"], by_day[day], by_coin[mk.name_of(q["coin"])], by_hour[hour_of(q["start"])]]
-        if day == today:
-            buckets.append(totals["today"])
-        if day in week:
-            buckets.append(totals["7d"])
-        window = (q["slug"], day)
-        if window not in quoted:
-            quoted.add(window)
-            for b in buckets:
-                b["quoted"] += 1
+        w = windows.get((q["slug"], day))
+        if w is None:
+            buckets = [totals["all"], by_day[day], by_coin[mk.name_of(q["coin"])], by_hour[hour_of(q["start"])]]
+            if day == today:
+                buckets.append(totals["today"])
+            if day in week:
+                buckets.append(totals["7d"])
+            w = windows[(q["slug"], day)] = {"buckets": buckets, "sides": set(), "cost": D(0), "payout": D(0),
+                                             "settled": True}
         f = filled(q)
         if not any(f.values()):
             continue
@@ -137,17 +139,16 @@ def journal(records: Iterable[dict], now: float, current: int | None = None) -> 
         settled = q.get("phase") == "settled" and result in mk.SIDES
         cost = sum((v * price for v in f.values()), D(0))
         payout = f.get(result, D(0)) if settled else D(0)
-        for b in buckets:
-            b["filled"] += 1
-            b["both"] += 1 if all(f.values()) else 0
-            if settled:
+        w["sides"] |= {side for side, v in f.items() if v > 0}
+        if settled:
+            w["cost"] += cost
+            w["payout"] += payout
+            for b in w["buckets"]:
                 b["cost"] += cost
                 b["payout"] += payout
                 b["pnl"] += payout - cost
-                b["wins"] += 1 if payout > cost else 0
-                b["losses"] += 1 if payout < cost else 0
-            else:
-                b["open"] += 1
+        else:
+            w["settled"] = False
         for side, shares in f.items():
             if shares <= 0:
                 continue
@@ -155,15 +156,30 @@ def journal(records: Iterable[dict], now: float, current: int | None = None) -> 
             if settled:
                 by_side[side]["cost"] += shares * price
                 by_side[side]["won"] += shares if side == result else D(0)
-            first = q["orders"][side].get("first_fill")
-            if first:
-                lead = by_lead[lead_bucket(q["start"] - float(first))]
+        for side, events in fill_events(q)[0].items():
+            o = q["orders"][side]
+            if not (o.get("fills_at") or o.get("first_fill") or o.get("gone")):
+                continue  # no time known for its fills
+            for ahead, shares in events:
+                lead = by_lead[lead_bucket(ahead)]
                 lead["fills"] += 1
                 lead["shares"] += shares
                 if settled:
                     lead["cost"] += shares * price
                     lead["won"] += shares if side == result else D(0)
         detail.append(q)
+    for w in windows.values():
+        for b in w["buckets"]:
+            b["quoted"] += 1
+            if not w["sides"]:
+                continue
+            b["filled"] += 1
+            b["both"] += 1 if len(w["sides"]) == len(mk.SIDES) else 0
+            if w["settled"]:
+                b["wins"] += 1 if w["payout"] > w["cost"] else 0
+                b["losses"] += 1 if w["payout"] < w["cost"] else 0
+            else:
+                b["open"] += 1
     detail.sort(key=lambda q: -q["start"])
 
     def money(x: dict) -> dict:

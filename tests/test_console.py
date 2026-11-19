@@ -276,6 +276,44 @@ class CancelReviewTest(unittest.TestCase):
         self.assertEqual(journal.fill_times_text(q, "up"), "40.0:10")
 
 
+class WindowCountTest(unittest.TestCase):
+    """11-19 review: quoted windows were counted once per window, fills once per level and attempt: one window filled on
+    two levels showed 1 quoted, 2 filled, 200%. And a side's fills all went to its first fill's time."""
+
+    def level(self, coin, start, level, result, fills, price):
+        q = settled(coin, start, result, fills, price=price)
+        q["key"], q["level"] = f"{coin}-{start}#{level}@0", level
+        return q
+
+    def test_a_window_filled_on_two_levels_is_one_filled_window(self):
+        t = T0 - 3600
+        records = [self.level("btc", t, 0, "up", {"up": [(900, 10)]}, "0.47"),     # 47¢ up 10
+                   self.level("btc", t, 1, "up", {"down": [(600, 20)]}, "0.40"),   # 40¢ down 20: a second level, filled
+                   self.level("eth", t, 0, "down", {}, "0.47")]                    # quoted, nothing filled
+        total = journal.journal(records, T0)["totals"]["all"]
+        self.assertEqual((total["quoted"], total["filled"], total["both"], total["fill_rate"]), (2, 1, 1, 50.0))
+        # the money still adds up record by record: 10 × 0.47 + 20 × 0.40 paid, 10 won
+        self.assertAlmostEqual(total["cost"], 12.7)
+        self.assertAlmostEqual(total["pnl"], 10 - 12.7)
+        self.assertEqual((total["wins"], total["losses"]), (0, 1))   # the window lost, once
+
+    def test_status_counts_today_by_window(self):
+        e, clock, pub, x = make_engine(settings(**ENV))
+        start = T0 + 1800
+        for level, (up, down) in enumerate((("10", "0"), ("0", "20"))):   # one window, two levels filled
+            e.save({"key": f"w#{level}@0", "slug": mk.slug_of("btc", start), "coin": "btc", "start": start, "level": level,
+                    "attempt": 0, "price": "0.47", "shares": "20", "phase": "active", "expiration": start,
+                    "condition_id": "0xc", "orders": {"up": {"state": "open", "filled": up},
+                                                      "down": {"state": "open", "filled": down}}})
+        self.assertEqual(e.today(), {"fills": 1, "both": 1, "pnl": 0.0, "settled": 0})
+
+    def test_each_fill_goes_to_its_own_time(self):
+        t = T0 - 3600
+        q = settled("btc", t, "up", {"up": [(1000, 1), (5, 9)]})       # 1 share 1000 s before the start, 9 shares 5 s before
+        lead = {b["bucket"]: (b["fills"], b["shares"]) for b in journal.journal([q], T0)["by_lead"]}
+        self.assertEqual(lead, {"5～30 分钟": (1, 1.0), "开场前 1 分钟内": (1, 9.0)})
+
+
 class JournalTest(unittest.IsolatedAsyncioTestCase):
     async def test_orders_tabs_and_review(self):
         e, clock, pub, x = make_engine(settings(**ENV))

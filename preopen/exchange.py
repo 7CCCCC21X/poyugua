@@ -160,6 +160,8 @@ class Cancelled:
     canceled: set[str] = field(default_factory=set)
     not_canceled: dict[str, str] = field(default_factory=dict)
     throttle: tuple[str, float] | None = None   # a later chunk was refused (429, restart): (reason, seconds); its ids are in neither list
+    unanswered: set[str] = field(default_factory=set)   # ids of the chunks not answered (refused, failed): asked again
+    error: str = ""                                     # why a later chunk failed (not a refusal before processing)
 
 
 class Throttled(Exception):
@@ -465,6 +467,9 @@ class LiveExchange:
                 group = self._outbox.pop(0)
                 groups.append(group)
                 size += len(group[0])
+            groups = [g for g in groups if not g[1].done()]  # a caller that gave up (the exit stopped it) is not sent for:
+            if not groups:                                    # no one would read the answer, nor know what rests
+                continue
             items = [item for signed, _ in groups for item in signed]
             try:
                 results = await self._post(items)
@@ -601,17 +606,25 @@ class LiveExchange:
                 r = await self.client.cancel_orders(order_ids=chunk)
             except RateLimitError as error:
                 result.throttle = ("撤单被限流（429）", float(error.retry_after or 5.0))
+                result.unanswered.update(ids[i:])
                 return result
             except RequestRejectedError as error:
                 if error.restriction == "restarting" or error.status in (425, 503):
                     result.throttle = (f"撤单被拒（{error.status}）：{error}", float(error.retry_after or 2.0))
+                    result.unanswered.update(ids[i:])
                     return result
                 if not result.canceled and not result.not_canceled:
                     raise
-                return result  # the rest is retried by the caller
-            except Exception:
+                result.unanswered.update(ids[i:])  # the rest is retried by the caller
+                result.error = str(error) or type(error).__name__
+                LOG.warning("撤单：后面 %d 张没收到答复（%s），稍后重撤", len(ids) - i, result.error)
+                return result
+            except Exception as error:
                 if not result.canceled and not result.not_canceled:
                     raise
+                result.unanswered.update(ids[i:])
+                result.error = str(error) or type(error).__name__
+                LOG.warning("撤单：后面 %d 张没收到答复（%s），稍后重撤", len(ids) - i, result.error)
                 return result
             result.canceled.update(str(x) for x in r.canceled)
             result.not_canceled.update({str(k): str(v) for k, v in r.not_canceled.items()})

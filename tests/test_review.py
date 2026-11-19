@@ -425,6 +425,86 @@ class RiskTest(unittest.IsolatedAsyncioTestCase):
         await tick(e, 30)
         self.assertEqual(len(quotes(e, phase="active")), 1)  # nothing new while the limit holds
 
+    async def test_a_partly_filled_record_is_withdrawn_on_both_sides(self):
+        """11-19 review: ten shares a side, one up share bought: its nine left could still fill one-sided, and the ten
+        down could overshoot the one share they pair into one-sided the other way. Both are withdrawn."""
+        e, clock, pub, x = make_engine(settings(PREOPEN_MAX_EXPOSURE_USD="0.4"))
+        pub.list_range(["btc"], mk.window_starts(clock.t, e.s)[:1])
+        await tick(e)
+        (q,) = quotes(e)
+        x.fill(q["orders"]["up"]["id"], D("1"))       # $0.49 one-sided: over the $0.40 cap
+        await tick(e, 10)
+        self.assertIn("最坏亏损", e.hold())
+        self.assertEqual(q["phase"], "closing")       # withdrawn whole
+        await tick(e, 6)
+        self.assertEqual(x.book, {})                  # neither side rests
+        x2 = [r for r in x.gone.values()]
+        self.assertTrue(all(r.status in ("CANCELED", "MATCHED") for r in x2))
+        self.assertEqual(e.exposure(), D("0.49"))     # and the worst case did not grow
+
+    async def test_the_side_behind_stays_only_within_the_gap(self):
+        """Three levels; the 40¢ up order filled whole (20 shares one-sided, $8): the 49¢ and 36¢ records still rest up
+        (more one-sided shares) and go; the 40¢ down order (20 left, the gap is 20) stays: it can only pair them."""
+        e, clock, pub, x = make_engine(settings(PREOPEN_LEVELS="40x20,36x40", PREOPEN_MAX_EXPOSURE_USD="5"))
+        pub.list_window("btc", mk.window_starts(clock.t, e.s)[0])
+        await tick(e)
+        recs = {int(q["level"]): q for q in quotes(e, phase="active")}
+        self.assertEqual(set(recs), {0, 1, 2})
+        x.fill(recs[1]["orders"]["up"]["id"], D("20"))
+        await tick(e, 10)
+        await tick(e, 6)       # a whole fill is known once its final record is read...
+        await e.cancel_pass()  # ...and the next cancel pass (every second) withdraws
+        self.assertIn("最坏亏损", e.hold())
+        self.assertEqual([int(q["level"]) for q in quotes(e, phase="active")], [1])
+        self.assertEqual(recs[1]["orders"]["down"]["state"], "open")
+        self.assertEqual(recs[0]["reason"], recs[2]["reason"])
+        self.assertIn("风控", recs[0]["reason"])
+        # the gap shrinks as the down side fills; the kept order never overshoots it
+        x.fill(recs[1]["orders"]["down"]["id"], D("15"))
+        await tick(e, 10)
+        self.assertEqual(recs[1]["phase"], "active")
+        self.assertEqual(e.risk_withdrawals(recs[1]["slug"]), [])
+
+    async def test_a_gap_smaller_than_the_order_left_withdraws_it(self):
+        e, clock, pub, x = make_engine(settings(PREOPEN_LEVELS="40x20", PREOPEN_MAX_EXPOSURE_USD="4"))
+        pub.list_window("btc", mk.window_starts(clock.t, e.s)[0])
+        await tick(e)
+        recs = {int(q["level"]): q for q in quotes(e, phase="active")}
+        x.fill(recs[0]["orders"]["up"]["id"], D("10"))   # 49¢ up whole: a gap of 10
+        await tick(e, 10)
+        await tick(e, 6)
+        await e.cancel_pass()
+        # 49¢ down (10 left) fits the gap; 40¢ (up resting) goes
+        self.assertEqual([int(q["level"]) for q in quotes(e, phase="active")], [0])
+        # 49¢ up 10 and 40¢ down 5: $6.90 paid, 5 pairs pay $5 back, $1.90 at risk (over $1.50)
+        e2, clock2, pub2, x2 = make_engine(settings(PREOPEN_LEVELS="40x20", PREOPEN_MAX_EXPOSURE_USD="1.5"))
+        pub2.list_window("btc", mk.window_starts(clock2.t, e2.s)[0])
+        await tick(e2)
+        recs2 = {int(q["level"]): q for q in quotes(e2, phase="active")}
+        x2.fill(recs2[0]["orders"]["up"]["id"], D("10"))
+        x2.fill(recs2[1]["orders"]["down"]["id"], D("5"))   # 40¢ down 5: the gap is 5 now, 49¢ down has 10 left
+        await tick(e2, 10)
+        await tick(e2, 6)
+        await e2.cancel_pass()
+        self.assertIn("最坏亏损", e2.hold())
+        self.assertEqual(quotes(e2, phase="active"), [])     # 49¢ down could overshoot by 5; 40¢ still rests on both
+
+    async def test_even_fills_withdraw_every_resting_side(self):
+        e, clock, pub, x = make_engine(settings(PREOPEN_MAX_DAILY_LOSS_USD="5"))
+        pub.list_range(["btc"], mk.window_starts(clock.t, e.s)[:1])
+        await tick(e)
+        (q,) = quotes(e)
+        x.fill(q["orders"]["up"]["id"], D("5"))
+        x.fill(q["orders"]["down"]["id"], D("5"))   # a pair: any more on either side is one-sided
+        await tick(e, 10)
+        self.assertEqual(q["phase"], "active")       # no limit reached yet
+        start = T0 - 600
+        e.save({"key": "x#0@0", "slug": mk.slug_of("btc", start), "coin": "btc", "start": start, "level": 0, "attempt": 0,
+                "price": "0.49", "shares": "20", "phase": "settled", "pnl": -9.8, "result": "down", "expiration": start,
+                "condition_id": "0xc", "orders": {s: {"state": "final", "filled": "20" if s == "up" else "0"} for s in mk.SIDES}})
+        await e.cancel_pass()
+        self.assertEqual(q["phase"], "closing")
+
     async def test_the_daily_loss_limit(self):
         e, clock, pub, x = make_engine(settings(PREOPEN_MAX_DAILY_LOSS_USD="5"))
         start = T0 - 600  # a window of today, already settled at a loss

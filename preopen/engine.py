@@ -66,6 +66,8 @@ TRADES_TTL_S = 10         # the account's trades of a market, read once for ever
 UNVERIFIED_AFTER_S = 1800 # past the expiration, the trades unreadable this long: recorded unverified (and said so)
 SEEN_MARGIN_S = 3         # an order accepted this long before a snapshot began should be in it
 SWEEP_EVERY_S = 5         # a hash not answered for (an unknown order, a send judged refused) is cancelled again this often
+WITHDRAW_PAUSE_S = 1.0    # a withdrawal (the exit, a switch to paper) asks again this often (or after the server's wait)
+PLACING_DRAIN_S = 10      # at the exit a placement in flight is given this long for its answer before the workers stop
 BALANCE_EVERY_S = 30      # the balance is read this often...
 BALANCE_STALE_S = 3 * BALANCE_EVERY_S + 15   # ...and no new order is placed on a balance older than this
 SETTLE_AFTER_S = 60       # a window's result is looked for this long after its end
@@ -191,6 +193,8 @@ class Engine:
         self.ghost_at = 0.0
         self.trades: dict[str, tuple[float, dict[str, D]]] = {}   # condition id -> (read at, order id -> shares bought)
         self.blocked = ""                     # the ledger belongs to another account: nothing is taken over or placed
+        self.stopping = ""                    # a withdrawal began (the exit, a switch to paper): nothing new is placed
+        self.cancel_wait_until = 0.0          # a cancel refused before processing (429, a restart): asked again after this
         self._risk: tuple[Any, str] = (None, "")
         self.risk_note = ""
         for q in ledger.rows.values():
@@ -281,6 +285,8 @@ class Engine:
         now = self.now()
         if self.blocked:
             return self.blocked
+        if self.stopping:
+            return f"正在撤单停止（{self.stopping}）"
         if self.paused:
             return "已暂停（/resume 恢复）"
         if risk := self.risk_hold():
@@ -353,8 +359,8 @@ class Engine:
         return text
 
     def risk_pass(self) -> int:
-        """A risk limit reached: the resting quotes with nothing filled are withdrawn (each could only add a one-sided
-        position); a window with a fill keeps its other side resting, which can only even it out. Returns how many."""
+        """A risk limit reached: no resting order may add to the worst case. The records risk_withdrawals names are
+        withdrawn (both sides: an order cannot be made smaller). Returns how many."""
         why = self.risk_hold()
         if why != self.risk_note:
             if why:
@@ -365,11 +371,39 @@ class Engine:
         if not why:
             return 0
         n = 0
-        for q in self.open_quotes():
-            if q["phase"] == "active" and not any(dnum(o.get("filled")) > 0 for o in q["orders"].values()):
+        for slug in {q["slug"] for q in self.open_quotes() if q["phase"] == "active"}:
+            for q in self.risk_withdrawals(slug):
                 self.close(q, "风控：" + why.split("：")[0], free=True)
                 n += 1
         return n
+
+    def risk_withdrawals(self, slug: str) -> list[dict]:
+        """The active records of a window that could add to its worst case, its levels together (the fills of records
+        already closed count too). Nothing filled, or both sides alike: every one (any fill would be one-sided). One
+        side ahead: a record still resting on that side (its remainder could only add one-sided shares); and on the
+        side behind, nearest level first, a resting order once the remainders kept would exceed the gap: each share
+        bought within it pairs one already bought, one more would be one-sided the other way. 11-19 review: a record
+        with a fill used to keep both sides, its filled side's remainder free to fill on."""
+        records = [q for q in self.quotes_of(slug) if q["phase"] != "settled"]
+        got = {side: sum((dnum(q["orders"][side].get("filled")) for q in records), D(0)) for side in mk.SIDES}
+        active = sorted((q for q in records if q["phase"] == "active"), key=lambda q: (int(q["level"]), int(q["attempt"])))
+        if got["up"] == got["down"]:
+            return active
+        ahead = "up" if got["up"] > got["down"] else "down"
+        behind = "down" if ahead == "up" else "up"
+        room = abs(got["up"] - got["down"])
+        out = []
+        for q in active:
+            mine, other = q["orders"][ahead], q["orders"][behind]
+            if mine["state"] in MAY_REST:
+                out.append(q)
+            elif other["state"] in MAY_REST:
+                left = dnum(q["shares"]) - dnum(other.get("filled"))
+                if left <= room:
+                    room -= left
+                else:
+                    out.append(q)
+        return out
 
     def stale_after(self) -> float:
         return 3 * max(self.s.snapshot_s, self.snapshot_took) + STALE_EXTRA_S
@@ -428,6 +462,11 @@ class Engine:
             self.cooldown_until, self.cooldown_reason = until, reason
         if fresh:
             self.problem(f"接口冷却 {seconds:.0f} 秒：{reason}", key="cooldown")
+
+    def cancel_throttled(self, reason: str, seconds: float) -> None:
+        """A cancel refused before processing (429, a restart): the cooldown, and a withdrawal asks again only after it."""
+        self.set_cooldown(reason, seconds)
+        self.cancel_wait_until = max(self.cancel_wait_until, self.now() + max(0.0, float(seconds)))
 
     def reserved(self) -> D:
         """The bot's own resting money: every order that may rest, at its price, for what is not filled."""
@@ -1003,7 +1042,7 @@ class Engine:
             try:
                 r = await self.x.cancel_market(cid)
             except Throttled as t:
-                self.set_cooldown(t.reason, t.seconds)
+                self.cancel_throttled(t.reason, t.seconds)
                 continue
             except Exception as error:
                 self.problem(f"按市场撤单失败 {q['slug']}：{error}", key="sweep-error")
@@ -1031,13 +1070,15 @@ class Engine:
         try:
             r = await self.x.cancel(ids)
         except Throttled as t:
-            self.set_cooldown(t.reason, t.seconds)
+            self.cancel_throttled(t.reason, t.seconds)
             return
         except Exception as error:
             LOG.warning("按哈希撤被拒的单失败：%s", error)
             return
-        for h in ids:
-            if h in r.canceled or h in r.not_canceled or r.throttle is None:
+        if r.throttle:
+            self.cancel_throttled(*r.throttle)
+        for h in ids:  # answered (cancelled, not cancelled, or left out of an answered chunk: the CLOB has no such
+            if h not in r.unanswered:  # order); a chunk refused or failed is asked again (11-19 review)
                 self.ghosts.pop(h, None)
         if r.canceled:
             self.problem(f"有 {len(r.canceled)} 张判为没发出的单其实挂上了，已按哈希撤掉", key="ghost")
@@ -1049,7 +1090,7 @@ class Engine:
         try:
             r = await self.x.cancel(ids)
         except Throttled as t:
-            self.set_cooldown(t.reason, t.seconds)
+            self.cancel_throttled(t.reason, t.seconds)
             self.retry_later(due, now, t.seconds)
             return
         except Exception as error:
@@ -1057,11 +1098,13 @@ class Engine:
             self.retry_later(due, now)
             return
         if r.throttle:
-            self.set_cooldown(*r.throttle)
+            self.cancel_throttled(*r.throttle)
         touched = self.mark_cancelled(r)
         missing = [(q, side) for (q, side), oid in zip(due, ids) if oid not in r.canceled and oid not in r.not_canceled]
         if missing:
             self.retry_later(missing, now, r.throttle[1] if r.throttle else 0.0)
+            if r.error:
+                self.problem(f"撤单只完成一部分：{len(missing)} 张没收到答复（{r.error[:120]}），稍后重撤", key="cancel-error")
         for q, side in due:
             if q["key"] not in touched:
                 self.save(q)
@@ -1096,7 +1139,7 @@ class Engine:
                     cancel_at = q["start"] - self.s.cancel_s
                     wait = SWEEP_EVERY_S if late else min(RETRY_MAX_S, SWEEP_EVERY_S * 2 ** (tries - 1))
                     o.update(hash_tries=tries, retry=now + wait if late else min(now + wait, max(cancel_at, now + SWEEP_EVERY_S)),
-                             lookup_at=0, cancel_note=r.not_canceled.get(oid, ""))
+                             lookup_at=0, cancel_note=r.not_canceled.get(oid, ""), hash_answered=now)
             else:
                 continue
             touched[q["key"]] = q
@@ -1631,21 +1674,84 @@ class Engine:
         self.sweep()
 
     async def withdraw_all(self, reason: str, deadline_s: float = 60.0) -> int:
-        """Close every active record and keep cancelling until nothing may rest (or the deadline)."""
+        """Stop placing, close every active record and keep cancelling until the CLOB has answered for everything that
+        may rest (withdraw_waits), or the deadline: a cancel that failed or was refused is asked again, after the wait
+        the server asked for. Returns how many orders may still rest."""
         if self.blocked:
             return 0
+        self.stopping = self.stopping or reason
         self.close_all(reason)
+        begun = self.now()
         end = time.monotonic() + deadline_s
-        while time.monotonic() < end:
+        while True:
             for q in self.open_quotes():
                 for o in q["orders"].values():
                     o.pop("retry", None)
-            await self.cancel_pass(sweep_all=True)
-            left = sum(1 for q in self.open_quotes() for o in q["orders"].values() if o["state"] in ("open",))
+            try:
+                await self.cancel_pass(sweep_all=True)
+            except Exception as error:  # one failed pass does not end the withdrawal
+                LOG.warning("撤单出错（%s），继续撤", error)
+            left = time.monotonic() < end and self.withdraw_waits(begun)
             if not left:
                 break
-            await asyncio.sleep(1)
+            pause = max(WITHDRAW_PAUSE_S, min(self.cancel_wait_until - self.now(), 10.0))
+            await asyncio.sleep(max(0.0, min(pause, end - time.monotonic())))
         return sum(1 for q in self.open_quotes() for o in q["orders"].values() if o["state"] in MAY_REST)
+
+    def withdraw_waits(self, begun: float) -> int:
+        """The orders a withdrawal begun at `begun` still waits for: an open one (its cancel not answered); one whose
+        placement is in flight (its answer says what rests); one of unknown state the CLOB has not answered for since
+        `begun` (by its hash; with PREOPEN_KEY_EXCLUSIVE=on, without a usable hash, until its market is swept). An
+        order past its expiration rests nowhere. 11-19 review: only open orders were waited for, so an unknown one
+        whose first cancel failed or was refused was not asked again."""
+        now = self.now()
+        n = 0
+        for q in self.open_quotes():
+            live = now < float(q["expiration"]) + EXPIRED_MARGIN_S
+            for o in q["orders"].values():
+                if o["state"] == "open":
+                    n += 1
+                elif o["state"] in UNSURE and live:
+                    if q["slug"] in self.placing:
+                        n += 1
+                    elif o.get("hash") and self.id_is_hash is not False:
+                        n += float(o.get("hash_answered") or 0) < begun
+                    elif self.s.key_exclusive and now < q["start"]:
+                        n += not q.get("swept")
+        return n
+
+    async def wind_down(self, tasks: list[asyncio.Task]) -> int:
+        """The exit, in order: nothing new is placed (hold() says stopping); the loops stop; a placement in flight gets
+        its answer before the workers stop (cut off mid-send, its orders could rest with no answer read); then, with
+        PREOPEN_CANCEL_ON_EXIT=on, everything is withdrawn. Returns how many orders may still rest."""
+        self.stopping = self.stopping or "程序退出"
+        for h in self.timers.values():
+            h.cancel()
+        workers = [t for t in tasks if t.get_name().startswith("worker")]
+        loops = [t for t in tasks if t not in workers]
+        for t in loops:
+            t.cancel()
+        await asyncio.gather(*loops, return_exceptions=True)
+        await self.let_placements_finish(PLACING_DRAIN_S)
+        for t in workers:
+            t.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        for h in self.timers.values():
+            h.cancel()
+        resting = sum(1 for q in self.open_quotes() for o in q["orders"].values() if o["state"] in MAY_REST)
+        if self.s.cancel_on_exit:
+            resting = await self.withdraw_all("程序退出", deadline_s=30)
+            LOG.info("退出撤单完成，可能还挂着 %d 张", resting)
+        return resting
+
+    async def let_placements_finish(self, seconds: float) -> None:
+        """The exit: a placement in flight gets its answer (what rests, under which id) before the workers stop; cut off
+        mid-send, its orders could rest with no answer read. Nothing new starts meanwhile (hold() says stopping)."""
+        end = time.monotonic() + seconds
+        while self.placing and time.monotonic() < end:
+            await asyncio.sleep(0.05)
+        if self.placing:
+            LOG.warning("退出：%d 场的下单还没回应，不再等", len(self.placing))
 
     # ------------------------------------------------------------------ loops
     async def sleep(self, seconds: float) -> None:
@@ -1818,15 +1924,7 @@ class Engine:
         try:
             await self.stop.wait()
         finally:
-            for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            for h in self.timers.values():
-                h.cancel()
-            resting = sum(1 for q in self.open_quotes() for o in q["orders"].values() if o["state"] in MAY_REST)
-            if self.s.cancel_on_exit:
-                resting = await self.withdraw_all("程序退出", deadline_s=30)
-                LOG.info("退出撤单完成，可能还挂着 %d 张", resting)
+            resting = await self.wind_down(tasks)
             self.notify(f"预挂机器人已停止：{resting} 张挂单留在簿上（各自在开场前 {self.s.expiry_s} 秒到期，重启后接管）"
                         if resting and not self.s.cancel_on_exit else f"预挂机器人已停止" + (f"，还可能挂着 {resting} 张" if resting else ""))
 
@@ -1942,22 +2040,25 @@ class Engine:
                 "closing": sum(1 for q in self.open_quotes() if q["phase"] == "closing")}
 
     def today(self) -> dict[str, Any]:
+        """Today's (Beijing time) windows with a fill, by window (its levels and attempts together): how many, how many
+        bought both sides, how many settled, and the settled P&L."""
         day = mk.dt.datetime.fromtimestamp(self.now(), mk.BEIJING).date()
-        fills = pnl = 0
-        both = 0
-        settled = 0
+        windows: dict[str, dict[str, Any]] = {}
+        pnl = 0.0
         for q in self.ledger.rows.values():
             if mk.dt.datetime.fromtimestamp(q["start"], mk.BEIJING).date() != day:
                 continue
             f = {s: dnum(o.get("filled")) for s, o in q["orders"].items()}
             if not any(f.values()):
                 continue  # withdrawn with nothing filled: not a trade
-            fills += 1
-            both += 1 if all(f.values()) else 0
+            w = windows.setdefault(q["slug"], {"sides": set(), "settled": True})
+            w["sides"] |= {s for s, v in f.items() if v > 0}
             if q.get("phase") == "settled":
-                settled += 1
                 pnl += float(q.get("pnl") or 0)
-        return {"fills": fills, "both": both, "pnl": pnl, "settled": settled}
+            else:
+                w["settled"] = False
+        return {"fills": len(windows), "both": sum(1 for w in windows.values() if len(w["sides"]) == len(mk.SIDES)),
+                "pnl": pnl, "settled": sum(1 for w in windows.values() if w["settled"])}
 
     def all_records(self) -> list[dict]:
         """The working records and the archived ones (the review reads both; the archive is read again only when it grew)."""

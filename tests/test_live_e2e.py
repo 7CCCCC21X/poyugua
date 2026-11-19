@@ -67,6 +67,8 @@ class FakeClob:
         self.market_cancels: list[str] = []
         self.cancel_alls = 0
         self.salt = 0
+        self.cancel_script: list[str] = []   # what the next DELETE /orders do: "ok", "429" (refused before processing),
+        self.cancel_calls: list[list[str]] = []   # "error" (the connection dropped); every call's ids
 
     def know(self, m: dict) -> dict:
         for t in json.loads(m["clobTokenIds"]):
@@ -138,6 +140,12 @@ class FakeClob:
         return Pages(o for o in self.orders.values() if o.status == "LIVE")
 
     async def cancel_orders(self, *, order_ids):
+        self.cancel_calls.append(list(order_ids))
+        step = self.cancel_script.pop(0) if self.cancel_script else "ok"
+        if step == "429":
+            raise RateLimitError("Request to https://clob.polymarket.com/orders was rate limited", retry_after=0.05)
+        if step == "error":
+            raise RuntimeError("connection reset by peer")
         canceled, refused = [], {}
         for i in order_ids:
             o = self.orders.get(i)
@@ -501,6 +509,157 @@ class SenderTest(unittest.IsolatedAsyncioTestCase):
         await x.place(groups[0])                                   # accepted: the next timeout starts again at 5 s
         fake.answers = ["timed_out"]
         self.assertEqual((await x.place(groups[1]))[0].wait, 5.0)
+        await x.close()
+
+
+class CancelAnswerTest(unittest.IsolatedAsyncioTestCase):
+    """11-19 review: a cancel sent in chunks, an earlier one answered and a later one failing with an ordinary error:
+    the ids of the failed chunk (and those after it) got no answer and must be asked again."""
+
+    async def test_a_later_chunk_that_fails_keeps_its_hashes_to_be_asked_again(self):
+        clock = Clock()
+        fake, pub = FakeClob(clock), FakePublic(clock)
+        s = settings()
+        x = adapter(fake, s)
+        x.cancels = Bucket(1000, 2)                       # chunks of two
+        e = make_engine(s, clock=clock, exchange=x, public=pub)[0]
+        hashes = ["0x" + f"{i:064x}" for i in range(1, 6)]   # five sends judged refused before processing
+        for h in hashes:
+            e.ghosts[h] = T0 + 1800
+        fake.cancel_script = ["ok", "error"]
+        await e.ghost_pass(clock.t)
+        self.assertEqual(set(e.ghosts), set(hashes[2:]))    # answered: off the list; not answered: kept
+        clock.advance(6)
+        await e.ghost_pass(clock.t)
+        self.assertEqual(e.ghosts, {})
+        self.assertEqual(fake.cancel_calls[-2:], [hashes[2:4], hashes[4:]])
+        fake.cancel_script = ["ok", "error"]
+        r = await x.cancel(list(hashes))
+        self.assertEqual((set(r.not_canceled), r.unanswered), (set(hashes[:2]), set(hashes[2:])))
+        self.assertIn("connection reset", r.error)
+
+    async def test_open_orders_of_a_failed_chunk_are_cancelled_again_and_said(self):
+        clock = Clock()
+        fake, pub = FakeClob(clock), FakePublic(clock)
+        s = settings(PREOPEN_CANCEL_SECONDS="60")
+        x = adapter(fake, s)
+        x.cancels = Bucket(1000, 2)
+        e = make_engine(s, clock=clock, exchange=x, public=pub)[0]
+        start = T0 + 1800
+        for coin in ("btc", "eth"):
+            fake.know(pub.list_window(coin, start))
+        await tick(e)
+        self.assertEqual(len(fake.live()), 4)
+        clock.t = start - 60                              # the cancel time: four orders, two chunks
+        fake.cancel_script = ["ok", "error"]
+        await tick(e)
+        self.assertEqual(len(fake.live()), 2)
+        self.assertTrue(any("撤单只完成一部分" in text for _, text in e.errors))
+        await tick(e, 2)
+        self.assertEqual(fake.live(), [])
+
+
+class ExitTest(unittest.IsolatedAsyncioTestCase):
+    """11-19 review: at the exit only open orders were waited for. An order of unknown state (its answer lost) whose
+    first cancel failed or was refused was not asked again, and could rest until it expired."""
+
+    def setUp(self):
+        import preopen.engine as engine_module
+        self.engine_module = engine_module
+        self.pause = getattr(engine_module, "WITHDRAW_PAUSE_S", 1.0)
+        engine_module.WITHDRAW_PAUSE_S = 0.01
+
+    def tearDown(self):
+        self.engine_module.WITHDRAW_PAUSE_S = self.pause
+
+    async def test_an_unknown_order_is_asked_again_until_the_clob_answers_for_it(self):
+        clock = Clock()
+        fake, pub = FakeClob(clock), FakePublic(clock)
+        fake.know(pub.list_window("btc", T0 + 1800))
+        s = settings(PREOPEN_CANCEL_ON_EXIT="on")
+        e = make_engine(s, clock=clock, exchange=adapter(fake, s), public=pub)[0]
+        await e.account_once()
+        await e.discover()
+        fake.answers = ["503"]                        # the CLOB took both orders; the answer is a bare 503
+        await drain(e)
+        (q,) = quotes(e)
+        self.assertEqual({o["state"] for o in q["orders"].values()}, {"unknown"})
+        self.assertEqual(len(fake.live()), 2)
+        fake.cancel_script = ["429", "error"]         # the exit's first cancel refused, the second one fails
+        left = await e.withdraw_all("程序退出", deadline_s=5)
+        self.assertEqual(left, 0)
+        self.assertEqual(fake.live(), [])
+        self.assertEqual(len(fake.cancel_calls), 3)
+        self.assertIn("正在撤单停止", e.hold())       # nothing new is placed meanwhile
+
+    async def test_an_order_the_clob_says_it_has_not_is_not_waited_for(self):
+        clock = Clock()
+        fake, pub = FakeClob(clock), FakePublic(clock)
+        fake.know(pub.list_window("btc", T0 + 1800))
+        s = settings(PREOPEN_CANCEL_ON_EXIT="on")
+        e = make_engine(s, clock=clock, exchange=adapter(fake, s), public=pub)[0]
+        await e.account_once()
+        await e.discover()
+        fake.answers = ["lost"]                       # a read timeout on a POST the CLOB never processed
+        await drain(e)
+        (q,) = quotes(e)
+        self.assertEqual({o["state"] for o in q["orders"].values()}, {"unknown"})
+        began = asyncio.get_running_loop().time()
+        self.assertEqual(await e.withdraw_all("程序退出", deadline_s=5), 2)   # "not found": may rest for all we know...
+        self.assertLess(asyncio.get_running_loop().time() - began, 1.0)       # ...but nothing more to ask: no waiting
+        self.assertEqual(len(fake.cancel_calls), 1)
+
+    async def test_a_placement_in_flight_at_the_exit_is_answered_then_cancelled(self):
+        """The exit used to cancel the workers at once: a POST in flight was cut off (its orders then rested with no
+        answer read), and orders waiting for the sender went out after the cancels."""
+        clock = Clock()
+        fake, pub = FakeClob(clock), FakePublic(clock)
+        start = T0 + 1800
+        fake.know(pub.list_window("btc", start))
+        s = settings(PREOPEN_CANCEL_ON_EXIT="on")
+        e = make_engine(s, clock=clock, exchange=adapter(fake, s), public=pub)[0]
+        await e.account_once()
+        await e.discover()
+        gate, sent = asyncio.Event(), asyncio.Event()
+        real = fake.post_orders
+
+        async def slow(orders):
+            sent.set()
+            await gate.wait()                         # the CLOB takes the orders when the request gets there
+            return await real(orders)
+        fake.post_orders = slow
+        *_, slug = e.queue.get_nowait()
+        worker = asyncio.create_task(e.process(slug), name="worker0")
+        await asyncio.wait_for(sent.wait(), 2)
+        loop = asyncio.get_running_loop()
+        loop.call_later(0.2, gate.set)
+        left = await asyncio.wait_for(e.wind_down([worker]), 10)
+        self.assertEqual(left, 0)
+        self.assertEqual(fake.live(), [])
+        (q,) = quotes(e)
+        self.assertEqual({o["state"] for o in q["orders"].values()}, {"gone"})   # answered, then cancelled by id
+
+    async def test_orders_whose_caller_gave_up_are_not_sent(self):
+        clock = Clock()
+        fake, pub = FakeClob(clock), FakePublic(clock)
+        x = adapter(fake, settings())
+        groups = SenderTest().specs(fake, pub, clock, 2)
+        gate = asyncio.Event()
+        real = fake.post_orders
+
+        async def slow(orders):
+            await gate.wait()
+            return await real(orders)
+        fake.post_orders = slow
+        first = asyncio.create_task(x.place(groups[0]))
+        await asyncio.sleep(0.01)                     # the first POST in flight
+        second = asyncio.create_task(x.place(groups[1]))
+        await asyncio.sleep(0.01)                     # the second waits for the sender
+        second.cancel()                               # its caller stopped (the exit)
+        gate.set()
+        await first
+        await asyncio.sleep(0.05)
+        self.assertEqual(len(fake.orders), 2)         # the first window's two orders only
         await x.close()
 
 
