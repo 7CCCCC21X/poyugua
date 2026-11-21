@@ -34,13 +34,14 @@ BUTTONS = {  # keyboard button text -> command
 }
 COMMANDS = [("status", "状态"), ("check", "体检"), ("probe", "只读探测接下来的场次"), ("web", "打开网页控制台"),
             ("pause", "暂停并撤掉全部挂单"), ("resume", "恢复挂单"), ("review", "复盘：/review 今天、/review 昨天、/review 7（最近 7 天）、/review 11-18 11-20、/review btc"),
-            ("export", "导出记录（CSV 文件）：/export 昨天、/export 7、/export 11-18 11-20"),
+            ("export", "导出复盘 Excel（点按钮选时间）：/export 昨天、/export 7、/export 11-18 11-20；/export csv = CSV 文件"),
             ("rejects", "拒单：真实原因、证据和现场检测（/rejects 1 = 最近 1 小时）"), ("help", "说明和按钮")]
 CONFIRM_PAUSE = "pause!"  # callback data of the inline 确认 button: the handler is asked "/pause!"
+REPORT_BUTTONS = ("set_", "chk_", "exp_", "rev_")   # buttons under a report: the report stays, the answer comes after it
 CANCEL = "cancel"
 
 HELP = ("按钮：📊 状态、🩺 体检、🧾 拒单、📈 复盘、📤 导出、🔎 探测、🌐 网页、⏸ 暂停（会先确认）、▶️ 恢复；左下角菜单按钮打开网页控制台。\n"
-        "命令：/status 状态 /check 体检 /rejects [小时] 拒单原因 /probe [小时] 只读探测 /review [时间] [币种] 复盘 /export [时间] 导出 CSV /web 网页 "
+        "命令：/status 状态 /check 体检 /rejects [小时] 拒单原因 /probe [小时] 只读探测 /review [时间] [币种] 复盘 /export [时间] 导出复盘 Excel（/export csv = CSV 文件） /web 网页 "
         "/pause 暂停并撤单 /resume 恢复 /help 本说明\n"
         "时间可以写：今天、昨天、7（最近 7 天）、11-20（那一天）、11-18 11-20（这几天）")
 
@@ -174,6 +175,7 @@ class Telegram:
         mine = self.allowed(msg.get("chat"), cb.get("from"))
         data = str(cb.get("data") or "")
         result = "只接受管理员的操作"
+        markup, files = None, []
         if mine:
             if data == CANCEL:
                 result = "已取消"
@@ -181,16 +183,21 @@ class Telegram:
                 try:
                     reply = await handle("/" + data, [])
                     result = reply.text if isinstance(reply, Reply) else str(reply)
+                    if isinstance(reply, Reply):
+                        markup, files = reply.markup, reply.files
                 except Exception as error:
                     LOG.exception("按钮 %s 出错", data)
                     result = f"操作出错：{error}"
         try:
             await self._post("answerCallbackQuery", callback_query_id=cb.get("id"), text=result[:190])
-            if mine and msg.get("message_id") and data.startswith(("set_", "chk_")):
-                # a button under a report (the review): the report stays, its button goes, the result comes as a message
+            if mine and msg.get("message_id") and data.startswith(REPORT_BUTTONS):
+                # a button under a report (the review, the export's choice): the report stays, its buttons go, the
+                # result comes as a message of its own (with its own buttons and files)
                 await self._post("editMessageReplyMarkup", chat_id=self.chat(), message_id=msg["message_id"],
                                  reply_markup={"inline_keyboard": []})
-                self.send(result)
+                self.send(result, markup=markup)
+                for name, blob in files:
+                    self.send_file(name, blob)
             elif mine and msg.get("message_id"):
                 await self._post("editMessageText", chat_id=self.chat(), message_id=msg["message_id"], text=result[:MAX_LEN])
         except Exception as error:

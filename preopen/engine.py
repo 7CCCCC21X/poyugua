@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from decimal import Decimal as D
 from typing import Any, Callable
 
+from . import config
 from . import markets as mk
 from . import refusals
 from .config import GTD_THRESHOLD_S, Settings
@@ -75,6 +76,7 @@ RESULT_RETRY_S = 30
 REDEEM_RETRY_S = 600
 FILL_LOG_TRIES = 3        # a window's trades read for the fills' exact times this many passes, then settled without them
 REDEEM_TRIES = 6
+SETTINGS_KEPT = 200       # settings changes kept (when, how, what from and to), for the review's 参数 sheet
 STALE_EXTRA_S = 15
 BALANCE_HOLD_S = 60       # the CLOB refused or cancelled an order for the balance: no new order this long
 RECONCILE_BUDGET_S = 20   # a reconcile pass is cut off after this (its reads are retried next pass)
@@ -197,6 +199,12 @@ class Engine:
         self.cancel_wait_until = 0.0          # a cancel refused before processing (429, a restart): asked again after this
         self._risk: tuple[Any, str] = (None, "")
         self.risk_note = ""
+        self.settings_log: collections.deque = collections.deque(maxlen=SETTINGS_KEPT)
+        try:
+            self.settings_log.extend(json.loads(ledger.get("settings_log") or "[]"))
+        except ValueError:
+            pass
+        self.note_settings(settings, "重启后（Railway 变量或网页设置）")
         for q in ledger.rows.values():
             self._index(q)
 
@@ -1601,9 +1609,26 @@ class Engine:
             self.save(q)
         return kept, changed
 
-    def apply_settings(self, new: Settings) -> int:
+    def note_settings(self, new: Settings, via: str) -> None:
+        """A settings change kept with when and how it came (the page, Telegram's button, a restart on new variables):
+        the review sets results before and after it side by side. Only the values the page shows (no key, no token)."""
+        values = config.current_values(new)
+        try:
+            before = json.loads(self.ledger.get("settings_now") or "null")
+        except ValueError:
+            before = None
+        if isinstance(before, dict):
+            changes = [[k, str(before.get(k, "")), v] for k, v in values.items() if str(before.get(k, "")) != v]
+            if changes:
+                self.settings_log.append({"at": round(self.now(), 1), "via": via, "changes": changes})
+                self.ledger.put("settings_log", json.dumps(list(self.settings_log), ensure_ascii=False))
+        if before != values:
+            self.ledger.put("settings_now", json.dumps(values, ensure_ascii=False))
+
+    def apply_settings(self, new: Settings, via: str = "网页") -> int:
         """New settings in force at once (the web console): a resting record that no longer fits them is withdrawn and
         quoted again under the new ones; one that fits keeps its place in the queue. Returns the withdrawn count."""
+        self.note_settings(new, via)
         self.s = new
         if hasattr(self.x, "settings"):
             self.x.settings = new

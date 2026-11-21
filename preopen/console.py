@@ -13,7 +13,7 @@ import logging
 from pathlib import Path
 from typing import Any, Callable
 
-from . import config, journal
+from . import config, export, journal
 from .config import ConfigError
 
 LOG = logging.getLogger(__name__)
@@ -68,6 +68,15 @@ class Console:
         out["market_more"] = max(0, len(out["by_market"]) - journal.MARKETS_SHOWN)
         out["by_market"] = out["by_market"][:journal.MARKETS_SHOWN]
         return out
+
+    def xlsx(self, query: dict[str, str] | None = None) -> tuple[str, bytes]:
+        """The review as one Excel file, for the windows in the filter (a bad custom filter: everything)."""
+        try:
+            span, info = self.span(query)
+        except ValueError:
+            span, info = None, {"label": "全部"}
+        name, data, _ = export.from_engine(self.engine, span, info.get("label") or "全部")
+        return name, data
 
     def csv(self, kind: str, query: dict[str, str] | None = None) -> tuple[str, str]:
         """A CSV of the windows in the filter (a bad custom filter: everything)."""
@@ -149,7 +158,7 @@ class Console:
         diff = [f"{k} {before[k] or '（空）'} → {after[k] or '（空）'}" for k in after if before.get(k) != after.get(k)]
         config.save_overrides(self.path, trial)
         self.overrides = trial
-        withdrawn = self.engine.apply_settings(new)
+        withdrawn = self.engine.apply_settings(new, via=f"Telegram：{what}")
         text = f"已保存：{what}" + (f"（{'；'.join(diff)}）" if diff else "（数值没变）")
         if withdrawn:
             text += f"；{withdrawn} 场的挂单按新的到期时间撤掉重挂"

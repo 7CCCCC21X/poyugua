@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 
-from preopen import config, journal, refusals, region
+from preopen import config, export as xls, journal, refusals, region
 from preopen import markets as mk
 from preopen.engine import Engine
 from preopen.exchange import LiveExchange, PaperExchange
@@ -77,7 +77,16 @@ def acquire_lock(ledger_path: str):
 
 REVIEW_USAGE = ("用法：/review（全部）、/review 今天、/review 昨天、/review 7（最近 7 天）、/review 11-20（那一天）、"
                 "/review 11-18 11-20（这几天）、/review btc、/review btc eth 3")
-EXPORT_USAGE = "用法：/export（全部）、/export 今天、/export 昨天、/export 7（最近 7 天）、/export 11-20、/export 11-18 11-20"
+EXPORT_USAGE = ("用法：/export（点按钮选时间）、/export 今天、/export 昨天、/export 7（最近 7 天）、/export 11-20、/export 11-18 11-20、"
+                "/export 全部；/export csv 7 = 旧的 CSV 文件")
+RANGE_BUTTONS = (("今天", "today"), ("昨天", "yesterday"), ("近 7 天", "7"), ("近 30 天", "30"), ("全部", "all"))
+RANGE_WORDS = {"today": "今天", "yesterday": "昨天", "all": "全部"}   # a button's callback -> the time word it stands for
+
+
+def range_buttons(prefix: str) -> list[list[dict]]:
+    """今天 / 昨天 / 近 7 天 / 近 30 天 / 全部 as inline buttons whose callback is prefix + the range."""
+    keys = [{"text": text, "callback_data": f"{prefix}{key}"} for text, key in RANGE_BUTTONS]
+    return [keys[:3], keys[3:]]
 
 
 def review(engine: Engine, args: list[str]) -> Reply | str:
@@ -101,9 +110,10 @@ def review(engine: Engine, args: list[str]) -> Reply | str:
     scope = "、".join(x for x in (" ".join(mk.name_of(c) for c in sorted(coins)), label) if x)
     text = journal.review_text(records, now, engine.s.cancel_s, scope, float(engine.s.max_daily_loss_usd))
     best = journal.cancel_review(records, now, engine.s.cancel_s)["best"]
+    rows = range_buttons("rev_")   # the same review for another time, a tap away
     if best and best != engine.s.cancel_s and not coins:  # one coin's sample is no reason to change them all
-        return Reply(text, {"inline_keyboard": [[{"text": f"改成开场前 {journal.secs_label(best)}撤单", "callback_data": f"set_cancel_{best}"}]]})
-    return text
+        rows = [[{"text": f"改成开场前 {journal.secs_label(best)}撤单", "callback_data": f"set_cancel_{best}"}]] + rows
+    return Reply(text, {"inline_keyboard": rows})
 
 
 async def set_cancel(engine: Engine, console: Console | None, seconds: int) -> str:
@@ -129,15 +139,25 @@ async def set_cancel(engine: Engine, console: Console | None, seconds: int) -> s
 
 
 def export(engine: Engine, args: list[str]) -> Reply:
-    """/export [time]: the records as CSV files (every market's P&L, by day, the fills, all quotes, the cancel-time
-    review), for a review in Excel or anywhere else. The time as /review takes it; without one, everything."""
+    """/export: buttons to choose the time; /export <time>: the review as one Excel file (every table of the review,
+    the refusals, the settings and their changes, a first sheet saying what each is for); /export csv [time]: the
+    tables as CSV files, as before. The time as /review takes it."""
+    if not args:
+        return Reply("📤 导出哪段时间的复盘数据？一个 Excel 文件，里面 12 张表：总览、每日、市场盈亏、档位、成交时刻、撤单时间、"
+                     "币种、时段、成交明细、全部报价、拒单、参数（第一张表说明每张表看什么）。",
+                     {"inline_keyboard": range_buttons("exp_")})
     now = engine.now()
+    csv_files = args[0].lower() == "csv"
     try:
-        span, label, rest = journal.span_args(args, now)
+        span, label, rest = journal.span_args(args[1:] if csv_files else args, now)
     except ValueError as error:
         return Reply(f"{error}。{EXPORT_USAGE}")
     if rest:
         return Reply(f"看不懂：{' '.join(rest)}。{EXPORT_USAGE}")
+    if not csv_files:
+        name, data, t = xls.from_engine(engine, span, label or "全部")
+        return Reply(f"📤 {label or '全部'}的复盘数据：{t['filled']} 场有成交，成交额 ${t['volume']:.2f}，已结算盈亏 {t['pnl']:+.2f} 美元。"
+                     "Excel 文件马上发过来，第一张「总览」写着每张表看什么。", files=[(name, data)])
     records = journal.within(engine.all_records(), span)
     stamp = time.strftime("%Y%m%d-%H%M", time.gmtime(now + 8 * 3600))
     review = journal.journal(records, now, engine.s.cancel_s)
@@ -183,6 +203,10 @@ def commander(settings: config.Settings, engine: Engine, pub: PublicApi, console
             return await set_cancel(engine, console, seconds)
         if cmd == "/export":
             return export(engine, args)
+        if cmd.startswith(("/exp_", "/rev_")):  # a time button under 📤 导出 or 📈 复盘
+            key = cmd[5:]
+            words = [RANGE_WORDS.get(key, key)]
+            return export(engine, words) if cmd.startswith("/exp_") else review(engine, words)
         if cmd == "/probe":
             try:
                 hours = float(args[0]) if args else 1.0

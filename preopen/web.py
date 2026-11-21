@@ -69,7 +69,7 @@ def check_init_data(init_data: str, bot_token: str, admins: Any, now: float | No
 
 class WebServer:
     """`app` is the console back end (console.Console): report(), settings(), orders(tab, coin, limit), review(query),
-    csv(kind, query) (query: the review's time filter), and the coroutines change(body) and action(body)."""
+    csv(kind, query), xlsx(query) (query: the review's time filter), and the coroutines change(body) and action(body)."""
 
     def __init__(self, port: int, app: Any, web_key: str = "", bot_token: str = "", admin_id: str = "", host: str = "0.0.0.0"):
         self.port, self.host = port, host
@@ -155,6 +155,11 @@ class WebServer:
             if path == "/api/journal.csv":
                 name, text = self.app.csv(query.get("kind", "detail"), query)
                 return 200, "text/csv; charset=utf-8", text.encode("utf-8"), [("Content-Disposition", f'attachment; filename="{name}"')]
+            if path == "/api/journal.xlsx":
+                name, data = self.app.xlsx(query)
+                quoted = urllib.parse.quote(name)
+                return 200, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", data, [
+                    ("Content-Disposition", f"attachment; filename=\"review.xlsx\"; filename*=UTF-8''{quoted}")]
             return 404, "text/plain", b"not found", []
         if method != "POST":
             return 405, "text/plain", b"", []
@@ -332,7 +337,7 @@ select { font:inherit; padding:5px 8px; border-radius:8px; border:1px solid var(
         <p class="muted small" style="margin:6px 0 0">按开场时间（北京时间）筛选，下面所有内容和导出的 CSV 都只算这段时间的场次；上面三张卡片不受影响。</p>
       </section>
       <div class="cards" id="jRange"></div>
-      <div class="ops"><button class="secondary" id="csvMarkets">导出市场盈亏 CSV</button><button class="secondary" id="csvDaily">导出每日汇总 CSV</button><button class="secondary" id="csvDetail">导出成交明细 CSV</button><button class="secondary" id="csvQuotes">导出全部报价 CSV</button><button class="secondary" id="csvCancel">导出撤单时间复盘 CSV</button></div>
+      <div class="ops"><button id="xlsxAll">导出 Excel（全部表）</button><button class="secondary" id="csvMarkets">导出市场盈亏 CSV</button><button class="secondary" id="csvDaily">导出每日汇总 CSV</button><button class="secondary" id="csvDetail">导出成交明细 CSV</button><button class="secondary" id="csvQuotes">导出全部报价 CSV</button><button class="secondary" id="csvCancel">导出撤单时间复盘 CSV</button></div>
       <section><h2>开场前几秒撤单最好</h2><p id="cAdvice"></p><div class="scroll"><table id="cRows"></table></div>
         <p class="muted small" id="cNote">把每一场按「如果提前 X 秒撤单」重算：X 秒之后才成交的单当作没成交。同一批场次比较，所以各行能直接比。只能算比当时撤得更早的情况。</p></section>
       <section><h2>什么时候成交的（按成交时刻）</h2><div class="scroll"><table id="cTimes"></table></div>
@@ -374,7 +379,8 @@ async function api(path, opts = {}) {
   try {
     const r = await fetch(path, Object.assign({credentials: "same-origin", signal: ctl.signal}, opts, {headers}));
     if (r.status === 401) { showLogin(await r.json().catch(() => ({}))); throw new Error("sign in"); }
-    return {status: r.status, data: path.endsWith(".csv") || path.includes(".csv?") ? await r.text() : await r.json().catch(() => ({}))};
+    const ct = r.headers.get("Content-Type") || "";
+    return {status: r.status, data: ct.includes("spreadsheetml") ? await r.blob() : path.endsWith(".csv") || path.includes(".csv?") ? await r.text() : await r.json().catch(() => ({}))};
   } finally { clearTimeout(timer); }
 }
 function showLogin(info) {
@@ -661,6 +667,14 @@ async function download(kind) {
 }
 $("csvDetail").onclick = () => download("detail");
 $("csvMarkets").onclick = () => download("markets");
+$("xlsxAll").onclick = async () => {
+  const r = await api("/api/journal.xlsx?" + jQuery()); if (r.status !== 200) return toast("导出失败", true);
+  const url = URL.createObjectURL(r.data);
+  const a = document.createElement("a"); a.href = url; a.download = `复盘_${(state.journal && state.journal.span && state.journal.span.label || "全部").replace(/[\s:～]/g, "")}.xlsx`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  if (initData) toast("Telegram 里可能下载不了：在机器人里点 📤 导出");
+};
 $("csvDaily").onclick = () => download("daily");
 $("csvQuotes").onclick = () => download("quotes");
 $("csvCancel").onclick = () => download("cancel");

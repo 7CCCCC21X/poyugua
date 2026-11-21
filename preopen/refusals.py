@@ -63,6 +63,26 @@ def explain(code: str) -> tuple[str, str, str]:
     return EXPLAIN.get(code, DEFAULT)
 
 
+STATUS = {"rejected": "被拒", "not_sent": "没发出", "unknown": "结果不明"}
+
+
+def table(log: Iterable[dict], span: tuple[float, float] | None = None) -> list[list[Any]]:
+    """Every refusal kept (the latest few hundred), the latest first, those that came within the span: for the review's
+    拒单 sheet (the exchange's words and the circumstances, to tell a rate limit from a market just opened)."""
+    lo, hi = span or (float("-inf"), float("inf"))
+    rows: list[list[Any]] = [["时间（北京时间）", "市场", "档", "原因", "交易所原话", "HTTP", "结果", "整个请求被拒", "同一请求几张单",
+                              "同一次拒单涉及几场", "上架后几秒", "开放下单后几秒"]]
+    for e in sorted((e for e in log if lo <= float(e.get("at") or 0) < hi), key=lambda e: -float(e.get("at") or 0)):
+        at = float(e["at"])
+        rows.append([f"{mk.hm(at)[:5]} {mk.hms(at)}",
+                     mk.window_name(e["coin"], int(e["start"])) if e.get("coin") and e.get("start") else e.get("slug", ""),
+                     int(e["level"]) + 1 if e.get("level") is not None else None, explain(str(e.get("code") or ""))[0],
+                     e.get("words") or "", e.get("http"), STATUS.get(str(e.get("status") or ""), e.get("status") or ""),
+                     "是" if e.get("whole") else "", e.get("batch"), int(e.get("windows") or 1), e.get("listed_ago"),
+                     e.get("opened_ago")])
+    return rows
+
+
 def recent(log: Iterable[dict], now: float, hours: float) -> list[dict]:
     return [e for e in log if now - float(e.get("at") or 0) <= hours * 3600]
 

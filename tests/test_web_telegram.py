@@ -66,6 +66,10 @@ class FakeApp:
         self.calls.append(("review", dict(query or {})))
         return {"error": "看不懂的时间：x"} if (query or {}).get("from") == "x" else {"totals": {}}
 
+    def xlsx(self, query=None):
+        self.calls.append(("xlsx", dict(query or {})))
+        return "复盘_今天_20261121-0930.xlsx", b"PK\x03\x04 workbook"
+
     def csv(self, kind, query=None):
         self.calls.append(("csv", kind, dict(query or {})))
         return f"{kind}.csv", "\ufeffa,b\n1,2\n"
@@ -136,6 +140,11 @@ class WebServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((status, ctype.split(";")[0]), (200, "text/csv"))
         self.assertIn("daily.csv", dict(extra)["Content-Disposition"])
         self.assertEqual(s.app.calls[-1], ("csv", "daily", {"kind": "daily", "range": "yesterday"}))  # the CSV follows the filter
+        status, ctype, body, extra = await s.respond("GET", "/api/journal.xlsx?range=today", auth, b"")
+        self.assertEqual((status, body[:2]), (200, b"PK"))
+        self.assertIn("spreadsheetml", ctype)
+        self.assertIn("filename*=UTF-8''%E5%A4%8D%E7%9B%98", dict(extra)["Content-Disposition"])   # 复盘_… for every browser
+        self.assertEqual(s.app.calls[-1], ("xlsx", {"range": "today"}))
         for page in ("/", "/control", "/journal"):
             self.assertEqual((await s.respond("GET", page, {}, b""))[0], 200)
 
@@ -251,46 +260,70 @@ class TelegramTest(unittest.IsolatedAsyncioTestCase):
         for _ in range(4):
             await tick(e, 30)
         handle = main.commander(settings(), e, pub)
+
+        async def say(cmd, args):
+            reply = await handle(cmd, args)
+            return reply.text if isinstance(reply, Reply) else reply
         review = await handle("/review", [])
-        self.assertTrue(review.splitlines()[1].startswith("结论："))  # the conclusion first
-        self.assertIn("【如果提前撤单】", review)
-        self.assertIn("什么时候成交的", review)
-        self.assertIn("（BTC、最近 7 天）", await handle("/review", ["btc", "7"]))
-        self.assertIn("报价 0 场", await handle("/review", ["eth"]))  # only ETH: nothing quoted
-        self.assertIn("看不懂：abc", await handle("/review", ["abc"]))
-        text = await handle("/review", [])
+        self.assertTrue(review.text.splitlines()[1].startswith("结论："))  # the conclusion first
+        self.assertIn("【如果提前撤单】", review.text)
+        self.assertIn("什么时候成交的", review.text)
+        buttons = [b["callback_data"] for row in review.markup["inline_keyboard"] for b in row]
+        self.assertEqual(buttons[-5:], ["rev_today", "rev_yesterday", "rev_7", "rev_30", "rev_all"])   # another time, a tap away
+        self.assertIn("（BTC、最近 7 天）", await say("/review", ["btc", "7"]))
+        self.assertIn("报价 0 场", await say("/review", ["eth"]))  # only ETH: nothing quoted
+        self.assertIn("看不懂：abc", await say("/review", ["abc"]))
+        text = await say("/review", [])
         self.assertIn("【每日】", text)
         self.assertIn("【按市场】1 场有成交", text)
         self.assertIn("赚最多：BTC", text)
         self.assertIn("成交额 $4.90", text)
         day = journal.day_of(starts[0])[5:]
-        self.assertIn(f"合计（{day}）：报价 2 场，成交 1 场", await handle("/review", [day]))
-        self.assertIn("合计（昨天）：报价 0 场", await handle("/review", ["昨天"]))
-        self.assertIn("没有这个时间：13-40", await handle("/review", ["13-40"]))
-        reply = await handle("/export", [])
+        self.assertIn(f"合计（{day}）：报价 2 场，成交 1 场", await say("/review", [day]))
+        self.assertIn("合计（昨天）：报价 0 场", await say("/review", ["昨天"]))
+        self.assertIn("合计（昨天）：报价 0 场", await say("/rev_yesterday", []))   # the button
+        self.assertIn("没有这个时间：13-40", await say("/review", ["13-40"]))
+        # /export alone: the time as buttons; a time: one Excel file
+        choose = await handle("/export", [])
+        self.assertEqual([b["callback_data"] for row in choose.markup["inline_keyboard"] for b in row],
+                         ["exp_today", "exp_yesterday", "exp_7", "exp_30", "exp_all"])
+        self.assertEqual(choose.files, [])
+        book = await handle("/exp_all", [])
+        (name, data), = book.files
+        self.assertTrue(name.startswith("复盘_全部_") and name.endswith(".xlsx"))
+        self.assertEqual(data[:2], b"PK")
+        self.assertIn("1 场有成交，成交额 $4.90，已结算盈亏 +5.10 美元", book.text)
+        self.assertTrue((await handle("/export", ["7"])).files[0][0].startswith("复盘_最近7天_"))
+        # the CSV files, as before: /export csv [time]
+        reply = await handle("/export", ["csv"])
         self.assertEqual([n.split("_")[0] for n, _ in reply.files], ["市场盈亏", "每日汇总", "成交明细", "全部报价", "撤单时间复盘"])
         markets = dict(reply.files)[next(n for n, _ in reply.files if n.startswith("市场盈亏"))].decode("utf-8")
         self.assertIn("BTC", markets)
         self.assertIn(",涨,5.1", markets)                          # up won: 10 shares paid $4.90
         self.assertIn("看不懂：abc", (await handle("/export", ["abc"])).text)
-        self.assertIn("导出昨天的记录：0 条报价", (await handle("/export", ["昨天"])).text)
+        self.assertIn("导出昨天的记录：0 条报价", (await handle("/export", ["csv", "昨天"])).text)
         fills = dict(reply.files)[next(n for n, _ in reply.files if n.startswith("成交明细"))].decode("utf-8")
         self.assertTrue(fills.startswith("\ufeff"))
         self.assertIn("涨成交时刻(开场前秒:份)", fills)
         self.assertIn(",是,", fills)  # the fill's time is the trade's own
+        # on Telegram: 📤 导出 asks for the time; a tap sends the file after the message, the question stays
         tg = FakeTelegram()
         await tg.on_message({"chat": {"id": int(ADMIN)}, "from": {"id": int(ADMIN)}, "text": "📤 导出"}, handle)
+        asked = tg.outbox.get_nowait()
+        self.assertIn("导出哪段时间", asked[0])
+        self.assertEqual(asked[1]["inline_keyboard"][0][0]["callback_data"], "exp_today")
+        await tg.on_callback({"id": "c", "data": "exp_7", "from": {"id": int(ADMIN)},
+                              "message": {"chat": {"id": int(ADMIN)}, "message_id": 5}}, handle)
+        self.assertEqual([m_ for m_, _ in tg.posts], ["answerCallbackQuery", "editMessageReplyMarkup"])
         task = asyncio.create_task(tg.sender())
         for _ in range(100):
             await asyncio.sleep(0.05)
-            if len(tg.documents) == 5:
+            if tg.documents:
                 break
         task.cancel()
-        self.assertEqual(len(tg.documents), 5)
-        self.assertTrue(all(name.endswith(".csv") for name, _, _ in tg.documents))
-        self.assertEqual(tg.posts[0][0], "sendMessage")  # the text first, then the files
-        week = await handle("/export", ["7"])
-        self.assertIn("最近 7 天", week.text)
+        self.assertEqual(len(tg.documents), 1)
+        self.assertTrue(tg.documents[0][0].endswith(".xlsx"))
+        self.assertEqual(tg.posts[2][0], "sendMessage")  # the text first, then the file
 
     async def test_rejects_explains_the_refusals_and_checks_them_live(self):
         e, clock, pub, x = make_engine()

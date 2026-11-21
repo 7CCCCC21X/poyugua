@@ -135,6 +135,9 @@ def span_args(args: list[str], now: float) -> tuple[tuple[float, float] | None, 
     label, dates, rest = "", [], []
     for a in args:
         key = a.strip().lower()
+        if key in ("全部", "all"):
+            span, label = None, RANGES["all"]
+            continue
         if key in ("今天", "today", "昨天", "yesterday"):
             name = "today" if key in ("今天", "today") else "yesterday"
             span, label = preset_span(name, now), RANGES[name]
@@ -239,6 +242,7 @@ def journal(records: Iterable[dict], now: float, current: int | None = None,
     by_side = {s: {"side": mk.SIDES_CN[s], "shares": D(0), "cost": D(0), "won": D(0)} for s in mk.SIDES}
     by_lead: dict[str, dict] = {name: {"bucket": name, "fills": 0, "shares": D(0), "cost": D(0), "won": D(0)} for _, name in LEAD_BUCKETS}
     windows: dict[tuple[str, str], dict[str, Any]] = {}
+    by_price: dict[D, dict[str, Any]] = {}
     detail = []
     for q in records:
         if not q.get("placed") and not any(filled(q).values()):
@@ -258,9 +262,14 @@ def journal(records: Iterable[dict], now: float, current: int | None = None,
                                              "settled": True, "inside": inside, "q": q, "levels": set(), "result": "",
                                              "shares": {side: D(0) for side in mk.SIDES}, "volume": D(0)}
         f = filled(q)
+        price = num(q["price"])
+        if inside:
+            pb = by_price.setdefault(price, {"quotes": 0, "filled": 0, "both": 0, "shares": D(0), "volume": D(0), "cost": D(0),
+                                             "payout": D(0), "won": D(0), "settled": D(0), "levels": set()})
+            pb["quotes"] += 1
+            pb["levels"].add(int(q["level"]) + 1)
         if not any(f.values()):
             continue
-        price = num(q["price"])
         result = q.get("result")
         settled = q.get("phase") == "settled" and result in mk.SIDES
         cost = sum((v * price for v in f.values()), D(0))
@@ -285,6 +294,15 @@ def journal(records: Iterable[dict], now: float, current: int | None = None,
             w["settled"] = False
         if not inside:
             continue
+        pb["filled"] += 1
+        pb["both"] += 1 if all(f.values()) else 0
+        pb["shares"] += sum(f.values(), D(0))
+        pb["volume"] += cost
+        if settled:
+            pb["cost"] += cost
+            pb["payout"] += payout
+            pb["won"] += f.get(result, D(0))
+            pb["settled"] += sum(f.values(), D(0))
         for side, shares in f.items():
             if shares <= 0:
                 continue
@@ -332,10 +350,24 @@ def journal(records: Iterable[dict], now: float, current: int | None = None,
         "by_side": [money(v) for v in by_side.values()],
         "by_lead": [money(v) for v in by_lead.values() if v["fills"]],
         "by_market": markets,
+        "by_price": [price_row(p, b) for p, b in sorted(by_price.items(), reverse=True)],
         "detail": [detail_row(q) for q in detail[:200]],
         "cancel": cancel_review(within(records, span), now, current),
         "detail_more": max(0, len(detail) - 200),
     }
+
+
+def price_row(price: D, b: dict[str, Any]) -> dict[str, Any]:
+    """One price quoted (a level; its price may have moved between settings): how often a quote there filled, and
+    whether the side bought there won more often than the price (its breakeven: a share bought at 47¢ pays $1 when its
+    side wins, so it needs to win more than 47% of the time)."""
+    pnl = b["payout"] - b["cost"]
+    return {"price": float(price * 100), "levels": "、".join(str(x) for x in sorted(b["levels"])), "quotes": b["quotes"],
+            "filled": b["filled"], "fill_rate": round(b["filled"] / b["quotes"] * 100, 1) if b["quotes"] else None,
+            "both": b["both"], "shares": float(b["shares"]), "volume": float(round(b["volume"], 4)),
+            "cost": float(round(b["cost"], 4)), "payout": float(round(b["payout"], 4)), "pnl": float(round(pnl, 4)),
+            "roi": round(float(pnl / b["cost"] * 100), 2) if b["cost"] else None,
+            "win_rate": round(float(b["won"] / b["settled"] * 100), 1) if b["settled"] else None, "breakeven": float(price * 100)}
 
 
 def market_row(w: dict[str, Any]) -> dict[str, Any]:
@@ -520,92 +552,152 @@ def detail_row(q: dict) -> dict[str, Any]:
     }
 
 
-def detail_csv(records: Iterable[dict]) -> str:
-    rows = sorted((q for q in records if any(filled(q).values())), key=lambda q: -q["start"])
+def to_csv(rows: list[list[Any]]) -> str:
+    """A table as CSV for Excel (UTF-8 with the BOM); a whole float written without its .0."""
     out = io.StringIO()
     w = csv.writer(out)
-    w.writerow(["场次（北京时间）", "日期", "币种", "档", "价格¢", "份数", "第几次报价", "涨成交", "跌成交", "成本$", "结果", "盈亏$",
-                "挂上时距开场(秒)", "撤单确认距开场(秒)", "首次成交距开场(秒)", "涨成交时刻(开场前秒:份)", "跌成交时刻(开场前秒:份)",
-                "成交时刻精确", "领取"])
-    for q in rows:
+    for row in rows:
+        w.writerow(["" if v is None else int(v) if isinstance(v, float) and v.is_integer() else v for v in row])
+    return "\ufeff" + out.getvalue()
+
+
+def detail_table(records: Iterable[dict]) -> list[list[Any]]:
+    """Every level of a window that filled, the latest first."""
+    rows = [["场次（北京时间）", "日期", "币种", "档", "价格¢", "份数", "第几次报价", "涨成交", "跌成交", "成本$", "结果", "盈亏$",
+             "挂上时距开场(秒)", "撤单确认距开场(秒)", "首次成交距开场(秒)", "涨成交时刻(开场前秒:份)", "跌成交时刻(开场前秒:份)",
+             "成交时刻精确", "领取"]]
+    for q in sorted((q for q in records if any(filled(q).values())), key=lambda q: -q["start"]):
         d = detail_row(q)
-        w.writerow([d["when"], d["day"], d["coin"], d["level"], d["price"], d["shares"], d["attempt"], d["up"], d["down"],
-                    round(d["cost"], 4), d["result"], "" if d["pnl"] is None else round(float(d["pnl"]), 4),
-                    d["placed_lead_s"] if d["placed_lead_s"] is not None else "", d["cancel_lead_s"] if d["cancel_lead_s"] is not None else "",
-                    d["first_fill_lead_s"] if d["first_fill_lead_s"] is not None else "", d["up_times"], d["down_times"],
-                    "是" if d["exact"] else "否（快照看到的时间）", d["redeem"]])
-    return "\ufeff" + out.getvalue()  # Excel reads UTF-8 with the BOM
+        rows.append([d["when"], d["day"], d["coin"], d["level"], d["price"], d["shares"], d["attempt"], d["up"], d["down"],
+                     round(d["cost"], 4), d["result"], None if d["pnl"] is None else round(float(d["pnl"]), 4), d["placed_lead_s"],
+                     d["cancel_lead_s"], d["first_fill_lead_s"], d["up_times"], d["down_times"],
+                     "是" if d["exact"] else "否（快照看到的时间）", d["redeem"]])
+    return rows
+
+
+GROUP_HEAD = ["报价场次", "成交场次", "成交率%", "双边成交", "成交份数", "成交额$", "赢", "输", "待结算", "已结算成本$", "回款$",
+              "盈亏$", "收益率%"]
+
+
+def group_table(first: str, groups: list[dict], key: str, label=lambda v: v) -> list[list[Any]]:
+    """Windows grouped (by day, coin, hour): counted as windows, the money record by record."""
+    return [[first, *GROUP_HEAD]] + [[label(d[key]), d["quoted"], d["filled"], d["fill_rate"], d["both"], d["shares"], d["volume"],
+                                      d["wins"], d["losses"], d["open"], d["cost"], d["payout"], d["pnl"], d["roi"]] for d in groups]
+
+
+def daily_table(review: dict) -> list[list[Any]]:
+    return group_table("日期", review["by_day"], "day")
+
+
+def coin_table(review: dict) -> list[list[Any]]:
+    return group_table("币种", review["by_coin"], "coin")
+
+
+def hour_table(review: dict) -> list[list[Any]]:
+    return group_table("开场（北京时间）", review["by_hour"], "hour", lambda h: f"{int(h):02d}:00")
+
+
+def markets_table(review: dict) -> list[list[Any]]:
+    """Every window traded, its levels together, the latest first."""
+    return [["市场（开场，北京时间）", "日期", "币种", "成交的档", "涨成交份数", "跌成交份数", "双边", "成交额$", "结果", "盈亏$"]] + [
+        [m["when"], m["day"], m["coin"], m["levels"], m["up"], m["down"], "是" if m["both"] else "", m["volume"],
+         m["result"] or "待结算", m["pnl"]] for m in review["by_market"]]
+
+
+def price_table(review: dict) -> list[list[Any]]:
+    """Each price quoted: the fill rate, and the side bought there won more often than the price or not."""
+    return [["价格¢", "第几档", "报价（档次）", "有成交", "成交率%", "两边都成交", "成交份数", "成交额$", "已结算成本$", "回款$", "盈亏$",
+             "收益率%", "买到的那一边赢的比例%", "保本比例%（=价格）"]] + [
+        [p["price"], p["levels"], p["quotes"], p["filled"], p["fill_rate"], p["both"], p["shares"], p["volume"], p["cost"],
+         p["payout"], p["pnl"], p["roi"], p["win_rate"], p["breakeven"]] for p in review["by_price"]]
+
+
+def quotes_table(records: Iterable[dict], limit: int | None = None) -> list[list[Any]]:
+    """Every quote (each window level and attempt that rested or filled), filled or not, the latest first: fill rates,
+    cancel times, the end of each, and how fast it rested after the listing and after the market opened."""
+    chosen = sorted((q for q in records if q.get("placed") or any(filled(q).values())), key=lambda q: (-q["start"], q["coin"], q["level"]))
+    rows = [["场次（北京时间）", "日期", "币种", "档", "第几次报价", "价格¢", "份数", "状态", "结束原因", "挂上时距开场(秒)",
+             "上架后几秒挂上", "开放下单后几秒挂上", "撤单确认距开场(秒)", "涨成交", "跌成交", "涨成交时刻(开场前秒:份)",
+             "跌成交时刻(开场前秒:份)", "结果", "盈亏$"]]
+    for q in chosen[:limit]:
+        f = filled(q)
+        placed = float(q["placed"]) if q.get("placed") else None
+        rows.append([mk.hm(q["start"]), day_of(q["start"]), mk.name_of(q["coin"]), int(q["level"]) + 1, int(q.get("attempt") or 0) + 1,
+                     float(num(q["price"]) * 100), float(num(q["shares"])), PHASES.get(q["phase"], q["phase"]), q.get("reason") or "",
+                     round(q["start"] - placed) if placed else None,
+                     round(placed - float(q["listed"]), 1) if placed and q.get("listed") else None,
+                     round(placed - float(q["opened"]), 2) if placed and q.get("opened") else None,
+                     q.get("cancel_lead"), float(f.get("up", 0)), float(f.get("down", 0)),
+                     fill_times_text(q, "up"), fill_times_text(q, "down"), mk.SIDES_CN.get(str(q.get("result") or ""), ""),
+                     None if q.get("pnl") is None else round(float(q["pnl"]), 4)])
+    return rows
+
+
+def replay_table(review: dict) -> list[list[Any]]:
+    """The cancel-time replay: the same windows as if cancelled X seconds before the start."""
+    rows: list[list[Any]] = [["开场前几秒撤单", "场次", "有成交的场次", "双边成交", "成交份数", "成本$", "回款$", "盈亏$", "说明"]]
+    if review.get("actual"):
+        a = review["actual"]
+        rows.append([f"实际（{review.get('current')} 秒）", a["windows"], a["filled"], a["both"], a["shares"], a["cost"], a["payout"],
+                     a["pnl"], "实际发生的"])
+    for r in review["rows"]:
+        rows.append([r["cancel_s"], r["windows"], r["filled"], r["both"], r["shares"], r["cost"], r["payout"], r["pnl"],
+                     "★最好" if r["cancel_s"] == review.get("best") else ""])
+    return rows
+
+
+def fill_time_table(review: dict) -> list[list[Any]]:
+    """When the fills came, and whether the side bought then won more often than its price."""
+    return [["成交时距开场", "份数", "成本$", "赢回$", "盈亏$", "这一边赢的比例%", "保本比例%（=买价）"]] + [
+        [t["bucket"], t["shares"], t["cost"], t["won"], t["pnl"], round(t["win_rate"] * 100, 1), round(t["breakeven"] * 100, 1)]
+        for t in review["by_fill_time"]]
+
+
+def cancel_notes(review: dict) -> list[list[Any]]:
+    rows: list[list[Any]] = [["结论", review["advice"]]]
+    if review.get("after_start") or review.get("after_cancel"):
+        rows.append(["注意", f"{review['after_start']} 笔开场后成交、{review['after_cancel']} 笔撤单确认后成交：撤单或到期没及时生效"])
+    if review["rows"]:
+        rows.append(["说明", f"只能复盘「比当时撤得更早」：开场前 {review['base']} 秒以后单子已经撤了，那段时间会不会成交没有记录。"
+                     f"另有 {review['excluded']} 场当时撤得更早，没算在内；{review['approx']} 场的成交时刻是快照看到的时间（偏晚几秒）"])
+    return rows
+
+
+def cancel_table(review: dict) -> tuple[list[list[Any]], set[int]]:
+    """The cancel-time replay, the fill times and the coins, one under the other; the rows that title a part."""
+    rows = replay_table(review)
+    bold = set()
+    rows.append([])
+    bold.add(len(rows))
+    rows += fill_time_table(review)
+    rows.append([])
+    bold.add(len(rows))
+    rows.append(["币种", "有成交的场次", "成本$", "赢回$", "盈亏$"])
+    for c in review.get("by_coin", []):
+        rows.append([c["coin"], c["filled"], c["cost"], c["won"], c["pnl"]])
+    rows.append([])
+    rows += cancel_notes(review)
+    return rows, bold
+
+
+def detail_csv(records: Iterable[dict]) -> str:
+    return to_csv(detail_table(records))
 
 
 def daily_csv(review: dict) -> str:
-    out = io.StringIO()
-    w = csv.writer(out)
-    w.writerow(["日期", "报价场次", "成交场次", "成交率%", "双边成交", "成交份数", "成交额$", "赢", "输", "待结算", "已结算成本$",
-                "回款$", "盈亏$", "收益率%"])
-    for d in review["by_day"]:
-        w.writerow([d["day"], d["quoted"], d["filled"], d["fill_rate"] if d["fill_rate"] is not None else "", d["both"],
-                    mk.fmt(D(str(d["shares"]))), d["volume"], d["wins"], d["losses"], d["open"], d["cost"], d["payout"], d["pnl"],
-                    d["roi"] if d["roi"] is not None else ""])
-    return "\ufeff" + out.getvalue()
+    return to_csv(daily_table(review))
 
 
 def markets_csv(review: dict) -> str:
-    """Every window traded, its levels together, the latest first."""
-    out = io.StringIO()
-    w = csv.writer(out)
-    w.writerow(["市场（开场，北京时间）", "日期", "币种", "成交的档", "涨成交份数", "跌成交份数", "双边", "成交额$", "结果", "盈亏$"])
-    for m in review["by_market"]:
-        w.writerow([m["when"], m["day"], m["coin"], m["levels"], mk.fmt(D(str(m["up"]))), mk.fmt(D(str(m["down"]))),
-                    "是" if m["both"] else "", m["volume"], m["result"] or "待结算", "" if m["pnl"] is None else m["pnl"]])
-    return "\ufeff" + out.getvalue()
+    return to_csv(markets_table(review))
 
 
 def quotes_csv(records: Iterable[dict]) -> str:
-    """Every quote (each window level and attempt that rested or filled), filled or not: the full record to review
-    fill rates, cancel times and refusals elsewhere."""
-    rows = sorted((q for q in records if q.get("placed") or any(filled(q).values())), key=lambda q: (-q["start"], q["coin"], q["level"]))
-    out = io.StringIO()
-    w = csv.writer(out)
-    w.writerow(["场次（北京时间）", "日期", "币种", "档", "第几次报价", "价格¢", "份数", "状态", "结束原因", "挂上时距开场(秒)",
-                "撤单确认距开场(秒)", "涨成交", "跌成交", "涨成交时刻(开场前秒:份)", "跌成交时刻(开场前秒:份)", "结果", "盈亏$"])
-    for q in rows:
-        f = filled(q)
-        w.writerow([mk.hm(q["start"]), day_of(q["start"]), mk.name_of(q["coin"]), int(q["level"]) + 1, int(q.get("attempt") or 0) + 1,
-                    float(num(q["price"]) * 100), float(num(q["shares"])), PHASES.get(q["phase"], q["phase"]), q.get("reason") or "",
-                    round(q["start"] - float(q["placed"])) if q.get("placed") else "",
-                    q.get("cancel_lead") if q.get("cancel_lead") is not None else "", float(f.get("up", 0)), float(f.get("down", 0)),
-                    fill_times_text(q, "up"), fill_times_text(q, "down"), mk.SIDES_CN.get(str(q.get("result") or ""), ""),
-                    "" if q.get("pnl") is None else round(float(q["pnl"]), 4)])
-    return "\ufeff" + out.getvalue()
+    return to_csv(quotes_table(records))
 
 
 def cancel_csv(review: dict) -> str:
-    out = io.StringIO()
-    w = csv.writer(out)
-    w.writerow(["开场前几秒撤单", "场次", "有成交的场次", "双边成交", "成交份数", "成本$", "回款$", "盈亏$", "说明"])
-    if review.get("actual"):
-        a = review["actual"]
-        w.writerow([f"实际（{review.get('current')} 秒）", a["windows"], a["filled"], a["both"], a["shares"], a["cost"], a["payout"],
-                    a["pnl"], "实际发生的"])
-    for r in review["rows"]:
-        w.writerow([r["cancel_s"], r["windows"], r["filled"], r["both"], r["shares"], r["cost"], r["payout"], r["pnl"],
-                    "★最好" if r["cancel_s"] == review.get("best") else ""])
-    w.writerow([])
-    w.writerow(["成交时距开场", "份数", "成本$", "赢回$", "盈亏$", "这一边赢的比例%", "保本比例%（=买价）"])
-    for t in review["by_fill_time"]:
-        w.writerow([t["bucket"], t["shares"], t["cost"], t["won"], t["pnl"], round(t["win_rate"] * 100, 1), round(t["breakeven"] * 100, 1)])
-    w.writerow([])
-    w.writerow(["币种", "有成交的场次", "成本$", "赢回$", "盈亏$"])
-    for c in review.get("by_coin", []):
-        w.writerow([c["coin"], c["filled"], c["cost"], c["won"], c["pnl"]])
-    w.writerow([])
-    w.writerow(["结论", review["advice"]])
-    if review.get("after_start") or review.get("after_cancel"):
-        w.writerow(["注意", f"{review['after_start']} 笔开场后成交、{review['after_cancel']} 笔撤单确认后成交：撤单或到期没及时生效"])
-    if review["rows"]:
-        w.writerow(["说明", f"只能复盘「比当时撤得更早」：开场前 {review['base']} 秒以后单子已经撤了，那段时间会不会成交没有记录。"
-                    f"另有 {review['excluded']} 场当时撤得更早，没算在内；{review['approx']} 场的成交时刻是快照看到的时间（偏晚几秒）"])
-    return "\ufeff" + out.getvalue()
+    return to_csv(cancel_table(review)[0])
 
 
 def review_text(records: list[dict], now: float, current: int | None = None, scope: str = "",
