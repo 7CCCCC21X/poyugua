@@ -59,18 +59,24 @@ class FakeApp:
     def settings(self):
         return {"items": []}
 
-    def orders(self, tab, coin, limit):
+    async def orders(self, tab, coin, limit):
         return {"tab": tab, "coin": coin, "limit": limit}
 
-    def review(self, query=None):
+    async def review(self, query=None):
         self.calls.append(("review", dict(query or {})))
         return {"error": "看不懂的时间：x"} if (query or {}).get("from") == "x" else {"totals": {}}
 
-    def xlsx(self, query=None):
+    async def price_detail(self, query=None):
+        self.calls.append(("price", dict(query or {})))
+        return {"price": 49.0, "rows": []}
+
+    async def xlsx(self, query=None):
         self.calls.append(("xlsx", dict(query or {})))
+        if (query or {}).get("from") == "x":
+            raise ValueError("看不懂的时间：x")
         return "复盘_今天_20261121-0930.xlsx", b"PK\x03\x04 workbook"
 
-    def csv(self, kind, query=None):
+    async def csv(self, kind, query=None):
         self.calls.append(("csv", kind, dict(query or {})))
         return f"{kind}.csv", "\ufeffa,b\n1,2\n"
 

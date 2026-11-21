@@ -186,7 +186,7 @@ class SettingsLogTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(last["changes"], [["PREOPEN_PRICE_CENTS", "49", "48"]])
         self.assertIn("重启", last["via"])
         self.assertEqual(len(e2.settings_log), 3)
-        name, data = c.xlsx({"range": "today"})
+        name, data = await c.xlsx({"range": "today"})
         self.assertTrue(name.startswith("复盘_今天_"))
         self.assertIn("参数", read(data))
 

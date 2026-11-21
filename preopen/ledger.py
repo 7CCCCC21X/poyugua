@@ -50,6 +50,7 @@ class Ledger:
         self.conn.execute("CREATE TABLE IF NOT EXISTS quotes (key TEXT PRIMARY KEY, slug TEXT, start INTEGER, phase TEXT, data TEXT NOT NULL)")
         self.conn.execute("CREATE TABLE IF NOT EXISTS archive (key TEXT PRIMARY KEY, start INTEGER, data TEXT NOT NULL)")
         self.conn.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS archive_start ON archive(start, key)")   # the review reads by time
         self.conn.commit()
         self.rows: dict[str, dict] = {}
         for key, data in self.conn.execute("SELECT key, data FROM quotes"):
@@ -95,6 +96,26 @@ class Ledger:
             rows = self.conn.execute("SELECT data FROM archive").fetchall()
         for (data,) in rows:
             yield json.loads(data)
+
+    def archived_between(self, lo: float, hi: float, newest_first: bool = False, batch: int = 2000) -> Iterator[dict]:
+        """The archived records of the windows starting from `lo` to `hi`, in start order (or the newest first), read a
+        batch at a time: the lock is held for a batch, not for the whole read (the loops keep writing meanwhile), and a
+        long archive never sits in memory at once."""
+        lo = -1e18 if lo == float("-inf") else lo
+        hi = 1e18 if hi == float("inf") else hi
+        at, key = (hi + 1, "\uffff") if newest_first else (lo - 1, "")
+        sql = ("SELECT key, start, data FROM archive WHERE start >= ? AND start < ? AND (start < ? OR (start = ? AND key < ?)) "
+               "ORDER BY start DESC, key DESC LIMIT ?" if newest_first else
+               "SELECT key, start, data FROM archive WHERE start >= ? AND start < ? AND (start > ? OR (start = ? AND key > ?)) "
+               "ORDER BY start, key LIMIT ?")
+        while True:
+            with self.lock:
+                rows = self.conn.execute(sql, (lo, hi, at, at, key, batch)).fetchall()
+            for _, _, data in rows:
+                yield json.loads(data)
+            if len(rows) < batch:
+                return
+            key, at = rows[-1][0], rows[-1][1]
 
     def archive_count(self) -> int:
         with self.lock:

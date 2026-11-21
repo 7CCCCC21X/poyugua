@@ -68,8 +68,9 @@ def check_init_data(init_data: str, bot_token: str, admins: Any, now: float | No
 
 
 class WebServer:
-    """`app` is the console back end (console.Console): report(), settings(), orders(tab, coin, limit), review(query),
-    csv(kind, query), xlsx(query) (query: the review's time filter), and the coroutines change(body) and action(body)."""
+    """`app` is the console back end (console.Console): report(), settings(), orders(tab, coin, limit), and the
+    coroutines review(query), price_detail(query), csv(kind, query), xlsx(query) (query: the review's filter: time,
+    coins, sort), change(body) and action(body)."""
 
     def __init__(self, port: int, app: Any, web_key: str = "", bot_token: str = "", admin_id: str = "", host: str = "0.0.0.0"):
         self.port, self.host = port, host
@@ -148,15 +149,21 @@ class WebServer:
                     limit = int(query.get("limit") or 300)
                 except ValueError:
                     limit = 300
-                return self._json(200, self.app.orders(query.get("tab", "open"), query.get("coin", ""), limit))
+                return self._json(200, await self.app.orders(query.get("tab", "open"), query.get("coin", ""), limit))
             if path == "/api/journal":
-                data = self.app.review(query)
+                data = await self.app.review(query)
                 return self._json(400 if "error" in data else 200, data)
-            if path == "/api/journal.csv":
-                name, text = self.app.csv(query.get("kind", "detail"), query)
-                return 200, "text/csv; charset=utf-8", text.encode("utf-8"), [("Content-Disposition", f'attachment; filename="{name}"')]
-            if path == "/api/journal.xlsx":
-                name, data = self.app.xlsx(query)
+            if path == "/api/journal/price":
+                data = await self.app.price_detail(query)
+                return self._json(400 if "error" in data else 200, data)
+            if path in ("/api/journal.csv", "/api/journal.xlsx"):
+                try:  # a filter that is not one is said so, not exported as everything
+                    if path.endswith(".csv"):
+                        name, text = await self.app.csv(query.get("kind", "detail"), query)
+                        return 200, "text/csv; charset=utf-8", text.encode("utf-8"), [("Content-Disposition", f'attachment; filename="{name}"')]
+                    name, data = await self.app.xlsx(query)
+                except ValueError as error:
+                    return self._json(400, {"error": str(error)})
                 quoted = urllib.parse.quote(name)
                 return 200, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", data, [
                     ("Content-Disposition", f"attachment; filename=\"review.xlsx\"; filename*=UTF-8''{quoted}")]
@@ -177,7 +184,10 @@ class WebServer:
         if path == "/api/action":
             if str(data.get("action") or "") not in getattr(self.app, "ACTIONS", ()):
                 return self._json(400, {"error": "unknown action"})
-            return self._json(200, {"message": await self.app.action(data)})
+            try:
+                return self._json(200, {"message": await self.app.action(data)})
+            except ValueError as error:  # an action that could not be done says why (a cancel time the rules refuse)
+                return self._json(400, {"error": str(error)})
         return 404, "text/plain", b"not found", []
 
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:

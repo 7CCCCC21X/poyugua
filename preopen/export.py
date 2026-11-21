@@ -11,6 +11,7 @@ from . import markets as mk
 from .xlsx import Sheet, workbook
 
 QUOTES_KEPT = 20_000      # the 全部报价 sheet: the latest this many quotes (all of them: /export csv)
+FILLS_KEPT = 50_000       # the 成交明细 sheet: the latest this many filled levels
 
 GUIDE: tuple[tuple[str, str], ...] = (
     ("每日", "每天的成交量（份数、成交额）和盈亏：变好还是变坏；改参数前后对比（改的时间在「参数」表）"),
@@ -33,7 +34,7 @@ def file_name(label: str, now: float) -> str:
     return f"复盘_{tag}_{mk.dt.datetime.fromtimestamp(now, mk.BEIJING).strftime('%Y%m%d-%H%M')}.xlsx"
 
 
-def overview(review: dict[str, Any], label: str, now: float, mode: str, quotes: int, quotes_all: int) -> Sheet:
+def overview(review: dict[str, Any], label: str, now: float, mode: str, quotes: int, quotes_all: int, fills: int) -> Sheet:
     """The first sheet: the span's totals, the cancel-time conclusion, and what each sheet is for."""
     r, c = review["totals"]["range"], review["cancel"]
     rows: list[list[Any]] = [
@@ -51,6 +52,8 @@ def overview(review: dict[str, Any], label: str, now: float, mode: str, quotes: 
         rows.append(["亏钱的价格", "、".join(f"{p['price']:g}¢（赢 {p['win_rate']:g}% < 保本 {p['breakeven']:g}%）" for p in losing)])
     if quotes < quotes_all:
         rows.append(["注意", f"「全部报价」只放了最近 {quotes} 条（共 {quotes_all} 条）；全部的发 /export csv"])
+    if fills >= FILLS_KEPT:
+        rows.append(["注意", f"「成交明细」只放了最近 {FILLS_KEPT} 条；全部的发 /export csv"])
     rows += [[], ["每张表看什么", ""]]
     title = len(rows) - 1
     rows += [[name, text] for name, text in GUIDE]
@@ -72,16 +75,26 @@ def settings_sheet(values: dict[str, str], log: list[dict]) -> Sheet:
     return Sheet("参数", rows, bold={title})
 
 
-def build(records: list[dict], now: float, current: int | None, span: tuple[float, float] | None, label: str, *,
-          refusal_log: list[dict], settings: dict[str, str], settings_log: list[dict], mode: str) -> tuple[bytes, dict[str, Any]]:
-    """The workbook of the windows starting within `span` (all of them for None), and the span's totals."""
-    chosen = journal.within(records, span)
-    review = journal.journal(records, now, current, span)
-    cancel = review["cancel"]
-    quotes = journal.quotes_table(chosen, QUOTES_KEPT)
-    quotes_all = sum(1 for q in chosen if q.get("placed") or any(journal.filled(q).values()))
+def build(records: Any, now: float, current: int | None, span: tuple[float, float] | None, label: str, *,
+          refusal_log: list[dict], settings: dict[str, str], settings_log: list[dict], mode: str,
+          coins: list[str] | None = None) -> tuple[bytes, dict[str, Any]]:
+    """The workbook of the windows starting within `span` (all of them for None) of the coins named, and their totals.
+    `records`: a list, or the engine's reader read(lo, hi, newest_first) (each part reads what it needs: the review in
+    start order, the latest quotes and fills the newest first; the ledger never sits in memory whole)."""
+    lo, hi = span or (float("-inf"), float("inf"))
+    wanted = set(coins or [])
+
+    def stream(newest: bool = False) -> Any:
+        source = journal.within(records, span) if isinstance(records, list) else records(lo, hi, newest)
+        return [q for q in source if not wanted or q["coin"] in wanted] if isinstance(source, list) else \
+            (q for q in source if not wanted or q["coin"] in wanted)
+    with journal.quiet_gc():
+        review = journal.journal(stream(), now, current, span)
+        cancel = review["cancel"]
+        quotes, quotes_all = journal.quotes_rows(stream(True), QUOTES_KEPT)
+        fills = journal.detail_table(stream(True), FILLS_KEPT)
     return workbook([
-        overview(review, label, now, mode, len(quotes) - 1, quotes_all),
+        overview(review, label, now, mode, len(quotes) - 1, quotes_all, len(fills) - 1),
         Sheet("每日", journal.daily_table(review)),
         Sheet("市场盈亏", journal.markets_table(review)),
         Sheet("档位", journal.price_table(review)),
@@ -89,16 +102,19 @@ def build(records: list[dict], now: float, current: int | None, span: tuple[floa
         Sheet("撤单时间", journal.replay_table(cancel) + [[]] + journal.cancel_notes(cancel)),
         Sheet("币种", journal.coin_table(review)),
         Sheet("时段", journal.hour_table(review)),
-        Sheet("成交明细", journal.detail_table(chosen)),
+        Sheet("成交明细", fills),
         Sheet("全部报价", quotes),
         Sheet("拒单", refusals.table(refusal_log, span)),
         settings_sheet(settings, settings_log),
     ]), review["totals"]["range"]
 
 
-def from_engine(engine: Any, span: tuple[float, float] | None, label: str) -> tuple[str, bytes, dict[str, Any]]:
-    """The file name, the workbook and the span's totals, from the engine's ledger, refusal log and settings."""
+def from_engine(engine: Any, span: tuple[float, float] | None, label: str, read: Any,
+                coins: list[str] | None = None) -> tuple[str, bytes, dict[str, Any]]:
+    """The file name, the workbook and the span's totals, from the engine's reader (engine.review_reader(), made on the
+    event loop), refusal log and settings. Meant for a thread of its own."""
     now = engine.now()
-    data, totals = build(engine.all_records(), now, engine.s.cancel_s, span, label, refusal_log=list(engine.refusal_log),
-                         settings=config.current_values(engine.s), settings_log=list(engine.settings_log), mode=engine.s.mode())
+    data, totals = build(read, now, engine.s.cancel_s, span, label, refusal_log=list(engine.refusal_log),
+                         settings=config.current_values(engine.s), settings_log=list(engine.settings_log), mode=engine.s.mode(),
+                         coins=coins)
     return file_name(label, now), data, totals

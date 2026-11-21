@@ -17,6 +17,7 @@ import socket
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 
 from preopen import config, export as xls, journal, refusals, region
@@ -89,9 +90,10 @@ def range_buttons(prefix: str) -> list[list[dict]]:
     return [keys[:3], keys[3:]]
 
 
-def review(engine: Engine, args: list[str]) -> Reply | str:
+def review(engine: Engine, args: list[str], read: Any = None) -> Reply | str:
     """/review [time] [coin ...]: the analysis as a message, for the windows starting in the time named (今天, 昨天, a
-    number of days back, a date or two) and the coins named (default: all)."""
+    number of days back, a date or two) and the coins named (default: all). `read`: the engine's reader, made on the
+    event loop (Engine.review_reader), so that this runs in a thread of its own."""
     now = engine.now()
     try:
         span, label, rest = journal.span_args(args, now)
@@ -106,39 +108,27 @@ def review(engine: Engine, args: list[str]) -> Reply | str:
             bad.append(a)
     if bad:
         return f"看不懂：{' '.join(bad)}。{REVIEW_USAGE}"
-    records = [q for q in journal.within(engine.all_records(), span) if not coins or q["coin"] in coins]
+    read = read or engine.review_reader()
+    lo, hi = span or (float("-inf"), float("inf"))
     scope = "、".join(x for x in (" ".join(mk.name_of(c) for c in sorted(coins)), label) if x)
-    text = journal.review_text(records, now, engine.s.cancel_s, scope, float(engine.s.max_daily_loss_usd))
-    best = journal.cancel_review(records, now, engine.s.cancel_s)["best"]
+    with journal.quiet_gc():
+        j = journal.journal((q for q in read(lo, hi) if not coins or q["coin"] in coins), now, engine.s.cancel_s, market_limit=0)
+    text = journal.review_text([], now, engine.s.cancel_s, scope, float(engine.s.max_daily_loss_usd), j)
+    rec = j["cancel"]["recommend"]   # the same recommendation as the page's (none on a tie, a thin sample, a cent)
     rows = range_buttons("rev_")   # the same review for another time, a tap away
-    if best and best != engine.s.cancel_s and not coins:  # one coin's sample is no reason to change them all
-        rows = [[{"text": f"改成开场前 {journal.secs_label(best)}撤单", "callback_data": f"set_cancel_{best}"}]] + rows
+    if rec and not coins:  # one coin's sample is no reason to change them all
+        rows = [[{"text": f"改成开场前 {journal.secs_label(rec)}撤单", "callback_data": f"set_cancel_{rec}"}]] + rows
     return Reply(text, {"inline_keyboard": rows})
 
 
 async def set_cancel(engine: Engine, console: Console | None, seconds: int) -> str:
-    """The review's button: the cancel time changed as on the web console (checked, saved, in force at once), with the
-    times tied to it: no new order within 60 s more than it, and the orders' own expiry moved close behind it (5 s
-    after it where the rules allow), so that an order whose cancel fails still dies soon after rather than resting
-    into the last seconds before the start. A changed expiry re-places the resting orders (about a minute)."""
+    """The review's button: the cancel time changed with the times tied to it (Console.set_cancel, as the page's)."""
     if console is None:
         return "这里改不了设置：控制台没启动"
-    s = engine.s
-    entry = max(s.entry_s, seconds + 60)
-    expiry = max(0, min(seconds - 5, entry - 150))
-    if (s.cancel_s, s.entry_s, s.expiry_s) == (seconds, entry, expiry):
-        return f"已经是开场前 {journal.secs_label(seconds)}撤单了"
-    ok, text = await console.change_many({"PREOPEN_CANCEL_SECONDS": str(seconds), "PREOPEN_ENTRY_SECONDS": str(entry),
-                                          "PREOPEN_EXPIRY_SECONDS": str(expiry)}, f"开场前 {journal.secs_label(seconds)}撤单")
-    if not ok:
-        return text
-    notes = [f"距开场不足 {journal.secs_label(entry)}不再新挂"] if entry != s.entry_s else []
-    if expiry != s.expiry_s:
-        notes.append(f"订单自己在开场前 {journal.secs_label(expiry)}到期（撤单万一失败也会失效），挂着的单按新到期时间重挂一遍，约 1 分钟")
-    return f"✅ 已改成开场前 {journal.secs_label(seconds)}撤单" + (f"；{'；'.join(notes)}" if notes else "") + "。立即生效"
+    return (await console.set_cancel(seconds, "Telegram"))[1]
 
 
-def export(engine: Engine, args: list[str]) -> Reply:
+def export(engine: Engine, args: list[str], read: Any = None) -> Reply:
     """/export: buttons to choose the time; /export <time>: the review as one Excel file (every table of the review,
     the refusals, the settings and their changes, a first sheet saying what each is for); /export csv [time]: the
     tables as CSV files, as before. The time as /review takes it."""
@@ -154,18 +144,20 @@ def export(engine: Engine, args: list[str]) -> Reply:
         return Reply(f"{error}。{EXPORT_USAGE}")
     if rest:
         return Reply(f"看不懂：{' '.join(rest)}。{EXPORT_USAGE}")
+    read = read or engine.review_reader()
+    lo, hi = span or (float("-inf"), float("inf"))
     if not csv_files:
-        name, data, t = xls.from_engine(engine, span, label or "全部")
+        name, data, t = xls.from_engine(engine, span, label or "全部", read)
         return Reply(f"📤 {label or '全部'}的复盘数据：{t['filled']} 场有成交，成交额 ${t['volume']:.2f}，已结算盈亏 {t['pnl']:+.2f} 美元。"
                      "Excel 文件马上发过来，第一张「总览」写着每张表看什么。", files=[(name, data)])
-    records = journal.within(engine.all_records(), span)
     stamp = time.strftime("%Y%m%d-%H%M", time.gmtime(now + 8 * 3600))
-    review = journal.journal(records, now, engine.s.cancel_s)
-    files = [(f"市场盈亏_{stamp}.csv", journal.markets_csv(review)), (f"每日汇总_{stamp}.csv", journal.daily_csv(review)),
-             (f"成交明细_{stamp}.csv", journal.detail_csv(records)), (f"全部报价_{stamp}.csv", journal.quotes_csv(records)),
-             (f"撤单时间复盘_{stamp}.csv", journal.cancel_csv(review["cancel"]))]
-    quoted = sum(1 for q in records if q.get("placed") or any(journal.filled(q).values()))
+    with journal.quiet_gc():
+        review = journal.journal(read(lo, hi), now, engine.s.cancel_s)
+        files = [(f"市场盈亏_{stamp}.csv", journal.markets_csv(review)), (f"每日汇总_{stamp}.csv", journal.daily_csv(review)),
+                 (f"成交明细_{stamp}.csv", journal.detail_csv(read(lo, hi, True))), (f"全部报价_{stamp}.csv", journal.quotes_csv(read(lo, hi, True))),
+                 (f"撤单时间复盘_{stamp}.csv", journal.cancel_csv(review["cancel"]))]
     t = review["totals"]["all"]
+    quoted = t["quoted"] + t["upcoming"]
     return Reply(f"📤 导出{label or '全部'}的记录：{quoted} 条报价，{t['filled']} 场有成交，成交额 ${t['volume']:.2f}，"
                  f"已结算盈亏 {t['pnl']:+.2f} 美元。{len(files)} 个 CSV 文件马上发过来"
                  "（Excel 可以直接打开；成交时刻一栏是「开场前几秒:份数」）。", files=[(name, text.encode("utf-8")) for name, text in files])
@@ -180,8 +172,8 @@ def commander(settings: config.Settings, engine: Engine, pub: PublicApi, console
             return Reply(HELP)
         if cmd == "/check":
             return engine.check_text()
-        if cmd == "/review":
-            return review(engine, args)
+        if cmd == "/review":  # the work in a thread through a reader: the trading loops never wait for a review
+            return await asyncio.to_thread(review, engine, args, engine.review_reader())
         if cmd == "/rejects":
             try:
                 hours = float(args[0]) if args else 24.0
@@ -202,11 +194,13 @@ def commander(settings: config.Settings, engine: Engine, pub: PublicApi, console
                 return "看不懂这个撤单时间"
             return await set_cancel(engine, console, seconds)
         if cmd == "/export":
-            return export(engine, args)
+            if not args:
+                return export(engine, args)   # the time buttons
+            return await asyncio.to_thread(export, engine, args, engine.review_reader())
         if cmd.startswith(("/exp_", "/rev_")):  # a time button under 📤 导出 or 📈 复盘
             key = cmd[5:]
             words = [RANGE_WORDS.get(key, key)]
-            return export(engine, words) if cmd.startswith("/exp_") else review(engine, words)
+            return await asyncio.to_thread(export if cmd.startswith("/exp_") else review, engine, words, engine.review_reader())
         if cmd == "/probe":
             try:
                 hours = float(args[0]) if args else 1.0

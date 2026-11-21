@@ -206,8 +206,10 @@ class CancelReviewTest(unittest.TestCase):
         self.assertAlmostEqual(rows[90]["pnl"], 5.30)
         self.assertAlmostEqual(rows[120]["pnl"], 0.0)            # btc's fill came 100 s before: gone too
         self.assertEqual((rows[10]["filled"], rows[10]["both"]), (2, 1))
-        self.assertIsNone(c["best"])                             # four windows: too few to name one
+        self.assertEqual(c["best"], 10)
+        self.assertIsNone(c["recommend"])                        # four windows: too few to recommend a change
         self.assertIn("样本还少", c["advice"])
+        self.assertEqual(c["confidence"]["level"], "低")
         quick = {t["bucket"]: t for t in c["by_fill_time"]}["开场前 0～15 秒"]
         self.assertEqual((quick["shares"], quick["won"]), (20.0, 10.0))  # eth down lost, sol down won
         self.assertAlmostEqual(quick["breakeven"], 0.47)
@@ -219,9 +221,12 @@ class CancelReviewTest(unittest.TestCase):
             c = journal.cancel_review(self.records, self.now, current=15)
         finally:
             journal.CANCEL_SAMPLE = old
-        self.assertEqual(c["best"], 10)
+        self.assertEqual((c["best"], c["recommend"]), (10, 10))
         self.assertIn("改成开场前 10 秒撤单最好", c["advice"])
-        self.assertIn("实际是 +1.20", c["advice"])               # btc +5.30, eth -4.70, sol +0.60
+        # compared with the current setting replayed on the same windows (15 s: sol keeps only its up side, -4.70),
+        # not with what happened under the old setting (actual +1.20)
+        self.assertIn("比现在的开场前 15 秒（+0.60）多 5.30", c["advice"])
+        self.assertEqual({r["cancel_s"]: r["delta"] for r in c["rows"]}[10], 5.3)
 
     def test_windows_cancelled_earlier_are_left_out_and_later_cancels_are_not_replayed(self):
         early = [settled("doge", T0 + 300 * i, "up", {"up": [(200, 10)]}, cancel_lead=60) for i in range(9)]
@@ -385,16 +390,21 @@ class TimeFilterTest(unittest.TestCase):
 
     def test_the_console_filters_by_the_query(self):
         import asyncio
-        c = asyncio.run(self._console())
-        d = c.review({"range": "custom", "from": "11-13 09:00", "to": "11-13 18:00"})
-        self.assertEqual([m["coin"] for m in d["by_market"]], ["XRP", "ETH"])
-        self.assertEqual(d["span"]["label"], "11-13 09:00 ～ 11-13 18:00")
-        self.assertEqual(d["market_more"], 0)
-        self.assertIn("error", c.review({"range": "custom", "from": "11-13", "to": "11-12"}))
-        name, text = c.csv("markets", {"range": "today"})
-        self.assertEqual(name, "preopen-markets.csv")
-        self.assertNotIn("BTC", text)
-        self.assertIn("BTC", c.csv("markets", {})[1])
+
+        async def check():
+            c = await self._console()
+            d = await c.review({"range": "custom", "from": "11-13 09:00", "to": "11-13 18:00"})
+            self.assertEqual([m["coin"] for m in d["by_market"]], ["XRP", "ETH"])
+            self.assertEqual(d["span"]["label"], "11-13 09:00 ～ 11-13 18:00")
+            self.assertEqual(d["market_more"], 0)
+            self.assertIn("error", await c.review({"range": "custom", "from": "11-13", "to": "11-12"}))
+            name, text = await c.csv("markets", {"range": "today"})
+            self.assertEqual(name, "preopen-markets-今天.csv")
+            self.assertNotIn("BTC", text)
+            self.assertIn("BTC", (await c.csv("markets", {}))[1])
+            with self.assertRaises(ValueError):   # a filter that is not one is said so, not exported as everything
+                await c.csv("markets", {"range": "custom", "from": "x", "to": "11-12"})
+        asyncio.run(check())
 
 
 class JournalTest(unittest.IsolatedAsyncioTestCase):
@@ -423,7 +433,9 @@ class JournalTest(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(day["cost"], 14 * 0.49)
         self.assertAlmostEqual(day["pnl"], 10 - 14 * 0.49)
         self.assertEqual(review["totals"]["all"]["fill_rate"], 50.0)
-        self.assertEqual({s["side"]: s["shares"] for s in review["by_side"]}, {"涨": 10.0, "跌": 4.0})
+        # 10 up and 4 down: 4 pairs (+0.08 locked) and 6 up alone (won: +3.06), adding up to the day's +3.14
+        self.assertEqual([(r["shares"], r["pnl"]) for r in review["by_side"]], [(4.0, 0.08), (6.0, 3.06), (0.0, 0.0), (0.0, None)])
+        self.assertAlmostEqual(sum(r["pnl"] for r in review["by_side"][:3]), day["pnl"])
         self.assertEqual([(b["bucket"], b["fills"]) for b in review["by_lead"]], [("5～30 分钟", 2)])  # seen at the snapshot after the fills
         detail = review["detail"][0]
         self.assertEqual((detail["coin"], detail["result"], detail["up"], detail["down"]), ("BTC", "涨", 10.0, 4.0))

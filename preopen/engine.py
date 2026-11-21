@@ -23,14 +23,16 @@ PREOPEN_KEY_EXCLUSIVE=on says the API key is the bot's alone (then a window's ma
 from __future__ import annotations
 
 import asyncio
+import bisect
 import collections
 import contextlib
+import heapq
 import json
 import logging
 import time
 from dataclasses import dataclass
 from decimal import Decimal as D
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from . import config
 from . import markets as mk
@@ -186,7 +188,6 @@ class Engine:
         self.recent_refusals: collections.deque = collections.deque(maxlen=500)  # (when, slug, code) of those refusals
         self.external: collections.deque = collections.deque(maxlen=200)         # (when, slug) of cancels made elsewhere
         self.restart = False                  # set by the console (a LIVE switch): main() starts the process again
-        self._archive: tuple[int, list[dict]] = (-1, [])
         self.attempted: dict[str, tuple[str, int]] = {}  # condition id -> (slug, start) of every market an order was sent to
         self.strays: set[str] = set()         # order ids that came back after their record was judged: cancelled
         self.by_hash: dict[str, tuple[str, str]] = {}    # order hash -> (record key, side)
@@ -2085,12 +2086,26 @@ class Engine:
         return {"fills": len(windows), "both": sum(1 for w in windows.values() if len(w["sides"]) == len(mk.SIDES)),
                 "pnl": pnl, "settled": sum(1 for w in windows.values() if w["settled"])}
 
+    def review_reader(self) -> Callable[..., Iterator[dict]]:
+        """For a review worked out in another thread. Here, on the event loop: the working records copied (a record and
+        its orders: the loops change them in place). Returned: read(lo, hi, newest_first=False), the records of the
+        windows starting from lo to hi in start order, the archived ones read from the database a batch at a time
+        (11-21: a 60-day archive read whole took 0.7 GB and 3 s on the event loop; it is never held now)."""
+        working = sorted(({**q, "orders": {side: dict(o) for side, o in (q.get("orders") or {}).items()}}
+                          for q in self.ledger.rows.values()), key=lambda q: q["start"])
+        keys = {q["key"] for q in working}
+        starts = [q["start"] for q in working]
+        ledger = self.ledger
+
+        def read(lo: float = float("-inf"), hi: float = float("inf"), newest_first: bool = False) -> Iterator[dict]:
+            part = working[bisect.bisect_left(starts, lo):bisect.bisect_left(starts, hi)]
+            archived = (q for q in ledger.archived_between(lo, hi, newest_first) if q["key"] not in keys)
+            return heapq.merge(archived, reversed(part) if newest_first else part, key=lambda q: q["start"], reverse=newest_first)
+        return read
+
     def all_records(self) -> list[dict]:
-        """The working records and the archived ones (the review reads both; the archive is read again only when it grew)."""
-        count = self.ledger.archive_count()
-        if self._archive[0] != count:
-            self._archive = (count, list(self.ledger.archived()))
-        return list(self.ledger.rows.values()) + self._archive[1]
+        """The working records and the archived ones, all in memory (the tests; a review reads by review_reader)."""
+        return list(self.ledger.rows.values()) + list(self.ledger.archived())
 
     def pending(self) -> list[dict[str, Any]]:
         """What wants a look (the console's 待处理): orders of unknown state, withdrawals running late."""
