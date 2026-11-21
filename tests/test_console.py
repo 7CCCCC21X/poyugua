@@ -280,7 +280,8 @@ class WindowCountTest(unittest.TestCase):
     """11-19 review: quoted windows were counted once per window, fills once per level and attempt: one window filled on
     two levels showed 1 quoted, 2 filled, 200%. And a side's fills all went to its first fill's time."""
 
-    def level(self, coin, start, level, result, fills, price):
+    @staticmethod
+    def level(coin, start, level, result, fills, price):
         q = settled(coin, start, result, fills, price=price)
         q["key"], q["level"] = f"{coin}-{start}#{level}@0", level
         return q
@@ -312,6 +313,88 @@ class WindowCountTest(unittest.TestCase):
         q = settled("btc", t, "up", {"up": [(1000, 1), (5, 9)]})       # 1 share 1000 s before the start, 9 shares 5 s before
         lead = {b["bucket"]: (b["fills"], b["shares"]) for b in journal.journal([q], T0)["by_lead"]}
         self.assertEqual(lead, {"5～30 分钟": (1, 1.0), "开场前 1 分钟内": (1, 9.0)})
+
+
+class TimeFilterTest(unittest.TestCase):
+    """11-21: the review by the day's volume, every market's P&L, and a time filter (by the windows' start, Beijing)."""
+
+    def setUp(self):
+        self.now = T0 + 6 * 3600                       # 2026-11-13 16:30 Beijing
+        today = journal.day_start(self.now)
+        self.records = [
+            # yesterday 10:00: BTC on two levels, settled (up won: 10 × 0.47 + 20 × 0.40 paid, 10 back)
+            WindowCountTest.level("btc", int(today - 86400 + 36000), 0, "up", {"up": [(900, 10)]}, "0.47"),
+            WindowCountTest.level("btc", int(today - 86400 + 36000), 1, "up", {"down": [(600, 20)]}, "0.40"),
+            # today 09:00: ETH both sides, settled (+0.60); today 15:00: SOL quoted, nothing filled
+            settled("eth", int(today + 32400), "down", {"up": [(100, 10)], "down": [(50, 10)]}),
+            settled("sol", int(today + 54000), "up", {}),
+        ]
+        later = settled("xrp", int(today + 61200), "up", {"up": [(300, 10)]})   # today 17:00: filled, not settled yet
+        later.update(phase="closed", result=None)
+        self.records.append(later)
+
+    def test_moments_and_spans(self):
+        now = self.now
+        self.assertEqual(journal.parse_when("11-12", now), (journal.day_start(now) - 86400, False))
+        self.assertEqual(journal.parse_when("2026-11-13T08:30", now)[1], True)
+        self.assertEqual(journal.span_label(journal.preset_span("yesterday", now)), "11-12")
+        self.assertEqual(journal.span_label(journal.custom_span("11-11", "11-13", now)), "11-11 ～ 11-13")
+        self.assertEqual(journal.span_label(journal.custom_span("11-13 08:00", "11-13 12:00", now)), "11-13 08:00 ～ 11-13 12:00")
+        with self.assertRaises(ValueError):
+            journal.custom_span("11-13", "11-12", now)
+        span, label, rest = journal.span_args(["btc", "11-11~11-12"], now)
+        self.assertEqual((label, rest), ("11-11 ～ 11-12", ["btc"]))
+        span, info = journal.span_from("7d", "", "", now)
+        self.assertEqual((info["label"], info["from"], info["to"]), ("近 7 天", "2026-11-07T00:00", "2026-11-14T00:00"))
+        self.assertEqual(journal.span_from("bogus", "", "", now)[0], None)   # anything else: everything
+
+    def test_volume_markets_and_the_filter(self):
+        j = journal.journal(self.records, self.now)
+        day = {d["day"]: d for d in j["by_day"]}
+        today, yesterday = journal.day_of(self.now), journal.day_of(self.now - 86400)
+        self.assertEqual((day[yesterday]["shares"], day[yesterday]["volume"], day[yesterday]["pnl"]), (30.0, 12.7, -2.7))
+        # today: ETH 20 shares $9.40 settled, XRP 10 shares $4.70 not settled yet (traded, P&L to come)
+        self.assertEqual((day[today]["shares"], day[today]["volume"], day[today]["cost"]), (30.0, 14.1, 9.4))
+        markets = {m["coin"]: m for m in j["by_market"]}
+        self.assertEqual(list(markets), ["XRP", "ETH", "BTC"])          # the latest first; SOL never traded
+        self.assertEqual((markets["BTC"]["levels"], markets["BTC"]["up"], markets["BTC"]["down"], markets["BTC"]["pnl"]),
+                         ("1、2", 10.0, 20.0, -2.7))
+        self.assertEqual((markets["ETH"]["both"], markets["ETH"]["result"], markets["ETH"]["pnl"]), (True, "跌", 0.6))
+        self.assertEqual((markets["XRP"]["result"], markets["XRP"]["pnl"]), ("", None))
+        # yesterday only: everything below the cards follows it, the cards do not
+        y = journal.journal(self.records, self.now, span=journal.preset_span("yesterday", self.now))
+        self.assertEqual(y["totals"]["all"], j["totals"]["all"])
+        self.assertEqual((y["totals"]["range"]["quoted"], y["totals"]["range"]["pnl"]), (1, -2.7))
+        self.assertEqual([m["coin"] for m in y["by_market"]], ["BTC"])
+        self.assertEqual([d["day"] for d in y["by_day"]], [yesterday])
+        self.assertEqual([c["coin"] for c in y["by_coin"]], ["BTC"])
+        self.assertEqual(y["span"], "11-12")
+        c = y["cancel"]                                # the replay too, by window: BTC's two levels are one window,
+        self.assertEqual((c["windows"], c["actual"]["filled"], c["actual"]["both"]), (1, 1, 1))   # up on one, down on the other
+        csv_text = journal.markets_csv(y)
+        self.assertIn("BTC,1、2,10,20,是,12.7,涨,-2.7", csv_text)
+        daily = journal.daily_csv(j)
+        self.assertIn("成交额$", daily.splitlines()[0])
+
+    async def _console(self):
+        e, clock, pub, x = make_engine(settings(**ENV))
+        clock.t = self.now
+        for q in self.records:
+            e.save(q)
+        return Console(e, ENV, Path(tempfile.mkdtemp()) / "c.json", {})
+
+    def test_the_console_filters_by_the_query(self):
+        import asyncio
+        c = asyncio.run(self._console())
+        d = c.review({"range": "custom", "from": "11-13 09:00", "to": "11-13 18:00"})
+        self.assertEqual([m["coin"] for m in d["by_market"]], ["XRP", "ETH"])
+        self.assertEqual(d["span"]["label"], "11-13 09:00 ～ 11-13 18:00")
+        self.assertEqual(d["market_more"], 0)
+        self.assertIn("error", c.review({"range": "custom", "from": "11-13", "to": "11-12"}))
+        name, text = c.csv("markets", {"range": "today"})
+        self.assertEqual(name, "preopen-markets.csv")
+        self.assertNotIn("BTC", text)
+        self.assertIn("BTC", c.csv("markets", {})[1])
 
 
 class JournalTest(unittest.IsolatedAsyncioTestCase):

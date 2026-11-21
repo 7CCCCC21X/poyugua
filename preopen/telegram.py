@@ -33,15 +33,16 @@ BUTTONS = {  # keyboard button text -> command
     "🧾 拒单": "/rejects",
 }
 COMMANDS = [("status", "状态"), ("check", "体检"), ("probe", "只读探测接下来的场次"), ("web", "打开网页控制台"),
-            ("pause", "暂停并撤掉全部挂单"), ("resume", "恢复挂单"), ("review", "复盘结论：/review 7 = 最近 7 天，/review btc = 只看 BTC"),
-            ("export", "导出记录（CSV 文件）：/export 7 = 最近 7 天"),
+            ("pause", "暂停并撤掉全部挂单"), ("resume", "恢复挂单"), ("review", "复盘：/review 今天、/review 昨天、/review 7（最近 7 天）、/review 11-18 11-20、/review btc"),
+            ("export", "导出记录（CSV 文件）：/export 昨天、/export 7、/export 11-18 11-20"),
             ("rejects", "拒单：真实原因、证据和现场检测（/rejects 1 = 最近 1 小时）"), ("help", "说明和按钮")]
 CONFIRM_PAUSE = "pause!"  # callback data of the inline 确认 button: the handler is asked "/pause!"
 CANCEL = "cancel"
 
 HELP = ("按钮：📊 状态、🩺 体检、🧾 拒单、📈 复盘、📤 导出、🔎 探测、🌐 网页、⏸ 暂停（会先确认）、▶️ 恢复；左下角菜单按钮打开网页控制台。\n"
-        "命令：/status 状态 /check 体检 /rejects [小时] 拒单原因 /probe [小时] 只读探测 /review [天数] [币种] 复盘 /export [天数] 导出 CSV /web 网页 "
-        "/pause 暂停并撤单 /resume 恢复 /help 本说明")
+        "命令：/status 状态 /check 体检 /rejects [小时] 拒单原因 /probe [小时] 只读探测 /review [时间] [币种] 复盘 /export [时间] 导出 CSV /web 网页 "
+        "/pause 暂停并撤单 /resume 恢复 /help 本说明\n"
+        "时间可以写：今天、昨天、7（最近 7 天）、11-20（那一天）、11-18 11-20（这几天）")
 
 
 @dataclass

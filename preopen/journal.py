@@ -8,6 +8,7 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import io
+import re
 from collections import defaultdict
 from decimal import Decimal as D
 from typing import Any, Iterable
@@ -23,6 +24,10 @@ TABS = ("open", "filled", "closed", "all")
 CANCEL_CHOICES = (10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 300, 420, 600, 900, 1800)   # seconds before the start
 FILL_TIMES = ((0, "开场之后（不该有）"), (15, "开场前 0～15 秒"), (30, "15～30 秒"), (60, "30～60 秒"), (120, "1～2 分钟"),
               (300, "2～5 分钟"), (900, "5～15 分钟"), (float("inf"), "15 分钟以上"))
+RANGES = {"all": "全部", "today": "今天", "yesterday": "昨天", "7d": "近 7 天", "30d": "近 30 天"}   # the review's time filter
+MARKETS_SHOWN = 500       # windows listed on the page (all of them in the CSV)
+DAYS_IN_TEXT = 7          # Telegram's review: this many days, and the markets that lost and won most, this many each
+MARKETS_IN_TEXT = 3
 CANCEL_SAMPLE = 20        # filled windows before the review names a best cancel time
 END_SLACK_S = 2.0         # a cancel confirmed this much earlier than a candidate still counts as resting until it
 
@@ -41,6 +46,116 @@ def day_of(ts: float) -> str:
 
 def hour_of(ts: float) -> int:
     return dt.datetime.fromtimestamp(ts, mk.BEIJING).hour
+
+
+def day_start(ts: float) -> float:
+    """00:00 Beijing time of the day `ts` falls in."""
+    d = dt.datetime.fromtimestamp(ts, mk.BEIJING)
+    return dt.datetime(d.year, d.month, d.day, tzinfo=mk.BEIJING).timestamp()
+
+
+WHEN = re.compile(r"^(?:(\d{4})-)?(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2}):(\d{2}))?$")
+
+
+def parse_when(text: str, now: float) -> tuple[float, bool]:
+    """A moment the operator typed, Beijing time: 2026-11-20, 11-20, 11/20, 2026-11-20T08:30 (the page's picker),
+    11-20 08:30. Returns (the moment, whether a time of day was given). A month and day without a year is the latest
+    such date not after tomorrow (typed in January, 12-30 is last December's). ValueError when it is not one."""
+    m = WHEN.match(text.strip().replace("/", "-").replace("：", ":"))
+    if not m:
+        raise ValueError(f"看不懂的时间：{text}（写成 11-20、2026-11-20 或 11-20 08:30）")
+    year, month, day, hour, minute = m.groups()
+    this_year = dt.datetime.fromtimestamp(now, mk.BEIJING).year
+    try:
+        moment = dt.datetime(int(year or this_year), int(month), int(day), int(hour or 0), int(minute or 0), tzinfo=mk.BEIJING)
+        if not year and moment.timestamp() > day_start(now) + 2 * 86400:
+            moment = moment.replace(year=this_year - 1)
+    except ValueError:
+        raise ValueError(f"没有这个时间：{text}") from None
+    return moment.timestamp(), hour is not None
+
+
+def preset_span(name: str, now: float) -> tuple[float, float] | None:
+    """The filter's presets, by the windows' start (Beijing days): today and the days before it; None is all."""
+    today = day_start(now)
+    return {"today": (today, today + 86400), "yesterday": (today - 86400, today), "7d": (today - 6 * 86400, today + 86400),
+            "30d": (today - 29 * 86400, today + 86400)}.get(name)
+
+
+def custom_span(frm: str, to: str, now: float) -> tuple[float, float]:
+    """From one moment to another, the windows starting from `frm` (a date: its 00:00) up to `to` (a date: the end of
+    that day; a time: until then, the window starting then not included)."""
+    lo, _ = parse_when(frm, now)
+    hi, timed = parse_when(to, now)
+    if not timed:
+        hi += 86400
+    if hi <= lo:
+        raise ValueError("结束时间要晚于开始时间")
+    return lo, hi
+
+
+def span_label(span: tuple[float, float] | None) -> str:
+    """11-20, 11-18 ～ 11-20 (whole days), or 11-20 08:00 ～ 11-20 12:00."""
+    if span is None:
+        return "全部"
+    lo, hi = span
+    if hi == float("inf"):
+        return f"{mk.hm(lo)} 以来"
+    if lo == day_start(lo) and hi == day_start(hi):
+        first, last = day_of(lo)[5:], day_of(hi - 86400)[5:]
+        return first if first == last else f"{first} ～ {last}"
+    return f"{mk.hm(lo)} ～ {mk.hm(hi)}"
+
+
+def span_from(name: str, frm: str, to: str, now: float) -> tuple[tuple[float, float] | None, dict[str, str]]:
+    """The page's filter (range=today|yesterday|7d|30d|all, or custom with from/to): the span and how to show it, the
+    bounds as the picker writes them. ValueError when the custom bounds are not times."""
+    name = name if name in RANGES or name == "custom" else "all"
+    span = custom_span(frm, to, now) if name == "custom" else preset_span(name, now)
+
+    def picker(ts: float) -> str:
+        return dt.datetime.fromtimestamp(ts, mk.BEIJING).strftime("%Y-%m-%dT%H:%M")
+    presets = {k: dict(zip(("from", "to"), map(picker, preset_span(k, now) or (now, now)))) for k in RANGES if k != "all"}
+    return span, {"range": name, "label": RANGES.get(name) if name not in ("custom", "all") and span else span_label(span),
+                  "from": picker(span[0]) if span else "", "to": picker(span[1]) if span else "", "presets": presets}
+
+
+def within(records: Iterable[dict], span: tuple[float, float] | None) -> list[dict]:
+    """The records of the windows starting within the span (all of them for None)."""
+    if span is None:
+        return list(records)
+    lo, hi = span
+    return [q for q in records if lo <= q["start"] < hi]
+
+
+def span_args(args: list[str], now: float) -> tuple[tuple[float, float] | None, str, list[str]]:
+    """Telegram's time words: 今天, 昨天, a number of days back (rolling), a date (11-20) or two (11-18 11-20, or
+    11-18~11-20). Returns the span, its label ("" for all) and the words left (the coins). ValueError on a bad date."""
+    span: tuple[float, float] | None = None
+    label, dates, rest = "", [], []
+    for a in args:
+        key = a.strip().lower()
+        if key in ("今天", "today", "昨天", "yesterday"):
+            name = "today" if key in ("今天", "today") else "yesterday"
+            span, label = preset_span(name, now), RANGES[name]
+            continue
+        try:
+            days = float(key)
+        except ValueError:
+            pass
+        else:
+            if days > 0:
+                span, label = (now - days * 86400, float("inf")), f"最近 {mk.fmt(D(str(days)))} 天"
+            continue
+        parts = re.split(r"[~～至到]", key)
+        if all(WHEN.match(x.strip().replace("/", "-")) for x in parts if x.strip()) and any(x.strip() for x in parts):
+            dates += [x.strip() for x in parts if x.strip()]
+            continue
+        rest.append(a)
+    if dates:
+        span = custom_span(dates[0], dates[-1], now)
+        label = span_label(span)
+    return span, label, rest
 
 
 def lead_bucket(seconds: float) -> str:
@@ -89,28 +204,35 @@ def orders(records: Iterable[dict], tab: str, coin: str, now: float, limit: int 
 
 
 def _blank() -> dict[str, Any]:
-    return {"quoted": 0, "filled": 0, "both": 0, "wins": 0, "losses": 0, "cost": D(0), "payout": D(0), "pnl": D(0), "open": 0}
+    return {"quoted": 0, "filled": 0, "both": 0, "wins": 0, "losses": 0, "cost": D(0), "payout": D(0), "pnl": D(0), "open": 0,
+            "shares": D(0), "volume": D(0)}
 
 
 def _finish(t: dict[str, Any]) -> dict[str, Any]:
+    """`cost`, `payout`, `pnl`: the settled windows' (the roi on them); `shares`, `volume`: everything bought, settled
+    or not (the shares and the dollars traded)."""
     out = dict(t)
     out["fill_rate"] = round(t["filled"] / t["quoted"] * 100, 1) if t["quoted"] else None
     out["roi"] = round(float(t["pnl"] / t["cost"] * 100), 2) if t["cost"] else None
-    for k in ("cost", "payout", "pnl"):
+    for k in ("cost", "payout", "pnl", "volume"):
         out[k] = float(round(t[k], 4))
+    out["shares"] = float(t["shares"])
     return out
 
 
-def journal(records: Iterable[dict], now: float, current: int | None = None) -> dict[str, Any]:
-    """The review: totals (today, 7 days, all), by day, coin, starting hour, side and how long before the start the
-    fills came, and the filled windows one by one. Windows are counted as windows (its levels and attempts together:
-    quoted, filled, both sides, won or lost once each; 11-19 review: fills were counted per level and attempt, a window
-    filled on two levels made 200%); the money adds up record by record; each fill goes to the time it came (not the
-    side's first fill's)."""
+def journal(records: Iterable[dict], now: float, current: int | None = None,
+            span: tuple[float, float] | None = None) -> dict[str, Any]:
+    """The review: totals (today, 7 days, all: always the whole ledger), and for the windows starting within `span`
+    (all of them for None): their totals ("range"), by day, coin, starting hour and side, how long before the start
+    the fills came, every window traded with its P&L (by_market), the fills one by one and the cancel-time replay.
+    Windows are counted as windows (its levels and attempts together: quoted, filled, both sides, won or lost once
+    each; 11-19 review: fills were counted per level and attempt, a window filled on two levels made 200%); the money
+    adds up record by record; each fill goes to the time it came (not the side's first fill's)."""
     records = list(records)
+    lo, hi = span or (float("-inf"), float("inf"))
     today = day_of(now)
     week = {day_of(now - 86400 * i) for i in range(7)}
-    totals = {"today": _blank(), "7d": _blank(), "all": _blank()}
+    totals = {"today": _blank(), "7d": _blank(), "all": _blank(), "range": _blank()}
     by_day: dict[str, dict] = defaultdict(_blank)
     by_coin: dict[str, dict] = defaultdict(_blank)
     by_hour: dict[int, dict] = defaultdict(_blank)
@@ -122,15 +244,19 @@ def journal(records: Iterable[dict], now: float, current: int | None = None) -> 
         if not q.get("placed") and not any(filled(q).values()):
             continue  # never rested: not a quote
         day = day_of(q["start"])
+        inside = lo <= q["start"] < hi
         w = windows.get((q["slug"], day))
         if w is None:
-            buckets = [totals["all"], by_day[day], by_coin[mk.name_of(q["coin"])], by_hour[hour_of(q["start"])]]
+            buckets = [totals["all"]]
             if day == today:
                 buckets.append(totals["today"])
             if day in week:
                 buckets.append(totals["7d"])
+            if inside:
+                buckets += [totals["range"], by_day[day], by_coin[mk.name_of(q["coin"])], by_hour[hour_of(q["start"])]]
             w = windows[(q["slug"], day)] = {"buckets": buckets, "sides": set(), "cost": D(0), "payout": D(0),
-                                             "settled": True}
+                                             "settled": True, "inside": inside, "q": q, "levels": set(), "result": "",
+                                             "shares": {side: D(0) for side in mk.SIDES}, "volume": D(0)}
         f = filled(q)
         if not any(f.values()):
             continue
@@ -140,15 +266,25 @@ def journal(records: Iterable[dict], now: float, current: int | None = None) -> 
         cost = sum((v * price for v in f.values()), D(0))
         payout = f.get(result, D(0)) if settled else D(0)
         w["sides"] |= {side for side, v in f.items() if v > 0}
+        w["levels"].add(int(q["level"]))
+        w["volume"] += cost
+        for side, v in f.items():
+            w["shares"][side] = w["shares"].get(side, D(0)) + v
+        for b in w["buckets"]:
+            b["shares"] += sum(f.values(), D(0))
+            b["volume"] += cost
         if settled:
             w["cost"] += cost
             w["payout"] += payout
+            w["result"] = result
             for b in w["buckets"]:
                 b["cost"] += cost
                 b["payout"] += payout
                 b["pnl"] += payout - cost
         else:
             w["settled"] = False
+        if not inside:
+            continue
         for side, shares in f.items():
             if shares <= 0:
                 continue
@@ -181,21 +317,37 @@ def journal(records: Iterable[dict], now: float, current: int | None = None) -> 
             else:
                 b["open"] += 1
     detail.sort(key=lambda q: -q["start"])
+    markets = [market_row(w) for w in windows.values() if w["inside"] and w["sides"]]
+    markets.sort(key=lambda m: (-m["start"], m["coin"]))
 
     def money(x: dict) -> dict:
         return {**x, **{k: float(round(v, 4)) for k, v in x.items() if isinstance(v, D)},
                 "pnl": float(round(x["won"] - x["cost"], 4))}
     return {
         "totals": {k: _finish(v) for k, v in totals.items()},
+        "span": span_label(span),
         "by_day": [{"day": d, **_finish(v)} for d, v in sorted(by_day.items(), reverse=True)][:90],
         "by_coin": [{"coin": c, **_finish(v)} for c, v in sorted(by_coin.items())],
         "by_hour": [{"hour": h, **_finish(by_hour[h])} for h in range(24) if h in by_hour],
         "by_side": [money(v) for v in by_side.values()],
         "by_lead": [money(v) for v in by_lead.values() if v["fills"]],
+        "by_market": markets,
         "detail": [detail_row(q) for q in detail[:200]],
-        "cancel": cancel_review(records, now, current),
+        "cancel": cancel_review(within(records, span), now, current),
         "detail_more": max(0, len(detail) - 200),
     }
+
+
+def market_row(w: dict[str, Any]) -> dict[str, Any]:
+    """One window traded (one Polymarket market: a coin's five minutes), its levels together: the shares each side
+    bought, the dollars, the result and the P&L (None until every filled level is settled)."""
+    q = w["q"]
+    return {"slug": q["slug"], "coin": mk.name_of(q["coin"]), "start": q["start"], "day": day_of(q["start"]),
+            "when": mk.hm(q["start"]), "levels": "、".join(str(i + 1) for i in sorted(w["levels"])),
+            "up": float(w["shares"].get("up", D(0))), "down": float(w["shares"].get("down", D(0))),
+            "both": len(w["sides"]) == len(mk.SIDES), "volume": float(round(w["volume"], 4)),
+            "result": mk.SIDES_CN.get(w["result"], "") if w["settled"] else "",
+            "pnl": float(round(w["payout"] - w["cost"], 4)) if w["settled"] else None}
 
 
 def fill_events(q: dict) -> tuple[dict[str, list[tuple[float, D]]], bool]:
@@ -265,15 +417,15 @@ def cancel_review(records: Iterable[dict], now: float, current: int | None = Non
         return sum(1 for e in ends if e <= c + END_SLACK_S)
     base = next((c for c in CANCEL_CHOICES if covered(c) >= 0.8 * len(ends)), CANCEL_CHOICES[-1]) if ends else CANCEL_CHOICES[0]
     common = [x for x in eligible if x[1] is None or x[1] <= base + END_SLACK_S]
-    windows = {(q["slug"], int(q["level"])) for q, _, _, _ in common}
+    windows = {q["slug"] for q, _, _, _ in common}   # counted as windows, its levels together, as the rest of the review
 
     def replay(cut: float | None) -> dict[str, Any]:
         """The common set with the fills earlier than `cut` seconds before the start kept (None: all of them)."""
-        kept: dict[tuple, dict[str, D]] = defaultdict(lambda: defaultdict(D))
-        result: dict[tuple, str] = {}
+        kept: dict[str, dict[str, D]] = defaultdict(lambda: defaultdict(D))
+        result: dict[str, str] = {}
         cost = payout = D(0)
         for q, _, events, _ in common:
-            key = (q["slug"], int(q["level"]))
+            key = q["slug"]
             price = num(q["price"])
             for side, ev in events.items():
                 sh = sum((v for lead, v in ev if cut is None or lead >= cut), D(0))
@@ -287,7 +439,7 @@ def cancel_review(records: Iterable[dict], now: float, current: int | None = Non
                 "both": sum(1 for k in filled_w if all(kept[k].get(sd, D(0)) > 0 for sd in mk.SIDES)),
                 "shares": sum((sum(v.values(), D(0)) for v in kept.values()), D(0)), "cost": cost, "payout": payout,
                 "pnl": payout - cost}
-    out.update(base=base, windows=len(windows), excluded=len({(q["slug"], int(q["level"])) for q, _, _, _ in eligible}) - len(windows),
+    out.update(base=base, windows=len(windows), excluded=len({q["slug"] for q, _, _, _ in eligible}) - len(windows),
                approx=sum(1 for x in common if x[2] and not x[3]))
     out["actual"] = replay(None)
     out["filled"] = out["actual"]["filled"]
@@ -388,10 +540,23 @@ def detail_csv(records: Iterable[dict]) -> str:
 def daily_csv(review: dict) -> str:
     out = io.StringIO()
     w = csv.writer(out)
-    w.writerow(["日期", "报价场次", "成交场次", "成交率%", "双边成交", "赢", "输", "待结算", "成本$", "回款$", "盈亏$", "收益率%"])
+    w.writerow(["日期", "报价场次", "成交场次", "成交率%", "双边成交", "成交份数", "成交额$", "赢", "输", "待结算", "已结算成本$",
+                "回款$", "盈亏$", "收益率%"])
     for d in review["by_day"]:
-        w.writerow([d["day"], d["quoted"], d["filled"], d["fill_rate"] if d["fill_rate"] is not None else "", d["both"], d["wins"],
-                    d["losses"], d["open"], d["cost"], d["payout"], d["pnl"], d["roi"] if d["roi"] is not None else ""])
+        w.writerow([d["day"], d["quoted"], d["filled"], d["fill_rate"] if d["fill_rate"] is not None else "", d["both"],
+                    mk.fmt(D(str(d["shares"]))), d["volume"], d["wins"], d["losses"], d["open"], d["cost"], d["payout"], d["pnl"],
+                    d["roi"] if d["roi"] is not None else ""])
+    return "\ufeff" + out.getvalue()
+
+
+def markets_csv(review: dict) -> str:
+    """Every window traded, its levels together, the latest first."""
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["市场（开场，北京时间）", "日期", "币种", "成交的档", "涨成交份数", "跌成交份数", "双边", "成交额$", "结果", "盈亏$"])
+    for m in review["by_market"]:
+        w.writerow([m["when"], m["day"], m["coin"], m["levels"], mk.fmt(D(str(m["up"]))), mk.fmt(D(str(m["down"]))),
+                    "是" if m["both"] else "", m["volume"], m["result"] or "待结算", "" if m["pnl"] is None else m["pnl"]])
     return "\ufeff" + out.getvalue()
 
 
@@ -491,13 +656,35 @@ def review_text(records: list[dict], now: float, current: int | None = None, sco
                          f"（保本 {t['breakeven'] * 100:.0f}%），盈亏 {t['pnl']:+.2f}")
     if c["by_coin"]:
         lines += ["", "【按币种】" + "，".join(f"{x['coin']} {x['pnl']:+.2f}（{x['filled']} 场成交）" for x in c["by_coin"])]
+    if j["by_day"]:
+        lines += ["", "【每日】成交额 = 买到的份数 × 买价；盈亏只算已结算的"]
+        for d in j["by_day"][:DAYS_IN_TEXT]:
+            lines.append(f"  {d['day'][5:]}：成交 {d['filled']}/{d['quoted']} 场，{mk.fmt(D(str(d['shares'])))} 份 ${d['volume']:.2f}，"
+                         f"盈亏 {d['pnl']:+.2f}" + (f"（{d['open']} 场待结算）" if d["open"] else ""))
+        if len(j["by_day"]) > DAYS_IN_TEXT:
+            lines.append(f"  …更早的 {len(j['by_day']) - DAYS_IN_TEXT} 天：网页「复盘」或 /export 的每日汇总")
+    settled = [m for m in j["by_market"] if m["pnl"] is not None]
+    if j["by_market"]:
+        waiting = len(j["by_market"]) - len(settled)
+        lines += ["", f"【按市场】{len(j['by_market'])} 场有成交" + (f"（{waiting} 场待结算）" if waiting else "")]
+        worst = [m for m in sorted(settled, key=lambda m: m["pnl"]) if m["pnl"] < 0][:MARKETS_IN_TEXT]
+        best = [m for m in sorted(settled, key=lambda m: -m["pnl"]) if m["pnl"] > 0][:MARKETS_IN_TEXT]
+        for name, chosen in (("亏最多", worst), ("赚最多", best)):
+            if chosen:
+                lines.append(f"  {name}：" + "；".join(f"{m['coin']} {m['when']} {m['pnl']:+.2f}" for m in chosen))
+        lines.append("  每一场的盈亏：网页「复盘」→ 按市场，或 /export 的市场盈亏 CSV")
     lines.append("")
+    if scope:  # the records were chosen by the caller: their whole is the selection
+        t = j["totals"]["all"]
+        lines.append(f"合计（{scope}）：报价 {t['quoted']} 场，成交 {t['filled']} 场（双边 {t['both']}），成交额 ${t['volume']:.2f}，"
+                     f"赢 {t['wins']} 输 {t['losses']}" + (f"，待结算 {t['open']}" if t["open"] else "") + f"，盈亏 {t['pnl']:+.2f} 美元")
+        return "\n".join(lines)
     for k, name in (("today", "今天"), ("7d", "近 7 天"), ("all", "累计")):
         t = j["totals"][k]
         if k != "today" and (t["quoted"], t["pnl"]) == (today["quoted"], today["pnl"]):
             continue  # nothing before today
-        lines.append(f"{name}：报价 {t['quoted']} 场，成交 {t['filled']} 场（双边 {t['both']}），赢 {t['wins']} 输 {t['losses']}"
-                     + (f"，待结算 {t['open']}" if t["open"] else "") + f"，盈亏 {t['pnl']:+.2f} 美元")
+        lines.append(f"{name}：报价 {t['quoted']} 场，成交 {t['filled']} 场（双边 {t['both']}），成交额 ${t['volume']:.2f}，"
+                     f"赢 {t['wins']} 输 {t['losses']}" + (f"，待结算 {t['open']}" if t["open"] else "") + f"，盈亏 {t['pnl']:+.2f} 美元")
     if (alltime["quoted"], alltime["pnl"]) == (today["quoted"], today["pnl"]):
         lines[-1] += "（全部记录都在今天）"
     return "\n".join(lines)

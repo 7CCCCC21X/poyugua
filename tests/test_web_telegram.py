@@ -12,7 +12,7 @@ import urllib.parse
 from helpers import make_engine, settings, tick
 
 import main
-from preopen import markets as mk
+from preopen import journal, markets as mk
 from preopen import web
 from preopen.telegram import BUTTONS, CONFIRM_PAUSE, Reply, Telegram
 
@@ -62,10 +62,12 @@ class FakeApp:
     def orders(self, tab, coin, limit):
         return {"tab": tab, "coin": coin, "limit": limit}
 
-    def review(self):
-        return {"totals": {}}
+    def review(self, query=None):
+        self.calls.append(("review", dict(query or {})))
+        return {"error": "看不懂的时间：x"} if (query or {}).get("from") == "x" else {"totals": {}}
 
-    def csv(self, kind):
+    def csv(self, kind, query=None):
+        self.calls.append(("csv", kind, dict(query or {})))
         return f"{kind}.csv", "\ufeffa,b\n1,2\n"
 
     async def change(self, body):
@@ -128,9 +130,12 @@ class WebServerTest(unittest.IsolatedAsyncioTestCase):
         status, _, body, _ = await s.respond("GET", "/api/orders?tab=filled&coin=btc&limit=5", auth, b"")
         self.assertEqual(json.loads(body), {"tab": "filled", "coin": "btc", "limit": 5})
         self.assertEqual((await s.respond("GET", "/api/journal", auth, b""))[0], 200)
-        status, ctype, body, extra = await s.respond("GET", "/api/journal.csv?kind=daily", auth, b"")
+        status, _, body, _ = await s.respond("GET", "/api/journal?range=custom&from=x&to=11-20", auth, b"")
+        self.assertEqual((status, json.loads(body)["error"]), (400, "看不懂的时间：x"))   # the filter's words, said
+        status, ctype, body, extra = await s.respond("GET", "/api/journal.csv?kind=daily&range=yesterday", auth, b"")
         self.assertEqual((status, ctype.split(";")[0]), (200, "text/csv"))
         self.assertIn("daily.csv", dict(extra)["Content-Disposition"])
+        self.assertEqual(s.app.calls[-1], ("csv", "daily", {"kind": "daily", "range": "yesterday"}))  # the CSV follows the filter
         for page in ("/", "/control", "/journal"):
             self.assertEqual((await s.respond("GET", page, {}, b""))[0], 200)
 
@@ -253,8 +258,22 @@ class TelegramTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("（BTC、最近 7 天）", await handle("/review", ["btc", "7"]))
         self.assertIn("报价 0 场", await handle("/review", ["eth"]))  # only ETH: nothing quoted
         self.assertIn("看不懂：abc", await handle("/review", ["abc"]))
+        text = await handle("/review", [])
+        self.assertIn("【每日】", text)
+        self.assertIn("【按市场】1 场有成交", text)
+        self.assertIn("赚最多：BTC", text)
+        self.assertIn("成交额 $4.90", text)
+        day = journal.day_of(starts[0])[5:]
+        self.assertIn(f"合计（{day}）：报价 2 场，成交 1 场", await handle("/review", [day]))
+        self.assertIn("合计（昨天）：报价 0 场", await handle("/review", ["昨天"]))
+        self.assertIn("没有这个时间：13-40", await handle("/review", ["13-40"]))
         reply = await handle("/export", [])
-        self.assertEqual([n.split("_")[0] for n, _ in reply.files], ["全部报价", "成交明细", "每日汇总", "撤单时间复盘"])
+        self.assertEqual([n.split("_")[0] for n, _ in reply.files], ["市场盈亏", "每日汇总", "成交明细", "全部报价", "撤单时间复盘"])
+        markets = dict(reply.files)[next(n for n, _ in reply.files if n.startswith("市场盈亏"))].decode("utf-8")
+        self.assertIn("BTC", markets)
+        self.assertIn(",涨,5.1", markets)                          # up won: 10 shares paid $4.90
+        self.assertIn("看不懂：abc", (await handle("/export", ["abc"])).text)
+        self.assertIn("导出昨天的记录：0 条报价", (await handle("/export", ["昨天"])).text)
         fills = dict(reply.files)[next(n for n, _ in reply.files if n.startswith("成交明细"))].decode("utf-8")
         self.assertTrue(fills.startswith("\ufeff"))
         self.assertIn("涨成交时刻(开场前秒:份)", fills)
@@ -264,10 +283,10 @@ class TelegramTest(unittest.IsolatedAsyncioTestCase):
         task = asyncio.create_task(tg.sender())
         for _ in range(100):
             await asyncio.sleep(0.05)
-            if len(tg.documents) == 4:
+            if len(tg.documents) == 5:
                 break
         task.cancel()
-        self.assertEqual(len(tg.documents), 4)
+        self.assertEqual(len(tg.documents), 5)
         self.assertTrue(all(name.endswith(".csv") for name, _, _ in tg.documents))
         self.assertEqual(tg.posts[0][0], "sendMessage")  # the text first, then the files
         week = await handle("/export", ["7"])

@@ -18,7 +18,6 @@ import sys
 import time
 from pathlib import Path
 
-from decimal import Decimal as D
 
 from preopen import config, journal, refusals, region
 from preopen import markets as mk
@@ -76,25 +75,30 @@ def acquire_lock(ledger_path: str):
     return f
 
 
+REVIEW_USAGE = ("用法：/review（全部）、/review 今天、/review 昨天、/review 7（最近 7 天）、/review 11-20（那一天）、"
+                "/review 11-18 11-20（这几天）、/review btc、/review btc eth 3")
+EXPORT_USAGE = "用法：/export（全部）、/export 今天、/export 昨天、/export 7（最近 7 天）、/export 11-20、/export 11-18 11-20"
+
+
 def review(engine: Engine, args: list[str]) -> Reply | str:
-    """/review [days] [coin ...]: the analysis as a message, for the last days and the coins named (default: all)."""
-    days, coins, bad = 0.0, set(), []
-    for a in args:
-        try:
-            days = float(a)
-            continue
-        except ValueError:
-            pass
+    """/review [time] [coin ...]: the analysis as a message, for the windows starting in the time named (今天, 昨天, a
+    number of days back, a date or two) and the coins named (default: all)."""
+    now = engine.now()
+    try:
+        span, label, rest = journal.span_args(args, now)
+    except ValueError as error:
+        return f"{error}。{REVIEW_USAGE}"
+    coins, bad = set(), []
+    for a in rest:
         key = a.lower().strip()
         if key in config.COINS:
             coins.add(key)
         else:
             bad.append(a)
     if bad:
-        return f"看不懂：{' '.join(bad)}。用法：/review（全部）、/review 7（最近 7 天）、/review btc、/review btc eth 3"
-    now = engine.now()
-    records = [q for q in engine.all_records() if (not days or q["start"] >= now - days * 86400) and (not coins or q["coin"] in coins)]
-    scope = "、".join(x for x in (" ".join(mk.name_of(c) for c in sorted(coins)), f"最近 {mk.fmt(D(str(days)))} 天" if days else "") if x)
+        return f"看不懂：{' '.join(bad)}。{REVIEW_USAGE}"
+    records = [q for q in journal.within(engine.all_records(), span) if not coins or q["coin"] in coins]
+    scope = "、".join(x for x in (" ".join(mk.name_of(c) for c in sorted(coins)), label) if x)
     text = journal.review_text(records, now, engine.s.cancel_s, scope, float(engine.s.max_daily_loss_usd))
     best = journal.cancel_review(records, now, engine.s.cancel_s)["best"]
     if best and best != engine.s.cancel_s and not coins:  # one coin's sample is no reason to change them all
@@ -125,23 +129,25 @@ async def set_cancel(engine: Engine, console: Console | None, seconds: int) -> s
 
 
 def export(engine: Engine, args: list[str]) -> Reply:
-    """/export [days]: the records as CSV files (all quotes, the fills, by day, the cancel-time review), for a review in
-    Excel or anywhere else. Without a number, everything the ledger holds."""
+    """/export [time]: the records as CSV files (every market's P&L, by day, the fills, all quotes, the cancel-time
+    review), for a review in Excel or anywhere else. The time as /review takes it; without one, everything."""
     now = engine.now()
     try:
-        days = float(args[0]) if args else 0.0
-    except ValueError:
-        days = 0.0
-    records = engine.all_records()
-    if days > 0:
-        records = [q for q in records if q["start"] >= now - days * 86400]
+        span, label, rest = journal.span_args(args, now)
+    except ValueError as error:
+        return Reply(f"{error}。{EXPORT_USAGE}")
+    if rest:
+        return Reply(f"看不懂：{' '.join(rest)}。{EXPORT_USAGE}")
+    records = journal.within(engine.all_records(), span)
     stamp = time.strftime("%Y%m%d-%H%M", time.gmtime(now + 8 * 3600))
     review = journal.journal(records, now, engine.s.cancel_s)
-    files = [(f"全部报价_{stamp}.csv", journal.quotes_csv(records)), (f"成交明细_{stamp}.csv", journal.detail_csv(records)),
-             (f"每日汇总_{stamp}.csv", journal.daily_csv(review)), (f"撤单时间复盘_{stamp}.csv", journal.cancel_csv(review["cancel"]))]
+    files = [(f"市场盈亏_{stamp}.csv", journal.markets_csv(review)), (f"每日汇总_{stamp}.csv", journal.daily_csv(review)),
+             (f"成交明细_{stamp}.csv", journal.detail_csv(records)), (f"全部报价_{stamp}.csv", journal.quotes_csv(records)),
+             (f"撤单时间复盘_{stamp}.csv", journal.cancel_csv(review["cancel"]))]
     quoted = sum(1 for q in records if q.get("placed") or any(journal.filled(q).values()))
-    span = f"最近 {mk.fmt(D(str(days)))} 天" if days > 0 else "全部"
-    return Reply(f"📤 导出{span}的记录：{quoted} 条报价，{review['totals']['all']['filled']} 场有成交。4 个 CSV 文件马上发过来"
+    t = review["totals"]["all"]
+    return Reply(f"📤 导出{label or '全部'}的记录：{quoted} 条报价，{t['filled']} 场有成交，成交额 ${t['volume']:.2f}，"
+                 f"已结算盈亏 {t['pnl']:+.2f} 美元。{len(files)} 个 CSV 文件马上发过来"
                  "（Excel 可以直接打开；成交时刻一栏是「开场前几秒:份数」）。", files=[(name, text.encode("utf-8")) for name, text in files])
 
 

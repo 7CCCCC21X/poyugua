@@ -68,8 +68,8 @@ def check_init_data(init_data: str, bot_token: str, admins: Any, now: float | No
 
 
 class WebServer:
-    """`app` is the console back end (console.Console): report(), settings(), orders(tab, coin, limit), review(),
-    csv(kind), and the coroutines change(body) and action(body)."""
+    """`app` is the console back end (console.Console): report(), settings(), orders(tab, coin, limit), review(query),
+    csv(kind, query) (query: the review's time filter), and the coroutines change(body) and action(body)."""
 
     def __init__(self, port: int, app: Any, web_key: str = "", bot_token: str = "", admin_id: str = "", host: str = "0.0.0.0"):
         self.port, self.host = port, host
@@ -150,9 +150,10 @@ class WebServer:
                     limit = 300
                 return self._json(200, self.app.orders(query.get("tab", "open"), query.get("coin", ""), limit))
             if path == "/api/journal":
-                return self._json(200, self.app.review())
+                data = self.app.review(query)
+                return self._json(400 if "error" in data else 200, data)
             if path == "/api/journal.csv":
-                name, text = self.app.csv(query.get("kind", "detail"))
+                name, text = self.app.csv(query.get("kind", "detail"), query)
                 return 200, "text/csv; charset=utf-8", text.encode("utf-8"), [("Content-Disposition", f'attachment; filename="{name}"')]
             return 404, "text/plain", b"not found", []
         if method != "POST":
@@ -267,6 +268,11 @@ a.link { color:var(--accent); cursor:pointer; font-size:12px; }
 .toast.err { background:var(--bad); color:#fff; }
 details summary { cursor:pointer; color:var(--muted); margin:8px 0; }
 select { font:inherit; padding:5px 8px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--text); }
+.frow { display:flex; flex-wrap:wrap; align-items:center; gap:6px 10px; }
+.frow .chips { margin-bottom:0; }
+.frow input { padding:5px 8px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--text); font:inherit; min-width:0; }
+#jCustom { margin-top:8px; }
+.tall { max-height:480px; overflow:auto; } .tall th { position:sticky; top:0; background:var(--card); }
 .orow { padding:8px 0; border-bottom:1px solid var(--line); font-size:13px; }
 .orow .l1 { display:flex; flex-wrap:wrap; align-items:center; gap:4px 10px; } .orow .l1 button { margin-left:auto; }
 .orow .l2 { margin-top:2px; color:var(--text); }
@@ -320,18 +326,26 @@ select { font:inherit; padding:5px 8px; border-radius:8px; border:1px solid var(
 
     <div id="tab-journal" hidden>
       <div class="cards" id="jTotals"></div>
-      <div class="ops"><button class="secondary" id="csvDetail">导出成交明细 CSV</button><button class="secondary" id="csvDaily">导出每日汇总 CSV</button><button class="secondary" id="csvQuotes">导出全部报价 CSV</button><button class="secondary" id="csvCancel">导出撤单时间复盘 CSV</button></div>
+      <section>
+        <div class="frow"><b>时间</b><span class="chips" id="jRanges"></span></div>
+        <div class="frow" id="jCustom" hidden><input type="datetime-local" id="jFrom" aria-label="开始"><span>～</span><input type="datetime-local" id="jTo" aria-label="结束"><button class="small" id="jApply">筛选</button></div>
+        <p class="muted small" style="margin:6px 0 0">按开场时间（北京时间）筛选，下面所有内容和导出的 CSV 都只算这段时间的场次；上面三张卡片不受影响。</p>
+      </section>
+      <div class="cards" id="jRange"></div>
+      <div class="ops"><button class="secondary" id="csvMarkets">导出市场盈亏 CSV</button><button class="secondary" id="csvDaily">导出每日汇总 CSV</button><button class="secondary" id="csvDetail">导出成交明细 CSV</button><button class="secondary" id="csvQuotes">导出全部报价 CSV</button><button class="secondary" id="csvCancel">导出撤单时间复盘 CSV</button></div>
       <section><h2>开场前几秒撤单最好</h2><p id="cAdvice"></p><div class="scroll"><table id="cRows"></table></div>
         <p class="muted small" id="cNote">把每一场按「如果提前 X 秒撤单」重算：X 秒之后才成交的单当作没成交。同一批场次比较，所以各行能直接比。只能算比当时撤得更早的情况。</p></section>
       <section><h2>什么时候成交的（按成交时刻）</h2><div class="scroll"><table id="cTimes"></table></div>
         <p class="muted small">买的那一边最后赢的比例低于保本线（=买价），这个时段的成交就是亏的：撤单时间应该提前到它之前。</p></section>
-      <section><h2>按日期（北京时间，按开场日）</h2><div class="scroll"><table id="jDay"></table></div></section>
+      <section><h2>按日期：每日成交量和盈亏（北京时间，按开场日）</h2><div class="scroll"><table id="jDay"></table></div>
+        <p class="muted small">成交额 = 买到的份数 × 买价（还没结算的也算）；盈亏和收益率只算已经结算的场次。</p></section>
+      <section><h2>按市场：每一场的盈亏<span class="chips" id="mSort"></span></h2><div class="scroll tall"><table id="jMarket"></table></div><p class="muted small" id="mNote"></p></section>
       <div class="grid2">
         <section><h2>按币种</h2><div class="scroll"><table id="jCoin"></table></div></section>
         <section><h2>按方向</h2><div class="scroll"><table id="jSide"></table></div><p class="muted small">成交了哪一边、那一边赢了多少：两边成交的那部分是锁定利润，只成交一边的是 49¢ 买五五开</p></section>
       </div>
       <section><h2>按开场时段（北京时间几点）</h2><div class="scroll"><table id="jHour"></table></div></section>
-      <section><h2>成交明细（最近 200 场）</h2><div class="scroll"><table id="jDetail"></table></div><p class="muted small" id="jMore"></p></section>
+      <section><h2>成交明细（每一档，最近 200 条）</h2><div class="scroll"><table id="jDetail"></table></div><p class="muted small" id="jMore"></p></section>
     </div>
     <p class="muted small" id="stamp"></p>
   </div>
@@ -375,7 +389,8 @@ $("loginBtn").onclick = async () => {
 };
 $("key").addEventListener("keydown", (e) => { if (e.key === "Enter") $("loginBtn").click(); });
 
-const state = { tab: (location.hash || "").slice(1) || store.get("tab", "overview"), ordersTab: store.get("ordersTab", "open"), coin: store.get("coin", ""), report: null };
+const state = { tab: (location.hash || "").slice(1) || store.get("tab", "overview"), ordersTab: store.get("ordersTab", "open"), coin: store.get("coin", ""), report: null,
+  jRange: store.get("jRange", "all"), jFrom: store.get("jFrom", ""), jTo: store.get("jTo", ""), mSort: store.get("mSort", "time"), journal: null };
 const TABS = ["overview", "settings", "orders", "journal"];
 let timer = null;
 function go(tab) {
@@ -551,14 +566,72 @@ async function loadOrders() {
 $("coinFilter").onchange = () => { state.coin = $("coinFilter").value; store.set("coin", state.coin); loadOrders(); };
 
 // ---- 复盘
-async function loadJournal() {
-  const r = await api("/api/journal"); if (r.status !== 200) return; const d = r.data; state.jAt = Date.now();
+const RANGES = [["all", "全部"], ["today", "今天"], ["yesterday", "昨天"], ["7d", "近 7 天"], ["30d", "近 30 天"], ["custom", "自定义"]];
+const MSORT = [["time", "按时间"], ["loss", "亏最多"], ["gain", "赚最多"]];
+const shares = (v) => v == null ? "—" : String(Math.round(Number(v) * 100) / 100);
+function jQuery(f) {
+  f = f || {range: state.jRange, from: state.jFrom, to: state.jTo};
+  const p = new URLSearchParams({range: f.range});
+  if (f.range === "custom") { p.set("from", f.from || ""); p.set("to", f.to || ""); }
+  return p.toString();
+}
+function renderRanges(info) {
+  $("jRanges").innerHTML = RANGES.map(([k, label]) => `<span class="chip ${k === state.jRange ? "on" : ""}" data-jr="${k}">${label}</span>`).join("");
+  $("jCustom").hidden = state.jRange !== "custom" && $("jCustom").dataset.open !== "1";
+  for (const el of document.querySelectorAll("[data-jr]")) el.onclick = () => {
+    const k = el.dataset.jr;
+    if (k === "custom") {  // the picker opens on the bounds shown now (or the last 7 days); 筛选 applies it
+      const P = (info && info.presets) || {}, now = info && info.range !== "all" ? info : P["7d"] || {};
+      if (!$("jFrom").value) $("jFrom").value = state.jFrom || now.from || "";
+      if (!$("jTo").value) $("jTo").value = state.jTo || now.to || "";
+      $("jCustom").dataset.open = "1"; $("jCustom").hidden = false; return;
+    }
+    $("jCustom").dataset.open = ""; loadJournal({range: k});
+  };
+}
+$("jApply").onclick = () => {
+  const from = $("jFrom").value, to = $("jTo").value;
+  if (!from || !to) return toast("开始和结束都要选", true);
+  loadJournal({range: "custom", from, to});
+};
+function renderMarkets() {
+  const d = state.journal; if (!d) return;
+  $("mSort").innerHTML = MSORT.map(([k, label]) => `<span class="chip ${k === state.mSort ? "on" : ""}" data-ms="${k}">${label}</span>`).join("");
+  for (const el of document.querySelectorAll("[data-ms]")) el.onclick = () => { state.mSort = el.dataset.ms; store.set("mSort", state.mSort); renderMarkets(); };
+  const rows = d.by_market.slice(), val = (x) => x.pnl == null ? null : x.pnl;
+  if (state.mSort !== "time") rows.sort((a, b) => (val(a) == null) - (val(b) == null) || (state.mSort === "loss" ? val(a) - val(b) : val(b) - val(a)));
+  $("jMarket").innerHTML = "<tr><th>市场（开场）</th><th>盈亏</th><th>结果</th><th>成交额</th><th>涨（份）</th><th>跌（份）</th><th>成交的档</th></tr>" + (rows.map((x) =>
+    `<tr><td>${esc(x.coin)} ${esc(x.when)}</td><td>${x.pnl == null ? "—" : signed(x.pnl)}</td><td>${x.result ? esc(x.result) : '<span class="muted">待结算</span>'}</td>` +
+    `<td>${money(x.volume)}</td><td>${x.up ? shares(x.up) : ""}</td><td>${x.down ? shares(x.down) : ""}</td><td>${esc(x.levels)}</td></tr>`).join("") || '<tr><td colspan="7" class="muted">这段时间没有成交的场次</td></tr>');
+  const R = d.totals.range, idle = R.quoted - R.filled;
+  $("mNote").textContent = (d.by_market.length ? `${R.filled} 场有成交` + (idle > 0 ? `，另有 ${idle} 场报价了但没成交（盈亏为 0，不列出）` : "") : "") +
+    (d.market_more ? `；页面只列最近 ${d.by_market.length} 场，另有 ${d.market_more} 场在「导出市场盈亏 CSV」里` : "");
+}
+async function loadJournal(next) {
+  // a new filter is kept (and remembered) only once the server took it; one it refuses leaves the last good one
+  const want = next ? Object.assign({from: "", to: ""}, next) : {range: state.jRange, from: state.jFrom, to: state.jTo};
+  const r = await api("/api/journal?" + jQuery(want));
+  if (r.status === 400) {
+    toast((r.data && r.data.error) || "时间不对", true);
+    if (!next && state.jRange !== "all") loadJournal({range: "all"});  // a remembered filter gone bad: everything
+    return;
+  }
+  if (r.status !== 200) return; const d = r.data; state.jAt = Date.now(); state.journal = d;
+  state.jRange = want.range; store.set("jRange", want.range);
+  if (want.range === "custom") { state.jFrom = want.from; state.jTo = want.to; store.set("jFrom", want.from); store.set("jTo", want.to); }
   const T = d.totals, names = {today: "今天", "7d": "近 7 天", all: "累计"};
   $("jTotals").innerHTML = Object.keys(names).map((k) => card(names[k], signed(T[k].pnl),
-    `报价 ${T[k].quoted} 场，成交 ${T[k].filled}（${pct(T[k].fill_rate)}），双边 ${T[k].both}；赢 ${T[k].wins} 输 ${T[k].losses}` + (T[k].open ? `，待结算 ${T[k].open}` : "") + `；成本 ${money(T[k].cost)}，收益率 ${pct(T[k].roi)}`)).join("");
-  const row = (label, x) => `<tr><td>${esc(label)}</td><td>${x.quoted ?? ""}</td><td>${x.filled}</td><td>${pct(x.fill_rate)}</td><td>${x.both}</td><td>${x.wins}/${x.losses}</td><td>${money(x.cost)}</td><td>${signed(x.pnl)}</td><td>${pct(x.roi)}</td></tr>`;
-  const head = "<tr><th></th><th>报价场次</th><th>成交场次</th><th>成交率</th><th>双边</th><th>赢/输</th><th>成本</th><th>盈亏</th><th>收益率</th></tr>";
-  $("jDay").innerHTML = head.replace("<th></th>", "<th>日期</th>") + (d.by_day.map((x) => row(x.day, x)).join("") || '<tr><td colspan="9" class="muted">还没有记录</td></tr>');
+    `报价 ${T[k].quoted} 场，成交 ${T[k].filled}（${pct(T[k].fill_rate)}），双边 ${T[k].both}；赢 ${T[k].wins} 输 ${T[k].losses}` + (T[k].open ? `，待结算 ${T[k].open}` : "") + `；成交额 ${money(T[k].volume)}，收益率 ${pct(T[k].roi)}`)).join("");
+  const info = d.span || {range: "all", label: "全部"}, R = T.range;
+  if (info.range === "custom") { state.jFrom = info.from; state.jTo = info.to; $("jFrom").value = info.from; $("jTo").value = info.to; }
+  renderRanges(info);
+  $("jRange").innerHTML = card(`所选时段：${info.label}`, signed(R.pnl),
+      `报价 ${R.quoted} 场，成交 ${R.filled}（${pct(R.fill_rate)}），双边 ${R.both}；赢 ${R.wins} 输 ${R.losses}` + (R.open ? `，待结算 ${R.open}` : "") + `；收益率 ${pct(R.roi)}`) +
+    card("所选时段成交量", `${shares(R.shares)} 份`, `成交额 ${money(R.volume)}；已结算的成本 ${money(R.cost)}、回款 ${money(R.payout)}`);
+  renderMarkets();
+  const row = (label, x) => `<tr><td>${esc(label)}</td><td>${signed(x.pnl)}</td><td>${money(x.volume)}</td><td>${shares(x.shares)}</td><td>${x.filled}</td><td>${x.quoted ?? ""}</td><td>${pct(x.fill_rate)}</td><td>${x.both}</td><td>${x.wins}/${x.losses}</td><td>${pct(x.roi)}</td></tr>`;
+  const head = "<tr><th></th><th>盈亏</th><th>成交额</th><th>成交份数</th><th>成交场次</th><th>报价场次</th><th>成交率</th><th>双边</th><th>赢/输</th><th>收益率</th></tr>";
+  $("jDay").innerHTML = head.replace("<th></th>", "<th>日期</th>") + (d.by_day.map((x) => row(x.day, x)).join("") || '<tr><td colspan="10" class="muted">这段时间没有记录</td></tr>');
   $("jCoin").innerHTML = head.replace("<th></th>", "<th>币种</th>") + d.by_coin.map((x) => row(x.coin, x)).join("");
   $("jHour").innerHTML = head.replace("<th></th>", "<th>开场</th>") + d.by_hour.map((x) => row(String(x.hour).padStart(2, "0") + ":00", x)).join("");
   $("jSide").innerHTML = "<tr><th>方向</th><th>成交份数</th><th>成本</th><th>赢回</th><th>盈亏</th></tr>" + d.by_side.map((x) => `<tr><td>${x.side}</td><td>${x.shares}</td><td>${money(x.cost)}</td><td>${money(x.won)}</td><td>${signed(x.pnl)}</td></tr>`).join("");
@@ -580,13 +653,14 @@ async function loadJournal() {
   $("jMore").textContent = d.detail_more ? `另有 ${d.detail_more} 场在 CSV 里` : "";
 }
 async function download(kind) {
-  const r = await api("/api/journal.csv?kind=" + kind); if (r.status !== 200) return toast("导出失败", true);
+  const r = await api("/api/journal.csv?kind=" + kind + "&" + jQuery()); if (r.status !== 200) return toast("导出失败", true);
   const url = URL.createObjectURL(new Blob([r.data], {type: "text/csv;charset=utf-8"}));
-  const a = document.createElement("a"); a.href = url; a.download = {daily: "preopen-daily.csv", quotes: "preopen-quotes.csv", cancel: "preopen-cancel-review.csv"}[kind] || "preopen-fills.csv"; document.body.appendChild(a); a.click(); a.remove();
+  const a = document.createElement("a"); a.href = url; a.download = {daily: "preopen-daily.csv", markets: "preopen-markets.csv", quotes: "preopen-quotes.csv", cancel: "preopen-cancel-review.csv"}[kind] || "preopen-fills.csv"; document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 5000);
   if (initData) toast("Telegram 里可能下载不了：发 /export 让机器人把文件发给你");
 }
 $("csvDetail").onclick = () => download("detail");
+$("csvMarkets").onclick = () => download("markets");
 $("csvDaily").onclick = () => download("daily");
 $("csvQuotes").onclick = () => download("quotes");
 $("csvCancel").onclick = () => download("cancel");

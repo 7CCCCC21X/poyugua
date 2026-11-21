@@ -51,17 +51,40 @@ class Console:
         records = self.engine.all_records() if tab in ("all", "filled", "closed") else list(self.engine.ledger.rows.values())
         return journal.orders(records, tab, coin.lower().strip(), self.engine.now(), limit=max(1, min(limit, 2000)))
 
-    def review(self) -> dict[str, Any]:
-        return journal.journal(self.engine.all_records(), self.engine.now(), self.engine.s.cancel_s)
+    def span(self, query: dict[str, str] | None) -> tuple[tuple[float, float] | None, dict[str, str]]:
+        """The review's time filter from the page: range=today|yesterday|7d|30d|all, or custom with from/to (Beijing
+        time, by the windows' start). ValueError for custom bounds that are not times."""
+        q = query or {}
+        return journal.span_from(str(q.get("range") or "all"), str(q.get("from") or ""), str(q.get("to") or ""), self.engine.now())
 
-    def csv(self, kind: str) -> tuple[str, str]:
-        records = self.engine.all_records()
+    def review(self, query: dict[str, str] | None = None) -> dict[str, Any]:
+        """The review for the page: the whole ledger's today / 7 days / all, the rest for the windows in the filter."""
+        try:
+            span, info = self.span(query)
+        except ValueError as error:
+            return {"error": str(error)}
+        out = journal.journal(self.engine.all_records(), self.engine.now(), self.engine.s.cancel_s, span)
+        out["span"] = info
+        out["market_more"] = max(0, len(out["by_market"]) - journal.MARKETS_SHOWN)
+        out["by_market"] = out["by_market"][:journal.MARKETS_SHOWN]
+        return out
+
+    def csv(self, kind: str, query: dict[str, str] | None = None) -> tuple[str, str]:
+        """A CSV of the windows in the filter (a bad custom filter: everything)."""
+        try:
+            span, _ = self.span(query)
+        except ValueError:
+            span = None
+        now = self.engine.now()
+        records = journal.within(self.engine.all_records(), span)
         if kind == "daily":
-            return "preopen-daily.csv", journal.daily_csv(journal.journal(records, self.engine.now()))
+            return "preopen-daily.csv", journal.daily_csv(journal.journal(records, now))
+        if kind == "markets":
+            return "preopen-markets.csv", journal.markets_csv(journal.journal(records, now))
         if kind == "quotes":
             return "preopen-quotes.csv", journal.quotes_csv(records)
         if kind == "cancel":
-            return "preopen-cancel-review.csv", journal.cancel_csv(journal.cancel_review(records, self.engine.now(), self.engine.s.cancel_s))
+            return "preopen-cancel-review.csv", journal.cancel_csv(journal.cancel_review(records, now, self.engine.s.cancel_s))
         return "preopen-fills.csv", journal.detail_csv(records)
 
     # ------------------------------------------------------------------ writes
