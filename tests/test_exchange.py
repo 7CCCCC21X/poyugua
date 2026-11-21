@@ -5,10 +5,13 @@ from decimal import Decimal as D
 import httpx
 from helpers import settings
 
-from polymarket import RateLimitError, RequestRejectedError, TransportError
-from polymarket.models.clob.cancel import CancelOrdersResponse
-from polymarket.models.clob.order_response import AcceptedOrder, RejectedOrder
-from polymarket.models.clob.orders import SignedOrder
+try:
+    from polymarket import RateLimitError, RequestRejectedError, TransportError
+    from polymarket.models.clob.cancel import CancelOrdersResponse
+    from polymarket.models.clob.order_response import AcceptedOrder, RejectedOrder
+    from polymarket.models.clob.orders import SignedOrder
+except ImportError:  # the SDK is in the image (requirements.lock); a light checkout without it skips this suite
+    raise unittest.SkipTest("polymarket-client is not installed") from None
 from preopen import gamma
 from preopen.exchange import Bucket, LiveExchange, OrderSpec, order_hash
 

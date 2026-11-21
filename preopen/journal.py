@@ -1013,14 +1013,16 @@ def detail_table(records: Iterable[dict], limit: int | None = None) -> list[list
     return rows
 
 
-GROUP_HEAD = ["报价场次", "成交场次", "成交率%", "双边成交", "成交份数", "成交额$", "赢", "输", "待结算", "已结算成本$", "回款$",
-              "盈亏$", "收益率%"]
+GROUP_HEAD = ["报价场次（已开场）", "还没开场", "成交场次", "成交率%", "双边成交", "双边率%", "成交份数", "成交额$", "赢", "输", "待结算",
+              "已结算成本$", "回款$", "盈亏$", "单场均盈亏$", "收益率%"]
 
 
 def group_table(first: str, groups: list[dict], key: str, label=lambda v: v) -> list[list[Any]]:
-    """Windows grouped (by day, coin, hour): counted as windows, the money record by record."""
-    return [[first, *GROUP_HEAD]] + [[label(d[key]), d["quoted"], d["filled"], d["fill_rate"], d["both"], d["shares"], d["volume"],
-                                      d["wins"], d["losses"], d["open"], d["cost"], d["payout"], d["pnl"], d["roi"]] for d in groups]
+    """Windows grouped (by day, coin, hour): counted as windows (the fill rate over those started), the money record
+    by record."""
+    return [[first, *GROUP_HEAD]] + [[label(d[key]), d["quoted"], d["upcoming"], d["filled"], d["fill_rate"], d["both"], d["both_rate"],
+                                      d["shares"], d["volume"], d["wins"], d["losses"], d["open"], d["cost"], d["payout"], d["pnl"],
+                                      d["avg_pnl"], d["roi"]] for d in groups]
 
 
 def daily_table(review: dict) -> list[list[Any]]:
@@ -1044,10 +1046,35 @@ def markets_table(review: dict) -> list[list[Any]]:
 
 def price_table(review: dict) -> list[list[Any]]:
     """Each price quoted: the fill rate, and the side bought there won more often than the price or not."""
-    return [["价格¢", "第几档", "报价（档次）", "有成交", "成交率%", "两边都成交", "成交份数", "成交额$", "已结算成本$", "回款$", "盈亏$",
-             "收益率%", "买到的那一边赢的比例%", "保本比例%（=价格）"]] + [
-        [p["price"], p["levels"], p["quotes"], p["filled"], p["fill_rate"], p["both"], p["shares"], p["volume"], p["cost"],
-         p["payout"], p["pnl"], p["roi"], p["win_rate"], p["breakeven"]] for p in review["by_price"]]
+    return [["价格¢", "第几档", "报价（已开场）", "还没开场", "有成交", "成交率%", "两边都成交", "成交份数", "成交额$", "已结算成本$",
+             "回款$", "盈亏$", "收益率%", "买到的那一边赢的比例%", "保本比例%（=价格）"]] + [
+        [p["price"], p["levels"], p["quotes"], p["upcoming"], p["filled"], p["fill_rate"], p["both"], p["shares"], p["volume"],
+         p["cost"], p["payout"], p["pnl"], p["roi"], p["win_rate"], p["breakeven"]] for p in review["by_price"]]
+
+
+def side_table(review: dict) -> list[list[Any]]:
+    """Pairs and one-sided shares (settled), and what is not settled yet."""
+    return [["", "份数", "成本$", "回款$", "盈亏$", "这一边赢的比例%", "保本比例%（平均买价）"]] + [
+        [r["name"], r["shares"], r["cost"], r["payout"], r["pnl"], r["win_rate"], r["breakeven"]] for r in review["by_side"]]
+
+
+def speed_table(review: dict) -> list[list[Any]]:
+    """The first level by how long after the opening it rested."""
+    return [["开放后几秒挂上（第一档）", "报价", "有成交", "成交率%", "两边都成交", "双边率%", "成交份数", "已结算成本$", "已结算盈亏$"]] + [
+        [r["bucket"], r["quotes"], r["filled"], r["fill_rate"], r["both"], r["both_rate"], r["shares"], r["cost"], r["pnl"]]
+        for r in review["by_speed"]]
+
+
+def changes_table(changes: list[dict]) -> list[list[Any]]:
+    """Each settings change with as long a time before and after it."""
+    rows: list[list[Any]] = [["改参时间（北京时间）", "怎么改的", "改了什么", "前/后", "时长（小时）", "报价场次", "成交率%", "双边率%",
+                              "成交额$", "已结算盈亏$", "单场均盈亏$"]]
+    for c in changes:
+        what = "；".join(f"{x[0]}：{x[1] or '（空）'} → {x[2] or '（空）'}" for x in c["changes"])
+        for name, hours, st in (("改之前", c["before_hours"], c["before"]), ("改之后", c["after_hours"], c["after"])):
+            rows.append([c["when"], c["via"], what, name, hours, st["quoted"], st["fill_rate"], st["both_rate"], st["volume"],
+                         st["pnl"], st["avg_pnl"]])
+    return rows
 
 
 def quotes_table(records: Iterable[dict], limit: int | None = None) -> list[list[Any]]:
@@ -1083,15 +1110,20 @@ def quotes_rows(records: Iterable[dict], limit: int | None = None) -> tuple[list
 
 
 def replay_table(review: dict) -> list[list[Any]]:
-    """The cancel-time replay: the same windows as if cancelled X seconds before the start."""
-    rows: list[list[Any]] = [["开场前几秒撤单", "场次", "有成交的场次", "双边成交", "成交份数", "成本$", "回款$", "盈亏$", "说明"]]
+    """The cancel-time replay: the same windows as if cancelled X seconds before the start, each against the baseline
+    (the current setting replayed on them, or what happened when it cannot be)."""
+    base = review.get("baseline") or {}
+    rows: list[list[Any]] = [["开场前几秒撤单", "场次", "有成交的场次", "双边成交", "成交份数", "成本$", "回款$", "盈亏$",
+                              f"比{base.get('name') or '基准'}$", "说明"]]
     if review.get("actual"):
         a = review["actual"]
-        rows.append([f"实际（{review.get('current')} 秒）", a["windows"], a["filled"], a["both"], a["shares"], a["cost"], a["payout"],
-                     a["pnl"], "实际发生的"])
+        rows.append(["实际发生的", a["windows"], a["filled"], a["both"], a["shares"], a["cost"], a["payout"], a["pnl"],
+                     round(a["pnl"] - base["pnl"], 4) if base else None, "当时的撤单"])
     for r in review["rows"]:
+        note = "、".join(x for x in ("现在的设置（基准）" if r.get("current") else "", "★最好" if r.get("best") else "",
+                                    "建议改成这个" if r["cancel_s"] == review.get("recommend") else "") if x)
         rows.append([r["cancel_s"], r["windows"], r["filled"], r["both"], r["shares"], r["cost"], r["payout"], r["pnl"],
-                     "★最好" if r["cancel_s"] == review.get("best") else ""])
+                     r.get("delta"), note])
     return rows
 
 
@@ -1103,7 +1135,9 @@ def fill_time_table(review: dict) -> list[list[Any]]:
 
 
 def cancel_notes(review: dict) -> list[list[Any]]:
-    rows: list[list[Any]] = [["结论", review["advice"]]]
+    conf = review.get("confidence") or {}
+    rows: list[list[Any]] = [["结论", review["advice"]],
+                             ["可信度", f"{conf.get('level', '低')}：{'；'.join(conf.get('notes') or [])}"]]
     if review.get("after_start") or review.get("after_cancel"):
         rows.append(["注意", f"{review['after_start']} 笔开场后成交、{review['after_cancel']} 笔撤单确认后成交：撤单或到期没及时生效"])
     if review["rows"]:
@@ -1194,6 +1228,13 @@ def review_text(records: list[dict], now: float, current: int | None = None, sco
                          f"盈亏 {d['pnl']:+.2f}" + (f"（{d['open']} 场待结算）" if d["open"] else ""))
         if len(j["by_day"]) > DAYS_IN_TEXT:
             lines.append(f"  …更早的 {len(j['by_day']) - DAYS_IN_TEXT} 天：网页「复盘」或 /export 的每日汇总")
+    if j["by_price"]:
+        lines += ["", "【按挂价】买到的那一边赢的比例对比保本（=价格），低于保本就在亏"]
+        for x in j["by_price"]:
+            mark = "" if x["win_rate"] is None else "✅" if x["win_rate"] >= x["breakeven"] else "⚠️"
+            lines.append(f"  {mark}{mk.fmt(D(str(x['price'])))}¢：成交率 {x['fill_rate'] if x['fill_rate'] is not None else '—'}%，"
+                         + (f"赢 {x['win_rate']}%（保本 {x['breakeven']:g}%）" if x["win_rate"] is not None else "还没结算")
+                         + f"，盈亏 {x['pnl']:+.2f}")
     if j["market_count"]:
         waiting = j["market_waiting"]
         lines += ["", f"【按市场】{j['market_count']} 场有成交" + (f"（{waiting} 场待结算）" if waiting else "")]

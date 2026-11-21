@@ -15,10 +15,13 @@ from types import SimpleNamespace as N
 import httpx
 from helpers import T0, Clock, FakePublic, drain, make_engine, settings, tick
 
-from polymarket import RateLimitError, RequestRejectedError, TransportError
-from polymarket.models.clob.cancel import CancelOrdersResponse
-from polymarket.models.clob.order_response import AcceptedOrder
-from polymarket.models.clob.orders import SignedOrder
+try:
+    from polymarket import RateLimitError, RequestRejectedError, TransportError
+    from polymarket.models.clob.cancel import CancelOrdersResponse
+    from polymarket.models.clob.order_response import AcceptedOrder
+    from polymarket.models.clob.orders import SignedOrder
+except ImportError:  # the SDK is in the image (requirements.lock); a light checkout without it skips this suite
+    raise unittest.SkipTest("polymarket-client is not installed") from None
 import preopen.markets as mk
 from preopen import refusals
 from preopen.exchange import Bucket, LiveExchange, OrderSpec, order_hash

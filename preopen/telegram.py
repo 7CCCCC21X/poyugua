@@ -46,6 +46,15 @@ HELP = ("按钮：📊 状态、🩺 体检、🧾 拒单、📈 复盘、📤 �
         "时间可以写：今天、昨天、7（最近 7 天）、11-20（那一天）、11-18 11-20（这几天）")
 
 
+MIME = {".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".csv": "text/csv",
+        ".pdf": "application/pdf", ".json": "application/json", ".txt": "text/plain"}
+
+
+def mime_of(name: str) -> str:
+    """The file's type by its name (11-21 review: the Excel file went as text/csv, and some phones opened it as text)."""
+    return next((t for ext, t in MIME.items() if name.lower().endswith(ext)), "application/octet-stream")
+
+
 @dataclass
 class Reply:
     text: str
@@ -101,7 +110,7 @@ class Telegram:
 
     async def _send_document(self, name: str, data: bytes, caption: str) -> None:
         r = await self.http.post(f"{API}/bot{self.token}/sendDocument", data={"chat_id": str(self.chat()), "caption": caption},
-                                 files={"document": (name, data, "text/csv")}, timeout=120)
+                                 files={"document": (name, data, mime_of(name))}, timeout=120)
         result = r.json()
         if not result.get("ok"):
             raise RuntimeError(f"Telegram sendDocument: {result.get('description')}")

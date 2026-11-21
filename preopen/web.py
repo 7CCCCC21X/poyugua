@@ -288,6 +288,17 @@ select { font:inherit; padding:5px 8px; border-radius:8px; border:1px solid var(
 .frow input { padding:5px 8px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--text); font:inherit; min-width:0; }
 #jCustom { margin-top:8px; }
 .tall { max-height:480px; overflow:auto; } .tall th { position:sticky; top:0; background:var(--card); }
+#jBody.busy { opacity:.55; transition:opacity .2s; }
+.chart { position:relative; outline:none; } .chart:focus-visible { box-shadow:0 0 0 2px var(--accent); border-radius:8px; }
+.chart .grid { stroke:var(--line); stroke-width:1; } .chart .axis0 { stroke:var(--muted); stroke-width:1; opacity:.6; }
+.chart .tick { fill:var(--muted); font-size:11px; } .chart .plabel { fill:var(--text); font-size:12px; font-weight:600; }
+.chart .pline { fill:none; stroke:var(--accent); stroke-width:2; stroke-linejoin:round; stroke-linecap:round; }
+.chart .pdot { fill:var(--accent); stroke:var(--card); stroke-width:2; } .chart .cross { stroke:var(--muted); stroke-width:1; }
+.ctip { position:absolute; top:4px; min-width:170px; padding:6px 9px; border-radius:8px; background:var(--card); border:1px solid var(--line); box-shadow:0 2px 10px rgba(0,0,0,.12); pointer-events:none; }
+.ctip .tv { font-weight:600; } .ctip .tl { color:var(--muted); font-size:12px; }
+.change { padding:8px 0; border-bottom:1px solid var(--line); } .change table { margin-top:4px; }
+tr.cur td { background:var(--chip); } h3.small { font-size:13px; margin:12px 0 6px; display:flex; gap:10px; align-items:baseline; }
+a.mlink { color:inherit; text-decoration:none; border-bottom:1px dotted var(--muted); }
 .orow { padding:8px 0; border-bottom:1px solid var(--line); font-size:13px; }
 .orow .l1 { display:flex; flex-wrap:wrap; align-items:center; gap:4px 10px; } .orow .l1 button { margin-left:auto; }
 .orow .l2 { margin-top:2px; color:var(--text); }
@@ -344,23 +355,37 @@ select { font:inherit; padding:5px 8px; border-radius:8px; border:1px solid var(
       <section>
         <div class="frow"><b>时间</b><span class="chips" id="jRanges"></span></div>
         <div class="frow" id="jCustom" hidden><input type="datetime-local" id="jFrom" aria-label="开始"><span>～</span><input type="datetime-local" id="jTo" aria-label="结束"><button class="small" id="jApply">筛选</button></div>
-        <p class="muted small" style="margin:6px 0 0">按开场时间（北京时间）筛选，下面所有内容和导出的 CSV 都只算这段时间的场次；上面三张卡片不受影响。</p>
+        <div class="frow" style="margin-top:6px"><b>币种</b><span class="chips" id="jCoins"></span></div>
+        <p class="muted small" style="margin:6px 0 0">按开场时间（北京时间）和币种筛选：下面所有内容和导出的文件都只算这些场次；上面三张卡片是全部记录，不受影响。<span id="jBusy"></span></p>
       </section>
+      <div id="jBody">
       <div class="cards" id="jRange"></div>
+      <section id="jChartBox" hidden><h2>累计盈亏（已结算，按开场日）</h2><div id="jChart" class="chart" tabindex="0" aria-label="累计盈亏图，左右方向键看每一天"></div>
+        <p class="muted small">每一天的数字在下面「按日期」表里。</p></section>
       <div class="ops"><button id="xlsxAll">导出 Excel（全部表）</button><button class="secondary" id="csvMarkets">导出市场盈亏 CSV</button><button class="secondary" id="csvDaily">导出每日汇总 CSV</button><button class="secondary" id="csvDetail">导出成交明细 CSV</button><button class="secondary" id="csvQuotes">导出全部报价 CSV</button><button class="secondary" id="csvCancel">导出撤单时间复盘 CSV</button></div>
-      <section><h2>开场前几秒撤单最好</h2><p id="cAdvice"></p><div class="scroll"><table id="cRows"></table></div>
-        <p class="muted small" id="cNote">把每一场按「如果提前 X 秒撤单」重算：X 秒之后才成交的单当作没成交。同一批场次比较，所以各行能直接比。只能算比当时撤得更早的情况。</p></section>
+      <section><h2>撤单时间回放：开场前几秒撤单最好</h2><p id="cAdvice"></p><p class="small" id="cConf"></p><div class="scroll"><table id="cRows"></table></div>
+        <p class="muted small" id="cNote"></p></section>
+      <section><h2>按挂价：哪个价格赚钱</h2><div class="scroll"><table id="jPrice"></table></div>
+        <p class="muted small">「买到的那一边赢的比例」低于「保本比例」（= 价格）的价格在亏钱。点价格列出这个价格成交的每一场，亏得最多的在前。成交率只算已经开场的场次。</p>
+        <div id="jPriceDetail"></div></section>
+      <section><h2>改参数前后对比</h2><div id="jChanges" class="small"></div></section>
       <section><h2>什么时候成交的（按成交时刻）</h2><div class="scroll"><table id="cTimes"></table></div>
         <p class="muted small">买的那一边最后赢的比例低于保本线（=买价），这个时段的成交就是亏的：撤单时间应该提前到它之前。</p></section>
-      <section><h2>按日期：每日成交量和盈亏（北京时间，按开场日）</h2><div class="scroll"><table id="jDay"></table></div>
-        <p class="muted small">成交额 = 买到的份数 × 买价（还没结算的也算）；盈亏和收益率只算已经结算的场次。</p></section>
+      <section><h2>按日期：每日成交量和盈亏（北京时间，按开场日）</h2><div class="scroll tall"><table id="jDay"></table></div>
+        <p class="muted small" id="jDayNote">成交额 = 买到的份数 × 买价（还没结算的也算）；盈亏、收益率、单场均盈亏只算已经结算的场次；成交率只算已经开场的场次。</p></section>
       <section><h2>按市场：每一场的盈亏<span class="chips" id="mSort"></span></h2><div class="scroll tall"><table id="jMarket"></table></div><p class="muted small" id="mNote"></p></section>
       <div class="grid2">
-        <section><h2>按币种</h2><div class="scroll"><table id="jCoin"></table></div></section>
-        <section><h2>按方向</h2><div class="scroll"><table id="jSide"></table></div><p class="muted small">成交了哪一边、那一边赢了多少：两边成交的那部分是锁定利润，只成交一边的是 49¢ 买五五开</p></section>
+        <section><h2>按方向：配对和单边</h2><div class="scroll"><table id="jSide"></table></div>
+          <p class="muted small">一涨一跌配成对的份数不管谁赢都回 $1（锁定价差）；多出来的单边份数靠结果赢输。三行加起来就是已结算盈亏。</p></section>
+        <section><h2>抢排队速度（第一档，开放后几秒挂上）</h2><div class="scroll"><table id="jSpeed"></table></div>
+          <p class="muted small">挂得越快排队越靠前；如果挂慢的那几行双边率低、亏钱，说明吃到的多是知道方向的单。</p></section>
       </div>
-      <section><h2>按开场时段（北京时间几点）</h2><div class="scroll"><table id="jHour"></table></div></section>
+      <div class="grid2">
+        <section><h2>按币种</h2><div class="scroll"><table id="jCoin"></table></div></section>
+        <section><h2>按开场时段（北京时间几点）</h2><div class="scroll tall"><table id="jHour"></table></div></section>
+      </div>
       <section><h2>成交明细（每一档，最近 200 条）</h2><div class="scroll"><table id="jDetail"></table></div><p class="muted small" id="jMore"></p></section>
+      </div>
     </div>
     <p class="muted small" id="stamp"></p>
   </div>
@@ -390,7 +415,7 @@ async function api(path, opts = {}) {
     const r = await fetch(path, Object.assign({credentials: "same-origin", signal: ctl.signal}, opts, {headers}));
     if (r.status === 401) { showLogin(await r.json().catch(() => ({}))); throw new Error("sign in"); }
     const ct = r.headers.get("Content-Type") || "";
-    return {status: r.status, data: ct.includes("spreadsheetml") ? await r.blob() : path.endsWith(".csv") || path.includes(".csv?") ? await r.text() : await r.json().catch(() => ({}))};
+    return {status: r.status, data: ct.includes("spreadsheetml") ? await r.blob() : ct.includes("json") ? await r.json().catch(() => ({})) : await r.text()};
   } finally { clearTimeout(timer); }
 }
 function showLogin(info) {
@@ -425,7 +450,7 @@ async function tick(first) {
     if (st.status === 200) { state.report = st.data; renderTop(st.data); if (state.tab === "overview") renderOverview(st.data); }
     if (state.tab === "settings" && first) await loadSettings();
     if (state.tab === "orders") await loadOrders();
-    if (state.tab === "journal" && (first || Date.now() - (state.jAt || 0) > 60000)) await loadJournal();
+    if (state.tab === "journal" && (first || Date.now() - (state.jAt || 0) > 60000)) loadJournal();  // not awaited: the top bar keeps updating while a long review is worked out
     $("app").hidden = false; $("login").hidden = true;
   } catch (e) { if (String(e.message) !== "sign in") $("stamp").textContent = "连接失败，稍后重试"; else return; }
   timer = setTimeout(() => tick(false), state.tab === "overview" ? 5000 : 10000);
@@ -585,13 +610,24 @@ $("coinFilter").onchange = () => { state.coin = $("coinFilter").value; store.set
 const RANGES = [["all", "全部"], ["today", "今天"], ["yesterday", "昨天"], ["7d", "近 7 天"], ["30d", "近 30 天"], ["custom", "自定义"]];
 const MSORT = [["time", "按时间"], ["loss", "亏最多"], ["gain", "赚最多"]];
 const shares = (v) => v == null ? "—" : String(Math.round(Number(v) * 100) / 100);
+const plus = (v) => v == null ? "—" : `<span class="${v >= 0 ? "good" : "bad"}">${v >= 0 ? "+" : "-"}${Math.abs(Number(v)).toFixed(2)}</span>`;
+state.jCoins = String(store.get("jCoins", "") || "").split(",").filter(Boolean);
+state.mSort = state.mSort || "time";
+function jWant(next) {
+  return Object.assign({range: state.jRange, from: state.jFrom, to: state.jTo, coins: state.jCoins.slice(), sort: state.mSort}, next || {});
+}
 function jQuery(f) {
-  f = f || {range: state.jRange, from: state.jFrom, to: state.jTo};
+  f = f || jWant();
   const p = new URLSearchParams({range: f.range});
   if (f.range === "custom") { p.set("from", f.from || ""); p.set("to", f.to || ""); }
+  if (f.coins && f.coins.length) p.set("coins", f.coins.join(","));
+  if (f.sort && f.sort !== "time") p.set("sort", f.sort);
   return p.toString();
 }
-function renderRanges(info) {
+function table(id, head, rows, empty) {
+  $(id).innerHTML = "<tr>" + head.map((h) => `<th>${h}</th>`).join("") + "</tr>" + (rows.join("") || `<tr><td colspan="${head.length}" class="muted">${empty || "这段时间没有记录"}</td></tr>`);
+}
+function renderFilters(info) {
   $("jRanges").innerHTML = RANGES.map(([k, label]) => `<span class="chip ${k === state.jRange ? "on" : ""}" data-jr="${k}">${label}</span>`).join("");
   $("jCustom").hidden = state.jRange !== "custom" && $("jCustom").dataset.open !== "1";
   for (const el of document.querySelectorAll("[data-jr]")) el.onclick = () => {
@@ -604,83 +640,238 @@ function renderRanges(info) {
     }
     $("jCustom").dataset.open = ""; loadJournal({range: k});
   };
+  const coins = ((state.report && state.report.coins) || []).map((c) => c.toLowerCase());
+  for (const c of state.jCoins) if (!coins.includes(c)) coins.push(c);
+  $("jCoins").innerHTML = `<span class="chip ${state.jCoins.length ? "" : "on"}" data-jc="">全部</span>` +
+    coins.map((c) => `<span class="chip ${state.jCoins.includes(c) ? "on" : ""}" data-jc="${esc(c)}">${esc(c.toUpperCase())}</span>`).join("");
+  for (const el of document.querySelectorAll("[data-jc]")) el.onclick = () => {
+    const c = el.dataset.jc, now = state.jCoins.slice();
+    const next = !c ? [] : now.includes(c) ? now.filter((x) => x !== c) : now.concat([c]);
+    loadJournal({coins: next});
+  };
 }
 $("jApply").onclick = () => {
   const from = $("jFrom").value, to = $("jTo").value;
   if (!from || !to) return toast("开始和结束都要选", true);
   loadJournal({range: "custom", from, to});
 };
+function marketLink(slug, label) {
+  return `<a class="mlink" href="https://polymarket.com/event/${encodeURIComponent(slug)}" target="_blank" rel="noopener" data-url="https://polymarket.com/event/${encodeURIComponent(slug)}">${esc(label)}</a>`;
+}
+document.addEventListener("click", (ev) => {  // a market opens on Polymarket (inside Telegram: its own browser)
+  const a = ev.target.closest && ev.target.closest("a.mlink");
+  if (a && tg && tg.openLink) { ev.preventDefault(); tg.openLink(a.dataset.url); }
+});
+
+// the cumulative P&L: one series, one axis; the crosshair snaps to a day (keyboard: ← →)
+function niceStep(raw) { const p = Math.pow(10, Math.floor(Math.log10(raw))), n = raw / p; return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * p; }
+function tickText(v) { const a = Math.abs(v); return (v < 0 ? "-$" : "$") + (a >= 10000 ? (a / 1000).toFixed(a % 1000 ? 1 : 0) + "K" : a.toFixed(a < 10 && a % 1 ? 1 : 0)); }
+function renderChart() {
+  const days = (state.journal && state.journal.by_day) || [], box = $("jChart");
+  const pts = days.slice().reverse();
+  $("jChartBox").hidden = pts.length < 2;
+  if (pts.length < 2) return;
+  let cum = 0;
+  const data = pts.map((d) => ({day: d.day, pnl: d.pnl, volume: d.volume, cum: (cum += d.pnl)}));
+  const endText = (cum >= 0 ? "+$" : "-$") + Math.abs(cum).toFixed(2);
+  const W = Math.max(280, box.clientWidth || 600), H = 200, L = 52, R = 16 + endText.length * 7.5, T = 12, B = 26;
+  const ys = data.map((p) => p.cum).concat([0]);
+  let lo = Math.min(...ys), hi = Math.max(...ys);
+  const step = niceStep((hi - lo) / 4 || 1);
+  lo = Math.floor(lo / step) * step; hi = Math.ceil(hi / step) * step; if (hi === lo) hi = lo + step;
+  const x = (i) => L + (W - L - R) * (i / (data.length - 1)), y = (v) => T + (H - T - B) * (1 - (v - lo) / (hi - lo));
+  const ns = "http://www.w3.org/2000/svg", svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.setAttribute("width", "100%"); svg.setAttribute("height", H); svg.setAttribute("role", "img");
+  const el = (tag, attrs, text) => { const e = document.createElementNS(ns, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); if (text != null) e.textContent = text; svg.appendChild(e); return e; };
+  for (let v = lo; v <= hi + step / 2; v += step) {
+    el("line", {x1: L, x2: W - R, y1: y(v), y2: y(v), class: Math.abs(v) < step / 2 ? "axis0" : "grid"});
+    el("text", {x: L - 6, y: y(v) + 4, "text-anchor": "end", class: "tick"}, tickText(Math.abs(v) < step / 2 ? 0 : v));
+  }
+  const ticks = data.length > 2 ? [0, Math.floor((data.length - 1) / 2), data.length - 1] : [0, data.length - 1];
+  for (const i of ticks) el("text", {x: x(i), y: H - 6, "text-anchor": i === 0 ? "start" : i === data.length - 1 ? "end" : "middle", class: "tick"}, data[i].day.slice(5));
+  el("path", {d: data.map((p, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(p.cum).toFixed(1)}`).join(""), class: "pline"});
+  const last = data[data.length - 1];
+  el("circle", {cx: x(data.length - 1), cy: y(last.cum), r: 4, class: "pdot"});
+  el("text", {x: x(data.length - 1) + 8, y: y(last.cum) + 4, class: "plabel"}, endText);
+  const cross = el("line", {x1: 0, x2: 0, y1: T, y2: H - B, class: "cross", visibility: "hidden"});
+  const mark = el("circle", {cx: 0, cy: 0, r: 4, class: "pdot", visibility: "hidden"});
+  const hit = el("rect", {x: L, y: T, width: W - L - R, height: H - T - B, fill: "transparent"});
+  box.replaceChildren(svg);
+  const tip = document.createElement("div"); tip.className = "ctip"; tip.hidden = true; box.appendChild(tip);
+  let at = -1;
+  const show = (i) => {
+    at = Math.max(0, Math.min(data.length - 1, i)); const p = data[at];
+    cross.setAttribute("x1", x(at)); cross.setAttribute("x2", x(at)); cross.setAttribute("visibility", "visible");
+    mark.setAttribute("cx", x(at)); mark.setAttribute("cy", y(p.cum)); mark.setAttribute("visibility", "visible");
+    tip.replaceChildren();
+    const line = (cls, text) => { const d = document.createElement("div"); d.className = cls; d.textContent = text; tip.appendChild(d); };
+    line("tv", "累计 " + (p.cum >= 0 ? "+$" : "-$") + Math.abs(p.cum).toFixed(2));
+    line("tl", p.day + "：当天 " + (p.pnl >= 0 ? "+$" : "-$") + Math.abs(p.pnl).toFixed(2) + "，成交额 $" + Number(p.volume).toFixed(2));
+    tip.hidden = false;
+    const left = Math.min(Math.max(0, x(at) / W * box.clientWidth - 90), box.clientWidth - 190);
+    tip.style.left = left + "px";
+  };
+  const hide = () => { cross.setAttribute("visibility", "hidden"); mark.setAttribute("visibility", "hidden"); tip.hidden = true; };
+  hit.addEventListener("pointermove", (ev) => {
+    const r = svg.getBoundingClientRect(), px = (ev.clientX - r.left) / r.width * W;
+    show(Math.round((px - L) / ((W - L - R) / (data.length - 1))));
+  });
+  hit.addEventListener("pointerleave", hide);
+  box.onfocus = () => show(at < 0 ? data.length - 1 : at);
+  box.onblur = hide;
+  box.onkeydown = (ev) => { if (ev.key === "ArrowLeft" || ev.key === "ArrowRight") { ev.preventDefault(); show((at < 0 ? data.length - 1 : at) + (ev.key === "ArrowLeft" ? -1 : 1)); } };
+}
+let chartTimer = null;
+window.addEventListener("resize", () => { clearTimeout(chartTimer); chartTimer = setTimeout(renderChart, 200); });
+
 function renderMarkets() {
   const d = state.journal; if (!d) return;
   $("mSort").innerHTML = MSORT.map(([k, label]) => `<span class="chip ${k === state.mSort ? "on" : ""}" data-ms="${k}">${label}</span>`).join("");
-  for (const el of document.querySelectorAll("[data-ms]")) el.onclick = () => { state.mSort = el.dataset.ms; store.set("mSort", state.mSort); renderMarkets(); };
-  const rows = d.by_market.slice(), val = (x) => x.pnl == null ? null : x.pnl;
-  if (state.mSort !== "time") rows.sort((a, b) => (val(a) == null) - (val(b) == null) || (state.mSort === "loss" ? val(a) - val(b) : val(b) - val(a)));
-  $("jMarket").innerHTML = "<tr><th>市场（开场）</th><th>盈亏</th><th>结果</th><th>成交额</th><th>涨（份）</th><th>跌（份）</th><th>成交的档</th></tr>" + (rows.map((x) =>
-    `<tr><td>${esc(x.coin)} ${esc(x.when)}</td><td>${x.pnl == null ? "—" : signed(x.pnl)}</td><td>${x.result ? esc(x.result) : '<span class="muted">待结算</span>'}</td>` +
-    `<td>${money(x.volume)}</td><td>${x.up ? shares(x.up) : ""}</td><td>${x.down ? shares(x.down) : ""}</td><td>${esc(x.levels)}</td></tr>`).join("") || '<tr><td colspan="7" class="muted">这段时间没有成交的场次</td></tr>');
-  const R = d.totals.range, idle = R.quoted - R.filled;
-  $("mNote").textContent = (d.by_market.length ? `${R.filled} 场有成交` + (idle > 0 ? `，另有 ${idle} 场报价了但没成交（盈亏为 0，不列出）` : "") : "") +
-    (d.market_more ? `；页面只列最近 ${d.by_market.length} 场，另有 ${d.market_more} 场在「导出市场盈亏 CSV」里` : "");
+  for (const el of document.querySelectorAll("[data-ms]")) el.onclick = () => loadJournal({sort: el.dataset.ms});  // sorted on the server, over every market
+  table("jMarket", ["市场（开场）", "盈亏", "结果", "成交额", "涨（份）", "跌（份）", "成交的档"], d.by_market.map((x) =>
+    `<tr><td>${marketLink(x.slug, x.coin + " " + x.when)}</td><td>${x.pnl == null ? "—" : signed(x.pnl)}</td><td>${x.result ? esc(x.result) : '<span class="muted">待结算</span>'}</td>` +
+    `<td>${money(x.volume)}</td><td>${x.up ? shares(x.up) : ""}</td><td>${x.down ? shares(x.down) : ""}</td><td>${esc(x.levels)}</td></tr>`), "这段时间没有成交的场次");
+  const R = d.totals.range, idle = R.quoted + R.upcoming - R.filled;
+  $("mNote").textContent = (d.market_count ? `${d.market_count} 场有成交` + (idle > 0 ? `，另有 ${idle} 场报价了但没成交（盈亏为 0，不列出）` : "") : "") +
+    (d.market_more ? `；按「${(MSORT.find((m) => m[0] === state.mSort) || MSORT[0])[1]}」排在全部 ${d.market_count} 场里，页面列前 ${d.by_market.length} 场，全部的在「导出市场盈亏 CSV」` : "");
 }
-async function loadJournal(next) {
-  // a new filter is kept (and remembered) only once the server took it; one it refuses leaves the last good one
-  const want = next ? Object.assign({from: "", to: ""}, next) : {range: state.jRange, from: state.jFrom, to: state.jTo};
-  const r = await api("/api/journal?" + jQuery(want));
-  if (r.status === 400) {
-    toast((r.data && r.data.error) || "时间不对", true);
-    if (!next && state.jRange !== "all") loadJournal({range: "all"});  // a remembered filter gone bad: everything
-    return;
-  }
-  if (r.status !== 200) return; const d = r.data; state.jAt = Date.now(); state.journal = d;
-  state.jRange = want.range; store.set("jRange", want.range);
-  if (want.range === "custom") { state.jFrom = want.from; state.jTo = want.to; store.set("jFrom", want.from); store.set("jTo", want.to); }
-  const T = d.totals, names = {today: "今天", "7d": "近 7 天", all: "累计"};
+async function openPrice(price) {
+  const box = $("jPriceDetail"); box.innerHTML = '<p class="muted small">读取中…</p>';
+  const r = await api("/api/journal/price?" + jQuery() + "&price=" + encodeURIComponent(price));
+  if (r.status !== 200) { box.innerHTML = ""; return toast((r.data && r.data.error) || "读不到", true); }
+  const d = r.data;
+  box.innerHTML = `<h3 class="small">${d.price}¢ 成交的 ${d.count} 次（已结算的合计 ${signed(d.pnl)}，${d.losing} 次亏）<a class="link" id="jPriceClose">收起</a></h3><div class="scroll tall"><table id="jPriceRows"></table></div>` +
+    (d.more ? `<p class="muted small">只列亏得最多的 ${d.rows.length} 次，另有 ${d.more} 次在导出的成交明细里</p>` : "");
+  table("jPriceRows", ["市场（开场）", "第几档", "涨（份）", "跌（份）", "成本", "结果", "盈亏", "首次成交距开场"], d.rows.map((x) =>
+    `<tr><td>${marketLink(x.slug, x.coin + " " + x.when)}</td><td>${x.level}</td><td>${x.up || ""}</td><td>${x.down || ""}</td><td>${money(x.cost)}</td>` +
+    `<td>${x.result ? esc(x.result) : '<span class="muted">待结算</span>'}</td><td>${x.pnl == null ? "—" : signed(x.pnl)}</td><td>${secs(x.first_fill_lead_s)}</td></tr>`));
+  $("jPriceClose").onclick = () => { box.innerHTML = ""; };
+}
+function renderChanges(list) {
+  const box = $("jChanges");
+  if (!list || !list.length) { box.innerHTML = '<p class="muted">还没有改过参数（从这个版本起，每次在网页、Telegram 或 Railway 变量里改参数都会记下时间）。</p>'; return; }
+  const stat = (name, h, s) => `<tr><td>${name}</td><td>${h} 小时</td><td>${s.quoted}</td><td>${pct(s.fill_rate)}</td><td>${pct(s.both_rate)}</td><td>${money(s.volume)}</td><td>${signed(s.pnl)}</td><td>${s.avg_pnl == null ? "—" : signed(s.avg_pnl)}</td></tr>`;
+  box.innerHTML = list.map((c, i) => `<div class="change"><div class="frow"><b>${esc(c.when)}</b><span class="muted">${esc(c.via)}</span>` +
+    `<a class="link" data-since="${i}">从这次改参开始看 →</a></div>` +
+    `<div class="muted">${c.changes.map((x) => esc(x[0] + "：" + (x[1] || "（空）") + " → " + (x[2] || "（空）"))).join("；")}</div>` +
+    `<div class="scroll"><table><tr><th></th><th>时长</th><th>报价场次</th><th>成交率</th><th>双边率</th><th>成交额</th><th>已结算盈亏</th><th>单场均盈亏</th></tr>` +
+    stat("改之前", c.before_hours, c.before) + stat("改之后", c.after_hours, c.after) + "</table></div></div>").join("") +
+    '<p class="muted">按开场时间分前后，两段一样长（改之前不早于上一次改参）；改之后的时间短、场次少时先别下结论。</p>';
+  for (const el of box.querySelectorAll("[data-since]")) el.onclick = () => {
+    const c = list[Number(el.dataset.since)], P = (state.journal.span && state.journal.span.presets) || {};
+    const from = new Date((c.at + 8 * 3600) * 1000).toISOString().slice(0, 16);   // Beijing, as the picker writes it
+    loadJournal({range: "custom", from, to: (P.today && P.today.to) || from});
+  };
+}
+function renderReplay(C) {
+  const rec = C.recommend;
+  $("cAdvice").innerHTML = "<b>结论：" + esc(C.advice || "—") + "</b>" +
+    (rec ? ` <button class="small" id="cApply">改成开场前 ${esc(String(rec))} 秒撤单</button>` : "") +
+    ((C.losses || []).length ? `<br>亏在哪：${esc(C.losses.map((t) => `${t.bucket} ${t.pnl >= 0 ? "+" : ""}${t.pnl.toFixed(2)}（赢 ${(t.win_rate * 100).toFixed(0)}%，保本 ${(t.breakeven * 100).toFixed(0)}%）`).join("；"))}` : "") +
+    (C.after_start || C.after_cancel ? `<br><span class="warn">⚠️ ${C.after_start} 笔开场后成交、${C.after_cancel} 笔撤单确认后成交：撤单或到期没及时生效</span>` : "");
+  if (rec) $("cApply").onclick = () => act("set_cancel", `把撤单改成开场前 ${rec} 秒？距开场不足的时间和订单自己的到期时间会一起调整（和 Telegram 复盘的按钮一样），立即生效。`, {seconds: rec}).then(() => loadJournal({}, true));
+  const conf = C.confidence || {level: "低", notes: []};
+  $("cConf").innerHTML = `可信度：<b class="${conf.level === "高" ? "good" : conf.level === "中" ? "" : "warn"}">${esc(conf.level)}</b>　<span class="muted">${esc(conf.notes.join("；"))}</span>`;
+  const A = C.actual, base = C.baseline;
+  const span = (g) => (g.from === g.to ? g.from + " 秒" : `${g.from}～${g.to} 秒`) + (g.current ? "（现在）" : "");
+  table("cRows", ["开场前几秒撤", "盈亏", base ? "比" + esc(base.name) : "差", "有成交", "双边", "成交份数", "可比场次"],
+    (A ? [`<tr><td><b>实际发生的</b> <span class="muted">（当时的撤单）</span></td><td>${signed(A.pnl)}</td><td>${base ? plus(A.pnl - base.pnl) : ""}</td><td>${A.filled}</td><td>${A.both}</td><td>${shares(A.shares)}</td><td>${A.windows}</td></tr>`] : [])
+      .concat((C.groups || []).map((g) => `<tr${g.current ? ' class="cur"' : ""}><td>${span(g)}${g.best ? " ★" : ""}</td><td>${signed(g.pnl)}</td>` +
+        `<td>${g.current ? '<span class="muted">基准</span>' : plus(g.delta)}</td><td>${g.filled}</td><td>${g.both}</td><td>${shares(g.shares)}</td><td>${C.windows}</td></tr>`)), "还没有结束的场次");
+  $("cNote").textContent = C.groups && C.groups.length ? `同一批 ${C.windows} 场按「如果开场前 X 秒撤单」重算（X 秒之后的成交当作没发生），结果相同的相邻秒数合成一行；` +
+    `「比…」一列是和${base ? base.name : "实际"}在这批场次上的差。比开场前 ${C.base} 秒更晚撤算不出来：那时单子已经撤了。` +
+    (C.current != null && C.base != null && C.current < C.base ? `现在设的 ${C.current} 秒比这些场次当时撤得晚，算不出来，所以和实际比。` : "") : "";
+  table("cTimes", ["成交时距开场", "份数", "成本", "盈亏", "那一边赢的比例", "保本线"], (C.by_fill_time || []).map((x) =>
+    `<tr><td>${esc(x.bucket)}</td><td>${shares(x.shares)}</td><td>${money(x.cost)}</td><td>${signed(x.pnl)}</td><td class="${x.win_rate >= x.breakeven ? "good" : "bad"}">${(x.win_rate * 100).toFixed(0)}%</td><td>${(x.breakeven * 100).toFixed(0)}%</td></tr>`), "还没有成交");
+}
+function renderJournal() {
+  const d = state.journal, T = d.totals, R = T.range, names = {today: "今天", "7d": "近 7 天", all: "累计"};
   $("jTotals").innerHTML = Object.keys(names).map((k) => card(names[k], signed(T[k].pnl),
-    `报价 ${T[k].quoted} 场，成交 ${T[k].filled}（${pct(T[k].fill_rate)}），双边 ${T[k].both}；赢 ${T[k].wins} 输 ${T[k].losses}` + (T[k].open ? `，待结算 ${T[k].open}` : "") + `；成交额 ${money(T[k].volume)}，收益率 ${pct(T[k].roi)}`)).join("");
-  const info = d.span || {range: "all", label: "全部"}, R = T.range;
-  if (info.range === "custom") { state.jFrom = info.from; state.jTo = info.to; $("jFrom").value = info.from; $("jTo").value = info.to; }
-  renderRanges(info);
-  $("jRange").innerHTML = card(`所选时段：${info.label}`, signed(R.pnl),
-      `报价 ${R.quoted} 场，成交 ${R.filled}（${pct(R.fill_rate)}），双边 ${R.both}；赢 ${R.wins} 输 ${R.losses}` + (R.open ? `，待结算 ${R.open}` : "") + `；收益率 ${pct(R.roi)}`) +
-    card("所选时段成交量", `${shares(R.shares)} 份`, `成交额 ${money(R.volume)}；已结算的成本 ${money(R.cost)}、回款 ${money(R.payout)}`);
+    `成交 ${T[k].filled} 场 / 报价 ${T[k].quoted}（${pct(T[k].fill_rate)}）` + (T[k].upcoming ? `，还没开场 ${T[k].upcoming}` : "") + `；双边率 ${pct(T[k].both_rate)}；赢 ${T[k].wins} 输 ${T[k].losses}` + (T[k].open ? `，待结算 ${T[k].open}` : "") + `；成交额 ${money(T[k].volume)}，收益率 ${pct(T[k].roi)}`)).join("");
+  const info = d.span || {range: "all", label: "全部"};
+  renderFilters(info);
+  const scope = info.label + (d.coins && d.coins.length ? " · " + d.coins.join("、") : "");
+  $("jRange").innerHTML = card(`已结算盈亏（${scope}）`, signed(R.pnl), `收益率 ${pct(R.roi)}；单场均 ${R.avg_pnl == null ? "—" : signed(R.avg_pnl)}`) +
+    card("已结算成本", money(R.cost), `回款 ${money(R.payout)}`) +
+    card("成交场次", String(R.filled), `报价 ${R.quoted} 场，成交率 ${pct(R.fill_rate)}` + (R.upcoming ? `；还没开场 ${R.upcoming} 场（不算成交率）` : "")) +
+    card("待结算场次", String(R.open), `双边 ${R.both} 场，双边率 ${pct(R.both_rate)}`) +
+    card("成交量", `${shares(R.shares)} 份`, `成交额 ${money(R.volume)}`);
+  renderChart();
+  renderReplay(d.cancel || {});
+  table("jPrice", ["挂价", "盈亏", "赢的比例 / 保本", "成交率", "报价次数", "双边", "成交份数", "第几档"], d.by_price.map((x) =>
+    `<tr><td>${x.filled ? `<a class="link" data-price="${x.price}">${x.price}¢ 看场次</a>` : x.price + "¢"}</td><td>${signed(x.pnl)}</td>` +
+    `<td class="${x.win_rate == null ? "" : x.win_rate >= x.breakeven ? "good" : "bad"}">${x.win_rate == null ? "—" : x.win_rate + "%"} / ${x.breakeven}%</td>` +
+    `<td>${pct(x.fill_rate)}</td><td>${x.quotes}${x.upcoming ? `<span class="muted">（+${x.upcoming} 未开场）</span>` : ""}</td><td>${x.both}</td><td>${shares(x.shares)}</td><td>${esc(x.levels)}</td></tr>`));
+  for (const el of document.querySelectorAll("[data-price]")) el.onclick = () => openPrice(el.dataset.price);
+  renderChanges(d.changes);
+  const row = (label, x) => `<tr><td>${esc(label)}</td><td>${signed(x.pnl)}</td><td>${money(x.volume)}</td><td>${shares(x.shares)}</td><td>${x.filled}</td><td>${x.quoted ?? ""}${x.upcoming ? `<span class="muted">+${x.upcoming}</span>` : ""}</td>` +
+    `<td>${pct(x.fill_rate)}</td><td>${x.both}</td><td>${pct(x.both_rate)}</td><td>${x.wins}/${x.losses}</td><td>${x.avg_pnl == null ? "—" : signed(x.avg_pnl)}</td><td>${pct(x.roi)}</td></tr>`;
+  const head = ["盈亏", "成交额", "成交份数", "成交场次", "报价场次", "成交率", "双边", "双边率", "赢/输", "单场均", "收益率"];
+  const days = d.by_day.slice(0, 120);
+  table("jDay", ["日期"].concat(head), days.map((x) => row(x.day, x)));
+  $("jDayNote").textContent = "成交额 = 买到的份数 × 买价（还没结算的也算）；盈亏、收益率、单场均盈亏只算已经结算的场次；成交率只算已经开场的场次（报价场次后面的 +N 是还没开场的）。" +
+    (d.by_day.length > days.length ? `页面列最近 ${days.length} 天，共 ${d.by_day.length} 天，全部在「导出每日汇总 CSV」。` : "");
+  table("jCoin", ["币种"].concat(head), d.by_coin.map((x) => row(x.coin, x)));
+  table("jHour", ["开场"].concat(head), d.by_hour.map((x) => row(String(x.hour).padStart(2, "0") + ":00", x)));
+  table("jSide", ["", "份数", "成本", "回款", "盈亏", "赢的比例 / 保本"], d.by_side.map((x) =>
+    `<tr><td>${esc(x.name)}</td><td>${shares(x.shares)}</td><td>${money(x.cost)}</td><td>${x.payout == null ? "—" : money(x.payout)}</td><td>${x.pnl == null ? "—" : signed(x.pnl)}</td>` +
+    `<td>${x.win_rate == null ? (x.breakeven == null ? "" : "— / " + x.breakeven + "%") : `<span class="${x.win_rate >= x.breakeven ? "good" : "bad"}">${x.win_rate}%</span> / ${x.breakeven}%`}</td></tr>`));
+  table("jSpeed", ["开放后几秒挂上", "报价", "成交率", "双边率", "已结算盈亏"], d.by_speed.map((x) =>
+    `<tr><td>${esc(x.bucket)}</td><td>${x.quotes}</td><td>${pct(x.fill_rate)}</td><td>${pct(x.both_rate)}</td><td>${signed(x.pnl)}</td></tr>`), "没有第一档的报价");
   renderMarkets();
-  const row = (label, x) => `<tr><td>${esc(label)}</td><td>${signed(x.pnl)}</td><td>${money(x.volume)}</td><td>${shares(x.shares)}</td><td>${x.filled}</td><td>${x.quoted ?? ""}</td><td>${pct(x.fill_rate)}</td><td>${x.both}</td><td>${x.wins}/${x.losses}</td><td>${pct(x.roi)}</td></tr>`;
-  const head = "<tr><th></th><th>盈亏</th><th>成交额</th><th>成交份数</th><th>成交场次</th><th>报价场次</th><th>成交率</th><th>双边</th><th>赢/输</th><th>收益率</th></tr>";
-  $("jDay").innerHTML = head.replace("<th></th>", "<th>日期</th>") + (d.by_day.map((x) => row(x.day, x)).join("") || '<tr><td colspan="10" class="muted">这段时间没有记录</td></tr>');
-  $("jCoin").innerHTML = head.replace("<th></th>", "<th>币种</th>") + d.by_coin.map((x) => row(x.coin, x)).join("");
-  $("jHour").innerHTML = head.replace("<th></th>", "<th>开场</th>") + d.by_hour.map((x) => row(String(x.hour).padStart(2, "0") + ":00", x)).join("");
-  $("jSide").innerHTML = "<tr><th>方向</th><th>成交份数</th><th>成本</th><th>赢回</th><th>盈亏</th></tr>" + d.by_side.map((x) => `<tr><td>${x.side}</td><td>${x.shares}</td><td>${money(x.cost)}</td><td>${money(x.won)}</td><td>${signed(x.pnl)}</td></tr>`).join("");
-  const C = d.cancel || {rows: [], by_fill_time: []};
-  const loss = (C.losses || []).map((t) => `${t.bucket} ${t.pnl >= 0 ? "+" : ""}${t.pnl.toFixed(2)}（赢 ${(t.win_rate * 100).toFixed(0)}%，保本 ${(t.breakeven * 100).toFixed(0)}%）`).join("；");
-  $("cAdvice").innerHTML = "<b>结论：" + esc(C.advice || "—") + "</b>" + (loss ? `<br>亏在哪：${esc(loss)}` : "") +
-    (C.after_start || C.after_cancel ? `<br><span class="warn">⚠️ ${C.after_start} 笔开场后成交、${C.after_cancel} 笔撤单确认后成交：撤单或到期没及时生效</span>` : "") +
-    (C.by_coin && C.by_coin.length ? `<br>按币种：${C.by_coin.map((x) => `${esc(x.coin)} ${x.pnl >= 0 ? "+" : ""}${x.pnl.toFixed(2)}`).join("，")}` : "");
-  const A = C.actual;
-  $("cRows").innerHTML = "<tr><th>开场前几秒撤</th><th>有成交的场次</th><th>双边</th><th>成交份数</th><th>成本</th><th>盈亏</th><th></th></tr>" +
-    (A ? `<tr><td><b>实际（${C.current} 秒）</b></td><td>${A.filled} / ${A.windows}</td><td>${A.both}</td><td>${A.shares}</td><td>${money(A.cost)}</td><td>${signed(A.pnl)}</td><td>实际发生的</td></tr>` : "") +
-    (C.rows.map((x) => `<tr><td>${x.cancel_s} 秒</td><td>${x.filled} / ${x.windows}</td><td>${x.both}</td><td>${x.shares}</td><td>${money(x.cost)}</td><td>${signed(x.pnl)}</td><td>${x.cancel_s === C.best ? "★最好" : ""}</td></tr>`).join("") || '<tr><td colspan="7" class="muted">还没有结束的场次</td></tr>');
-  $("cNote").textContent = C.rows.length ? `把每一场按「如果开场前 X 秒撤单」重算（X 秒之后的成交当作没发生），同一批 ${C.windows} 场比较。比开场前 ${C.base} 秒更晚撤算不出来：那时单子已经撤了。${C.excluded ? `另有 ${C.excluded} 场当时撤得更早，没算。` : ""}${C.approx ? `${C.approx} 条成交时刻是快照看到的时间（偏晚几秒）。` : ""}改撤单时间：「参数」页的撤单一项，或 Telegram 复盘消息下面的按钮。` : "";
-  $("cTimes").innerHTML = "<tr><th>成交时距开场</th><th>份数</th><th>成本</th><th>盈亏</th><th>那一边赢的比例</th><th>保本线</th></tr>" + (C.by_fill_time.map((x) =>
-    `<tr><td>${esc(x.bucket)}</td><td>${x.shares}</td><td>${money(x.cost)}</td><td>${signed(x.pnl)}</td><td class="${x.win_rate >= x.breakeven ? "good" : "bad"}">${(x.win_rate * 100).toFixed(0)}%</td><td>${(x.breakeven * 100).toFixed(0)}%</td></tr>`).join("") || '<tr><td colspan="6" class="muted">还没有成交</td></tr>');
-  $("jDetail").innerHTML = "<tr><th>场次</th><th>档</th><th>价格</th><th>涨</th><th>跌</th><th>成本</th><th>结果</th><th>盈亏</th><th>挂上时距开场</th><th>撤单确认</th><th>首次成交距开场</th><th>第几次</th></tr>" + (d.detail.map((x) =>
+  table("jDetail", ["场次", "档", "价格", "涨", "跌", "成本", "结果", "盈亏", "挂上时距开场", "撤单确认", "首次成交距开场", "第几次"], d.detail.map((x) =>
     `<tr><td>${esc(x.coin)} ${esc(x.when)}</td><td>${x.level}</td><td>${x.price}¢</td><td>${x.up || ""}</td><td>${x.down || ""}</td><td>${money(x.cost)}</td><td>${esc(x.result)}</td><td>${x.pnl == null ? "" : signed(x.pnl)}</td>` +
-    `<td>${secs(x.placed_lead_s)}</td><td>${x.cancel_lead_s == null ? "—" : "开场前 " + secs(x.cancel_lead_s)}</td><td>${secs(x.first_fill_lead_s)}</td><td>${x.attempt}</td></tr>`).join("") || '<tr><td colspan="12" class="muted">还没有成交</td></tr>');
-  $("jMore").textContent = d.detail_more ? `另有 ${d.detail_more} 场在 CSV 里` : "";
+    `<td>${secs(x.placed_lead_s)}</td><td>${x.cancel_lead_s == null ? "—" : "开场前 " + secs(x.cancel_lead_s)}</td><td>${secs(x.first_fill_lead_s)}</td><td>${x.attempt}</td></tr>`), "还没有成交");
+  $("jMore").textContent = d.detail_more ? `另有 ${d.detail_more} 条在导出的成交明细里` : "";
+}
+let jLoading = null;
+async function loadJournal(next, force) {
+  // a new filter is kept (and remembered) only once the server took it; one it refuses leaves the last good one.
+  // While a review is worked out (seconds on a long ledger) the page keeps the last one, dimmed.
+  const want = jWant(next);
+  const query = jQuery(want);
+  if (jLoading === query && !force) return;
+  jLoading = query; $("jBody").classList.add("busy"); $("jBusy").textContent = "　计算中…";
+  try {
+    const r = await api("/api/journal?" + query);
+    if (jLoading !== query) return;  // a newer filter was asked meanwhile
+    if (r.status === 400) {
+      toast((r.data && r.data.error) || "时间不对", true);
+      if (!next && state.jRange !== "all") loadJournal({range: "all"});  // a remembered filter gone bad: everything
+      return;
+    }
+    if (r.status !== 200) return;
+    state.jAt = Date.now();
+    state.jRange = want.range; store.set("jRange", want.range);
+    if (want.range === "custom") { state.jFrom = want.from; state.jTo = want.to; store.set("jFrom", want.from); store.set("jTo", want.to); }
+    state.jCoins = want.coins; store.set("jCoins", want.coins.join(","));
+    state.mSort = want.sort; store.set("mSort", want.sort);
+    const text = JSON.stringify(r.data);
+    if (text === state.jText && !force) return;   // nothing changed: the tables (and where they are scrolled) stay
+    state.jText = text; state.journal = r.data;
+    const kept = {};
+    for (const s of document.querySelectorAll("#tab-journal .scroll")) { const t = s.querySelector("table"); if (t && t.id) kept[t.id] = [s.scrollLeft, s.scrollTop]; }
+    renderJournal();
+    for (const s of document.querySelectorAll("#tab-journal .scroll")) { const t = s.querySelector("table"); if (t && kept[t.id]) [s.scrollLeft, s.scrollTop] = kept[t.id]; }
+  } finally {
+    if (jLoading === query) { jLoading = null; $("jBody").classList.remove("busy"); $("jBusy").textContent = ""; }
+  }
 }
 async function download(kind) {
-  const r = await api("/api/journal.csv?kind=" + kind + "&" + jQuery()); if (r.status !== 200) return toast("导出失败", true);
+  const r = await api("/api/journal.csv?kind=" + kind + "&" + jQuery());
+  if (r.status !== 200) return toast((r.data && r.data.error) || "导出失败", true);
   const url = URL.createObjectURL(new Blob([r.data], {type: "text/csv;charset=utf-8"}));
-  const a = document.createElement("a"); a.href = url; a.download = {daily: "preopen-daily.csv", markets: "preopen-markets.csv", quotes: "preopen-quotes.csv", cancel: "preopen-cancel-review.csv"}[kind] || "preopen-fills.csv"; document.body.appendChild(a); a.click(); a.remove();
+  const a = document.createElement("a"); a.href = url; a.download = `${kind}-${((state.journal && state.journal.span && state.journal.span.label) || "全部").replace(/[\s:～]/g, "")}.csv`;
+  document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 5000);
   if (initData) toast("Telegram 里可能下载不了：发 /export 让机器人把文件发给你");
 }
 $("csvDetail").onclick = () => download("detail");
 $("csvMarkets").onclick = () => download("markets");
 $("xlsxAll").onclick = async () => {
-  const r = await api("/api/journal.xlsx?" + jQuery()); if (r.status !== 200) return toast("导出失败", true);
+  const r = await api("/api/journal.xlsx?" + jQuery()); if (r.status !== 200) return toast((r.data && r.data.error) || "导出失败", true);
   const url = URL.createObjectURL(r.data);
-  const a = document.createElement("a"); a.href = url; a.download = `复盘_${(state.journal && state.journal.span && state.journal.span.label || "全部").replace(/[\s:～]/g, "")}.xlsx`;
+  const a = document.createElement("a"); a.href = url; a.download = `复盘_${((state.journal && state.journal.span && state.journal.span.label) || "全部").replace(/[\s:～]/g, "")}.xlsx`;
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 5000);
   if (initData) toast("Telegram 里可能下载不了：在机器人里点 📤 导出");

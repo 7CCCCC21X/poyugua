@@ -108,8 +108,8 @@ class WorkbookTest(unittest.TestCase):
 
     def test_every_sheet_and_the_guide(self):
         sheets, totals = self.build()
-        self.assertEqual(list(sheets), ["总览", "每日", "市场盈亏", "档位", "成交时刻", "撤单时间", "币种", "时段", "成交明细", "全部报价",
-                                        "拒单", "参数"])
+        self.assertEqual(list(sheets), ["总览", "每日", "市场盈亏", "档位", "成交时刻", "撤单时间", "方向", "速度", "改参对比", "币种", "时段",
+                                        "成交明细", "全部报价", "拒单", "参数"])
         overview = {r[0]: r[1:] for r in sheets["总览"] if r}
         self.assertEqual(overview["时间范围（按开场，北京时间）"], ["全部"])
         self.assertEqual(overview["成交场次"], ["2"])
@@ -122,14 +122,14 @@ class WorkbookTest(unittest.TestCase):
     def test_the_prices_quoted(self):
         sheets, _ = self.build()
         head, *rows = sheets["档位"]
-        self.assertEqual(head[:5], ["价格¢", "第几档", "报价（档次）", "有成交", "成交率%"])
+        self.assertEqual(head[:6], ["价格¢", "第几档", "报价（已开场）", "还没开场", "有成交", "成交率%"])
         by_price = {r[0]: r for r in rows}
         # 47¢: two quotes, both filled; 30 shares settled, 20 on the winning side: 66.7% against a 47% breakeven
-        self.assertEqual(by_price["47"][2:5], ["2", "2", "100"])
+        self.assertEqual(by_price["47"][2:6], ["2", "0", "2", "100"])
         self.assertEqual(by_price["47"][-2:], ["66.7", "47"])
         # 40¢: two quotes, one filled (20 down, which lost)
-        self.assertEqual(by_price["40"][2:5], ["2", "1", "50"])
-        self.assertEqual((by_price["40"][10], by_price["40"][-2]), ("-8", "0"))
+        self.assertEqual(by_price["40"][2:6], ["2", "0", "1", "50"])
+        self.assertEqual((by_price["40"][11], by_price["40"][-2]), ("-8", "0"))
 
     def test_the_span_refusals_quotes_and_settings(self):
         today = journal.preset_span("today", self.now)

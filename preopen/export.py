@@ -18,7 +18,10 @@ GUIDE: tuple[tuple[str, str], ...] = (
     ("市场盈亏", "每一场（一个币的一个 5 分钟）几档合起来的盈亏：亏得多的场次有什么共同点（币种、时段、成交时刻）"),
     ("档位", "每个价格报价多少次、成交率、买到的那一边赢的比例。赢的比例低于保本比例（=价格）的价格在亏钱：降价或去掉这一档"),
     ("成交时刻", "成交离开场多久：越靠近开场越可能是知道方向的人在吃单。哪一行赢的比例低于保本，就把撤单提前到它之前"),
-    ("撤单时间", "如果开场前 X 秒撤单会怎样（同一批场次重算）：★ 是这些记录里最好的撤单时间"),
+    ("撤单时间", "如果开场前 X 秒撤单会怎样（同一批场次重算），每一行和现在的设置比：★ 是最好的；还有可信度"),
+    ("方向", "配成对的份数（锁定价差）和单边多出来的份数分开算：单边那部分赢的比例低于保本，就是被知道方向的人吃了"),
+    ("速度", "第一档开放后几秒挂上：挂得慢的那几档双边率低、亏钱，说明排队靠后只吃到单边"),
+    ("改参对比", "每次改参数，改之前和改之后一样长的时间各自的成交率、双边率、成交额、盈亏"),
     ("币种", "每个币的成交和盈亏：一直亏的币可以不挂"),
     ("时段", "按开场的小时（北京时间）：哪些时段亏，可以考虑那段时间不挂"),
     ("成交明细", "每一档的成交，含每笔成交的时刻（开场前几秒:份数），可以自己再筛选、透视"),
@@ -43,6 +46,7 @@ def overview(review: dict[str, Any], label: str, now: float, mode: str, quotes: 
         ["成交份数", r["shares"]], ["成交额$（份数×买价，没结算的也算）", r["volume"]], ["赢的场次", r["wins"]], ["输的场次", r["losses"]],
         ["待结算场次", r["open"]], ["已结算成本$", r["cost"]], ["回款$", r["payout"]], ["盈亏$（已结算）", r["pnl"]], ["收益率%", r["roi"]], [],
         ["撤单时间", c["advice"]],
+        ["可信度", f"{(c.get('confidence') or {}).get('level', '低')}：{'；'.join((c.get('confidence') or {}).get('notes') or [])}"],
     ]
     if c.get("losses"):
         rows.append(["亏在哪（成交时刻）", "；".join(f"{t['bucket']} {t['pnl']:+.2f}（买到的一边赢 {t['win_rate'] * 100:.0f}%，"
@@ -58,6 +62,15 @@ def overview(review: dict[str, Any], label: str, now: float, mode: str, quotes: 
     title = len(rows) - 1
     rows += [[name, text] for name, text in GUIDE]
     return Sheet("总览", rows, header=False, bold={0, 5, 20, title})
+
+
+def changes_for(records: Any, now: float, log: list[dict], coins: list[str] | None) -> list[dict]:
+    """The settings changes with the time before and after each, through the reader (or a list)."""
+    def read(lo: float, hi: float, newest: bool = False) -> Any:
+        if callable(records):
+            return records(lo, hi, newest)
+        return [q for q in records if lo <= q["start"] < hi]
+    return journal.change_effects(read, now, log, coins)
 
 
 def settings_sheet(values: dict[str, str], log: list[dict]) -> Sheet:
@@ -91,6 +104,7 @@ def build(records: Any, now: float, current: int | None, span: tuple[float, floa
     with journal.quiet_gc():
         review = journal.journal(stream(), now, current, span)
         cancel = review["cancel"]
+        changes = changes_for(records, now, settings_log, coins)
         quotes, quotes_all = journal.quotes_rows(stream(True), QUOTES_KEPT)
         fills = journal.detail_table(stream(True), FILLS_KEPT)
     return workbook([
@@ -100,6 +114,9 @@ def build(records: Any, now: float, current: int | None, span: tuple[float, floa
         Sheet("档位", journal.price_table(review)),
         Sheet("成交时刻", journal.fill_time_table(cancel)),
         Sheet("撤单时间", journal.replay_table(cancel) + [[]] + journal.cancel_notes(cancel)),
+        Sheet("方向", journal.side_table(review)),
+        Sheet("速度", journal.speed_table(review)),
+        Sheet("改参对比", journal.changes_table(changes)),
         Sheet("币种", journal.coin_table(review)),
         Sheet("时段", journal.hour_table(review)),
         Sheet("成交明细", fills),
