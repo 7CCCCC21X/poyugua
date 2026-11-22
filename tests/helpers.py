@@ -106,13 +106,13 @@ class FakePublic:
         return condition_id not in self.not_accepting
 
     async def book(self, asset):
-        return {"bids": [], "asks": []} if any(asset in m["clobTokenIds"] for m in self.listed.values()) else None
+        return {"bids": [], "asks": []} if any(asset in (mk.outcome_ids(m) or []) for m in self.listed.values()) else None
 
     async def clob_market(self, condition_id):
         m = next((m for m in self.listed.values() if m["conditionId"] == condition_id), None)
         if m is None:
             return None
-        tokens = json.loads(m["clobTokenIds"])
+        tokens = mk.outcome_ids(m)   # a V2 market's are its position ids
         return {"ao": condition_id not in self.not_accepting, "t": [{"t": t, "o": o} for t, o in zip(tokens, ("Up", "Down"))],
                 "c": condition_id}
 

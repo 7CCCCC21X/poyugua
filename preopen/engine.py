@@ -54,6 +54,9 @@ ARM_EARLY_S = 1.0         # a fresh listing the CLOB does not accept yet is aske
 ARM_RETRY_S = 0.2         # ...and this often from ARM_FAST_AFTER_S on: markets turn active ~75-90 s after their
 ARM_FAST_AFTER_S = 55     #    creation (11-13: +71 to +92 s), and the crowd posts within a second of it
 ARM_FRESH_S = 300         # ...while this young; an older one waits HOLD_RETRY_S
+ARM_IDLE_S = 900          # still not accepting this long after its creation (V2 markets may be created a day before their
+ARM_IDLE_RETRY_S = 30     # trading starts, docs 11-22): asked every 30 s, and ARM_IDLE_RATE a second over all such
+ARM_IDLE_RATE = 2.0       # listings, so hundreds of them never flood the CLOB (a 429 there would stall every opening)
 ERROR_RETRY_S = 30        # a placement that raised
 FREE_REQUOTE_S = 3        # a withdrawn level is quoted again this long after its close (not its own failure)...
 COUNTED_REQUOTE_S = 60    # ...or after its own failure
@@ -79,6 +82,12 @@ REDEEM_RETRY_S = 600
 FILL_LOG_TRIES = 3        # a window's trades read for the fills' exact times this many passes, then settled without them
 REDEEM_TRIES = 6
 SETTINGS_KEPT = 200       # settings changes kept (when, how, what from and to), for the review's 参数 sheet
+V2_HOLD_S = 600           # a V2 market refused for the balance or allowance with ExchangeV3's not known granted: V2 waits
+V2_REFRESH_S = 300        # ...and the CLOB is asked to read the allowances afresh this often meanwhile
+V2_NOTE_S = 1800          # V2 markets left unquoted for the approval: told on Telegram this often
+V2_HELP = ("账户的 pUSD 还没授权给 Polymarket Protocol V2 的交易所（ExchangeV3），V2 市场的单会被拒。到 Polymarket 网页或 App "
+           "打开一个 V2 市场（11-23 起 SOL、XRP、DOGE、HYPE、BNB 的 5 分钟场，11-24 起 BTC、ETH），按提示完成授权；授权后几分钟内"
+           "机器人自己开始挂 V2 市场。旧的（CTF）市场照常挂，不受影响")
 STALE_EXTRA_S = 15
 BALANCE_HOLD_S = 60       # the CLOB refused or cancelled an order for the balance: no new order this long
 RECONCILE_BUDGET_S = 20   # a reconcile pass is cut off after this (its reads are retried next pass)
@@ -197,6 +206,9 @@ class Engine:
         self.trades: dict[str, tuple[float, dict[str, D]]] = {}   # condition id -> (read at, order id -> shares bought)
         self.blocked = ""                     # the ledger belongs to another account: nothing is taken over or placed
         self.stopping = ""                    # a withdrawal began (the exit, a switch to paper): nothing new is placed
+        self.v2_hold_until = 0.0              # V2 markets wait (their approval seems missing) until then
+        self.idle_ask_at = 0.0                # the next CLOB "accepting?" read of a long-idle listing not before then
+        self.v2_refreshed = 0.0               # when the CLOB was last asked to read the allowances afresh
         self.cancel_wait_until = 0.0          # a cancel refused before processing (429, a restart): asked again after this
         self._risk: tuple[Any, str] = (None, "")
         self.risk_note = ""
@@ -413,6 +425,23 @@ class Engine:
                 else:
                     out.append(q)
         return out
+
+    def v2_blocked(self) -> str:
+        """Why a Polymarket Protocol V2 market is not quoted now ("" when it may be): ExchangeV3 known not to be allowed
+        any pUSD, or a V2 refusal for the balance or allowance that the allowance did not explain. Granted, it is quoted
+        at once (the balance read every 30 s brings the allowance)."""
+        allowance = getattr(self.x, "v2_allowance", None)
+        if allowance is not None and allowance > 0:
+            self.v2_hold_until = 0.0
+            return ""
+        if allowance is not None or self.now() < self.v2_hold_until:
+            return "V2 市场还没授权：" + V2_HELP
+        return ""
+
+    def v2_warn(self, text: str) -> None:
+        """V2 markets left unquoted for the approval: said now and then (Telegram, the errors), not at every retry."""
+        if self.now() - self.notified.get("v2-approval", float("-inf")) >= V2_NOTE_S:
+            self.problem(text, key="v2-approval")
 
     def stale_after(self) -> float:
         return 3 * max(self.s.snapshot_s, self.snapshot_took) + STALE_EXTRA_S
@@ -775,7 +804,15 @@ class Engine:
             return None
         if why := self.hold():
             return Hold(why, None if self.paused else HOLD_RETRY_S)
+        if listing.version == "v2" and (why := self.v2_blocked()):  # V2 alone waits; the CTF markets go on
+            self.v2_warn(f"{mk.window_name(listing.coin, listing.start)} 是 V2 市场，没挂：{V2_HELP}")
+            return Hold(why, HOLD_RETRY_S * 12)
         if not listing.accepting:
+            age = self.now() - (listing.created or listing.seen)
+            if age >= ARM_IDLE_S:  # long listed and still shut: read within one rate over all such listings
+                if self.now() < self.idle_ask_at:
+                    return Hold("市场还没开放下单", ARM_IDLE_RETRY_S)
+                self.idle_ask_at = self.now() + 1 / ARM_IDLE_RATE
             try:
                 accepting = await self.pub.accepting(listing.condition_id)
             except PublicThrottled as t:
@@ -784,8 +821,8 @@ class Engine:
                 LOG.debug("accepting %s: %s", slug, error)
                 accepting = None
             if not accepting:
-                age = self.now() - (listing.created or listing.seen)
-                retry = HOLD_RETRY_S if age >= ARM_FRESH_S else ARM_EARLY_S if age < ARM_FAST_AFTER_S else ARM_RETRY_S
+                retry = (ARM_IDLE_RETRY_S if age >= ARM_IDLE_S else HOLD_RETRY_S if age >= ARM_FRESH_S
+                         else ARM_EARLY_S if age < ARM_FAST_AFTER_S else ARM_RETRY_S)
                 return Hold("市场还没开放下单", retry)
             listing.accepting = True
             listing.opened = self.now()
@@ -875,7 +912,15 @@ class Engine:
                         self.listings.pop(slug, None)
                         self.problem(f"{mk.window_name(listing.coin, listing.start)} 连续 {tries} 次 invalid token id："
                                      f"重新读一遍这一场的市场信息再挂", key="token-refresh")
-                if r.code == "not_enough_balance":
+                if r.code == "not_enough_balance" and listing.version == "v2" and not (getattr(self.x, "v2_allowance", None) or 0) > 0:
+                    # a V2 market refused while ExchangeV3's allowance is not known granted: the V2 approval, most likely
+                    # (11-22: the CTF approvals do not cover V2). Only the V2 markets wait; the others go on
+                    self.v2_hold_until = max(self.v2_hold_until, self.now() + V2_HOLD_S)  # the allowances read afresh
+                    # at the next account pass (account_once); the balance's age untouched, or every placement waits
+                    hold = Hold("V2 市场还没授权：" + V2_HELP, V2_HOLD_S)
+                    self.v2_warn(f"交易所拒了 V2 市场 {mk.window_name(listing.coin, listing.start)} 的单（余额或授权不足）："
+                                 + V2_HELP)
+                elif r.code == "not_enough_balance":
                     hold = Hold("余额或授权不足（交易所拒单）", None)
                     self.hold_balance("交易所拒单：余额或授权不足（到 Polymarket 核对 pUSD 余额和交易授权）")
             states = {o["state"] for o in q["orders"].values()}
@@ -1433,7 +1478,11 @@ class Engine:
         rows = await self.x.open_orders()
         self.snapshot_took = self.now() - began
         self.apply_snapshot(rows, began)
-        if self.now() - self.balance_at >= BALANCE_EVERY_S or self.balance is None:
+        held_v2 = bool(self.v2_blocked()) and self.now() - self.v2_refreshed >= V2_REFRESH_S
+        if held_v2 and hasattr(self.x, "refresh_allowance"):  # an approval made on the website: the CLOB reads it afresh
+            self.v2_refreshed = self.now()
+            await self.x.refresh_allowance()
+        if self.now() - self.balance_at >= BALANCE_EVERY_S or self.balance is None or held_v2:
             self.balance = await self.x.balance()
             self.balance_at = self.now()
 
@@ -2278,6 +2327,14 @@ class Engine:
             lines.append(f"⚠️ 冷却中：{self.cooldown_reason[:120]}（还有 {self.cooldown_until - now:.0f} 秒）")
         if timeouts:
             lines.append(f"⚠️ 下单超时（order timed out）连续 {timeouts} 次")
+        v2 = sum(1 for listing in self.listings.values() if listing.version == "v2")
+        allowance = getattr(self.x, "v2_allowance", None)
+        if self.v2_blocked():
+            lines.append(f"⛔ V2 市场：没授权，不挂（已发现 {v2} 场 V2 市场）。{V2_HELP}")
+        elif allowance is not None and allowance > 0:
+            lines.append(f"✅ V2 市场：已授权（Polymarket Protocol V2）" + (f"，已发现 {v2} 场" if v2 else ""))
+        elif v2:
+            lines.append(f"ℹ️ V2 市场：已发现 {v2} 场，交易所还没报授权情况；被拒就会只停 V2 市场并提醒你授权")
         if self.accepted_at:
             lines.append(f"✅ 下单：最近一次被交易所接受是 {mk.span(now - self.accepted_at)}前")
         elif self.last_refusal:

@@ -7,7 +7,6 @@ the request held and whether it was refused as a whole, how long after the listi
 """
 from __future__ import annotations
 
-import json
 import statistics
 from collections import Counter, defaultdict
 from typing import Any, Iterable
@@ -201,12 +200,7 @@ async def live_check(engine: Any, limit: int = 6) -> str:
             continue
         ao = clob.get("ao") if isinstance(clob, dict) else None
         clob_tokens = {str(t.get("t")) for t in (clob or {}).get("t", []) if isinstance(t, dict)}
-        gamma_tokens = set()
-        if isinstance(gamma, dict):
-            try:
-                gamma_tokens = {str(t) for t in json.loads(gamma.get("clobTokenIds") or "[]")}
-            except ValueError:
-                gamma_tokens = set()
+        gamma_tokens = {str(t) for t in (mk.outcome_ids(gamma) or [])} if isinstance(gamma, dict) else set()
         parts.append("现在挂着 ✅" if resting else "现在没挂着")
         parts.append("交易所接受下单 ✅" if ao else f"交易所接受下单 ❌（{'没有这个市场' if clob is None else ao}）")
         parts.append("代币有订单簿 ✅" if book is not None else "代币还没有订单簿 ❌")

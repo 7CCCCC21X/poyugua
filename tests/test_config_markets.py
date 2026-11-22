@@ -111,6 +111,15 @@ class MarketsTest(unittest.TestCase):
         m = gamma_market("btc", T0, version="v2", positionIds=json.dumps(["111", "222"]))
         listing, _ = mk.parse_listing(m, "btc", T0)
         self.assertEqual((listing.up, listing.down), ("111", "222"))
+        self.assertEqual(listing.version, "v2")
+        # Gamma's positionIds is a plain array; a V2 market's ids are its positionIds even with clobTokenIds there
+        m = gamma_market("btc", T0, version="v2", positionIds=["333", "444"])
+        self.assertEqual(mk.outcome_ids(m), ["333", "444"])
+        self.assertEqual(mk.parse_listing(m, "btc", T0)[0].up, "333")
+        # ...and a CTF (v1) market's are its clobTokenIds, whatever else it carries
+        m = gamma_market("btc", T0, positionIds=["333", "444"])
+        self.assertEqual(mk.outcome_ids(m), json.loads(m["clobTokenIds"]))
+        self.assertEqual(mk.parse_listing(m, "btc", T0)[0].version, "v1")
 
     def test_level_problem_and_winner(self):
         listing, _ = mk.parse_listing(gamma_market("btc", T0), "btc", T0)

@@ -13,7 +13,7 @@ try:
 except ImportError:  # the SDK is in the image (requirements.lock); a light checkout without it skips this suite
     raise unittest.SkipTest("polymarket-client is not installed") from None
 from preopen import gamma
-from preopen.exchange import Bucket, LiveExchange, OrderSpec, order_hash
+from preopen.exchange import V2_EXCHANGE, Bucket, LiveExchange, OrderSpec, order_hash, v2_allowance_of
 
 WALLET = "0x1111111111111111111111111111111111111111"
 ZERO32 = "0x" + "00" * 32
@@ -140,6 +140,55 @@ class LiveExchangeTest(unittest.IsolatedAsyncioTestCase):
         r = await x.cancel(["a", "b", "c"])
         self.assertEqual(r.canceled, {"a", "b"})
         self.assertEqual(r.not_canceled, {"c": "order not found"})
+
+
+class ProtocolV2Test(unittest.IsolatedAsyncioTestCase):
+    """Polymarket Protocol V2 (11-23 on): ExchangeV3's pUSD allowance read with the balance, the CLOB asked to read the
+    allowances afresh, a V2 market's empty position taken as claimed."""
+
+    async def test_the_allowance_of_exchange_v3(self):
+        self.assertEqual(v2_allowance_of({V2_EXCHANGE: 2_500_000, "0xabc": 1}), D("2.5"))
+        self.assertEqual(v2_allowance_of({V2_EXCHANGE.lower(): 0}), D(0))          # known: none allowed
+        self.assertIsNone(v2_allowance_of({"0xC5d563A36AE78145C45a50134d48A1215220f80a": 10**30}))   # not named: not known
+        self.assertIsNone(v2_allowance_of(None))
+        self.assertIsNone(v2_allowance_of({V2_EXCHANGE: "max"}))
+
+    async def test_the_balance_brings_the_allowance(self):
+        from polymarket.models.clob.account import BalanceAllowance
+        x, c = live()
+
+        async def balance_allowance(asset_type):
+            self.assertEqual(asset_type, "COLLATERAL")
+            return BalanceAllowance(balance=75_100_000, allowances={V2_EXCHANGE: 0, "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E": 10**30})
+        c.get_balance_allowance = balance_allowance
+        self.assertIsNone(x.v2_allowance)
+        self.assertEqual(await x.balance(), D("75.1"))
+        self.assertEqual(x.v2_allowance, D(0))
+
+    async def test_the_allowances_read_afresh(self):
+        x, c = live()
+        await x.refresh_allowance()               # a client without the SDK's internals: nothing, no error
+        asked = []
+
+        class Clob:
+            async def get_bytes(self, path, params=None):
+                asked.append((path, params))
+        c._ctx = type("Ctx", (), {"wallet_type": "DEPOSIT_WALLET", "secure_clob": Clob()})()
+        await x.refresh_allowance()
+        self.assertEqual(asked, [("/balance-allowance/update", {"asset_type": "COLLATERAL", "signature_type": 3})])
+
+    async def test_a_v2_market_with_nothing_to_redeem_is_claimed(self):
+        from polymarket import UserInputError
+        x, c = live()
+        x.wallet_type = "EOA"
+        errors = [UserInputError("no balance to redeem"), UserInputError("condition not resolved")]
+
+        async def redeem_positions(condition_id):
+            raise errors.pop(0)
+        c.redeem_positions = redeem_positions
+        self.assertIn("已领取", await x.redeem("0x" + "12" * 32))
+        with self.assertRaises(UserInputError):    # any other refusal stays an error (tried again later)
+            await x.redeem("0x" + "12" * 32)
 
 
 class HashFirstTest(unittest.IsolatedAsyncioTestCase):
@@ -315,16 +364,63 @@ class PublicApiTest(unittest.IsolatedAsyncioTestCase):
         def handler(request: httpx.Request) -> httpx.Response:
             seen.append(request.url)
             slugs = request.url.params.get_list("slug")
-            return httpx.Response(200, json=[{"slug": s} for s in slugs if s.endswith("0")])
+            # Gamma lists one protocol per query (v1 when none is named): the V2 markets only with version=v2
+            want = request.url.params.get("version", "v1")
+            return httpx.Response(200, json=[{"slug": s, "version": want} for s in slugs
+                                             if s.endswith("0") and want == ("v2" if s.endswith("00") else "v1")])
         api = gamma.PublicApi(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
         slugs = [f"btc-updown-5m-{1794537000 + 300 * i}" for i in range(50)]
         found = await api.listings(slugs)
-        self.assertEqual(len(seen), 2)  # 40 + 10
+        self.assertEqual(len(seen), 6)  # (20 + 20 + 10) x (v1, v2): each slug under both names, 40 names a request
         self.assertEqual(set(found), {s for s in slugs if s.endswith("0")})
+        self.assertEqual({m["version"] for s, m in found.items() if s.endswith("00")}, {"v2"})   # 11-22: V2 ones too
+        self.assertEqual(sorted(u.params["version"] for u in seen), ["v1"] * 3 + ["v2"] * 3)
         for url in seen:
             self.assertTrue(url.params.get("_"))
             self.assertGreaterEqual(int(url.params["limit"]), len(url.params.get_list("slug")))
+            self.assertLessEqual(len(url.params.get_list("slug")), gamma.SLUGS_PER_REQUEST)
+        self.assertIn("polyv2" + slugs[0], seen[0].params.get_list("slug"))
         self.assertNotEqual(seen[0].params["_"], seen[1].params["_"])
+        await api.close()
+
+    async def test_a_market_under_the_v2_test_name_is_kept_under_the_bots(self):
+        """11-20's V2 test markets were polyv2<coin>-updown-5m-<t>: the V2 ones may keep that name."""
+        t = 1795216800
+        listed = {f"polyv2sol-updown-5m-{t}", f"btc-updown-5m-{t}", f"polyv2btc-updown-5m-{t}"}
+        paths = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.startswith("/markets/slug/"):
+                name = request.url.path.rsplit("/", 1)[1]
+                paths.append(name)
+                return httpx.Response(200, json={"slug": name, "version": "v2"}) if name in listed else httpx.Response(404)
+            names = request.url.params.get_list("slug")
+            return httpx.Response(200, json=[{"slug": n, "version": "v2"} for n in names if n in listed])
+        now = [100.0]
+        api = gamma.PublicApi(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)), clock=lambda: now[0])
+        sol, btc, eth = (f"{c}-updown-5m-{t}" for c in ("sol", "btc", "eth"))
+        found = await api.listings([sol, btc, eth])
+        self.assertEqual(set(found), {sol, btc})
+        self.assertEqual((found[sol]["slug"], found[sol]["listedSlug"]), (sol, "polyv2" + sol))
+        self.assertNotIn("listedSlug", found[btc])            # both names there: the bot's own
+        self.assertEqual((await api.market(sol))["listedSlug"], "polyv2" + sol)
+        self.assertIsNone(await api.market(eth))
+        self.assertEqual(paths[-2:], [eth, "polyv2" + eth])
+        # the fast path: SOL's markets are asked by the V2 test name now, the other name only every 5 s
+        later = [f"{c}-updown-5m-{t + 300}" for c in ("sol", "eth")]
+        listed.add("polyv2" + later[0])
+        paths.clear()
+        got = await api.markets(later)
+        self.assertEqual(set(got), {later[0]})
+        self.assertEqual(sorted(paths), sorted(["polyv2" + later[0], later[0], later[1], "polyv2" + later[1]]))
+        paths.clear()
+        now[0] += 1
+        await api.markets(later)
+        self.assertEqual(sorted(paths), sorted(["polyv2" + later[0], later[1]]))   # each coin's own name alone
+        now[0] += gamma.OTHER_NAME_S
+        paths.clear()
+        await api.markets(later)
+        self.assertEqual(len(paths), 4)
         await api.close()
 
     async def test_accepting_reads_the_clob_flag(self):

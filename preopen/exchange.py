@@ -244,6 +244,21 @@ def order_hash(signed: Any, *, neg_risk: bool, chain_id: int = 137) -> str:
         return ""
 
 
+def v2_allowance_of(allowances: Any) -> D | None:
+    """The pUSD that ExchangeV3 (Polymarket Protocol V2's exchange) may spend for the account, from the CLOB's COLLATERAL
+    allowances by spender; None when the CLOB names no allowance for it (not known). A V2 BUY needs it: the CTF
+    approvals do not cover it (docs: Polymarket Protocol V2 API Migration, 11-22)."""
+    if not isinstance(allowances, dict):
+        return None
+    for spender, amount in allowances.items():
+        if str(spender).lower() == V2_EXCHANGE.lower():
+            try:
+                return D(int(amount)) / D(1_000_000)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
 def _is_v2_position(asset: str) -> bool:
     try:
         from polymarket._internal.protocol import is_v2_position_id
@@ -310,6 +325,7 @@ class LiveExchange:
         self.client: Any = None
         self.wallet = ""
         self.wallet_type = ""
+        self.v2_allowance: D | None = None   # what ExchangeV3 may spend (None: the CLOB does not say), read with the balance
         self.tier = ""
         self.rate_warning = False
         self.wallet_list_off_until = 0.0
@@ -703,8 +719,23 @@ class LiveExchange:
         return f"{self.wallet.lower()}|{signer.lower()}"
 
     async def balance(self) -> D:
+        """The pUSD balance; the V2 exchange's allowance read with it (v2_allowance)."""
         b = await self.client.get_balance_allowance(asset_type="COLLATERAL")
+        self.v2_allowance = v2_allowance_of(getattr(b, "allowances", None))
         return D(int(b.balance)) / D(1_000_000)
+
+    async def refresh_allowance(self) -> None:
+        """Have the CLOB read the account's pUSD allowances afresh (an approval made on the website shows then). The
+        SDK's own refresh after an approval, through its internals: on any mismatch nothing is refreshed."""
+        try:
+            from polymarket._internal.actions import account as account_actions
+            from polymarket._internal.wallet import signature_type_for
+            ctx = self.client._ctx
+            path, params = account_actions.build_update_balance_allowance_request(
+                asset_type="COLLATERAL", signature_type=signature_type_for(ctx.wallet_type))
+            await ctx.secure_clob.get_bytes(path, params=params)
+        except Exception as error:
+            LOG.debug("refresh allowance: %s", error)
 
     def redeem_problem(self) -> str:
         """Why winnings cannot be claimed from here ("" when they can): a smart wallet (the website's) claims through
@@ -716,7 +747,13 @@ class LiveExchange:
     async def redeem(self, condition_id: str) -> str:
         if why := self.redeem_problem():
             raise RuntimeError(why)
-        handle = await self.client.redeem_positions(condition_id=condition_id)
+        from polymarket import UserInputError
+        try:
+            handle = await self.client.redeem_positions(condition_id=condition_id)
+        except UserInputError as error:  # a V2 market whose positions hold nothing: redeemed already (the auto-redeem)
+            if "no balance to redeem" in str(error):
+                return "已领取（账户里这一场已经没有持仓）"
+            raise
         result = await asyncio.wait_for(handle.wait(), timeout=180)
         return str(getattr(result, "transaction_hash", "") or getattr(result, "state", "") or "ok")
 
@@ -747,6 +784,7 @@ class PaperExchange:
         self.fail_balance: Exception | None = None   # set: every balance() raises it (tests)
         self.markets: dict[str, str] = {}      # asset -> condition id (rows of the paper book carry it)
         self.fill_log: dict[str, list[tuple[float, D]]] = {}   # order id -> [(when, shares)] of fill() (tests)
+        self.v2_allowance: D | None = None   # V2 approvals do not exist on paper; a test sets D(0) to play them missing
 
     async def start(self) -> None:
         return None
@@ -806,6 +844,9 @@ class PaperExchange:
             self.gone[oid] = row
             result.canceled.add(oid)
         return result
+
+    async def refresh_allowance(self) -> None:
+        return None
 
     async def cancel_market(self, condition_id: str) -> Cancelled:
         self.market_cancels.append(condition_id)

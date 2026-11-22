@@ -29,6 +29,10 @@ LOG = logging.getLogger(__name__)
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
 SLUGS_PER_REQUEST = 40
+VERSIONS = ("v1", "v2")   # Gamma's market protocols: a batch query lists one of them, so each is asked
+V2_PREFIX = "polyv2"      # the temporary V2 test markets (11-20) were named polyv2<coin>-updown-5m-<t>, beside the live
+                          # <coin>-updown-5m-<t>: a market is looked for under that name too, and kept under the bot's own
+OTHER_NAME_S = 5.0        # the fast path asks a coin's other name this often (the name its markets have, every poll)
 UA = "poyugua-preopen/1.0"
 
 
@@ -66,6 +70,15 @@ class PublicApi:
         self.blocked_until: dict[str, float] = {}       # host -> when its 429 lifts
         self.errors: collections.Counter = collections.Counter()   # host -> failed reads (timeouts, 5xx, 429)
         self.last_error = ""
+        self.prefix: dict[str, str] = {}         # coin -> the name its latest market was found under ("" or V2_PREFIX)
+        self.other_asked: dict[str, float] = {}  # coin -> when the fast path last asked its other name
+
+    def kept(self, m: dict, slug: str) -> dict:
+        """A market found for the bot's `slug`, under that name or the V2 test one: kept under `slug` (its own name in
+        listedSlug); the coin's next markets asked first by the name this one had."""
+        name = str(m.get("slug") or "")
+        self.prefix[coin_of(slug)] = "" if name == slug else V2_PREFIX
+        return m if name == slug else {**m, "slug": slug, "listedSlug": name}
 
     async def close(self) -> None:
         await self.http.aclose()
@@ -104,44 +117,76 @@ class PublicApi:
         return r.json()
 
     async def listings(self, slugs: list[str], closed: bool = False) -> dict[str, dict]:
-        """The Gamma markets of these slugs that exist (open ones; closed ones too with closed=True), by slug."""
+        """The Gamma markets of these slugs that exist (open ones; closed ones too with closed=True), by slug, of both
+        protocols: GET /markets?slug= lists the CTF (v1) markets alone unless asked for version=v2 (and takes no
+        "all"; measured 11-22), and from 11-23 (BNB, DOGE, HYPE, SOL, XRP, ZEC) and 11-24 (BTC, ETH) the new
+        Up/Down markets are Polymarket Protocol V2 ones."""
         out: dict[str, dict] = {}
-        chunks = [slugs[i:i + SLUGS_PER_REQUEST] for i in range(0, len(slugs), SLUGS_PER_REQUEST)]
+        half = SLUGS_PER_REQUEST // 2   # each slug asked under both names
+        chunks = [slugs[i:i + half] for i in range(0, len(slugs), half)]
 
-        async def one(chunk: list[str]) -> None:
-            params = [("slug", s) for s in chunk] + [("limit", str(len(chunk) + 5)), ("_", str(time.time_ns()))]
+        async def one(chunk: list[str], version: str) -> None:
+            names = [n for s in chunk for n in (s, V2_PREFIX + s)]
+            params = [("slug", n) for n in names] + [("limit", str(len(names) + 5)), ("version", version),
+                                                      ("_", str(time.time_ns()))]
             if closed:
                 params.append(("closed", "true"))
             data = await self._get(f"{GAMMA}/markets", params=params)
+            wanted = set(chunk)
             for m in data or []:
-                if isinstance(m, dict) and m.get("slug") in chunk:
-                    out[str(m["slug"])] = m
+                if not isinstance(m, dict):
+                    continue
+                name = str(m.get("slug") or "")
+                slug = name[len(V2_PREFIX):] if name.startswith(V2_PREFIX) else name
+                if slug in wanted and (name == slug or slug not in out):   # both there: the bot's own name
+                    out[slug] = self.kept(m, slug)
         gate = asyncio.Semaphore(4)
 
-        async def gated(chunk: list[str]) -> None:
+        async def gated(chunk: list[str], version: str) -> None:
             async with gate:
-                await one(chunk)
-        await asyncio.gather(*(gated(c) for c in chunks))
+                await one(chunk, version)
+        await asyncio.gather(*(gated(c, v) for c in chunks for v in VERSIONS))
         return out
 
-    async def market(self, slug: str) -> dict | None:
-        """One market by slug, closed or not. This path is a direct lookup: a new market answers here within a second
-        of its creation, while the GET /markets?slug= query shows it only ~88 s later (measured 11-13 03:12:30:
+    async def path(self, name: str) -> dict | None:
+        """GET /markets/slug/<name>: a direct lookup, closed or not. A new market answers here within a second of its
+        creation, while the GET /markets?slug= query shows it only ~88 s later (measured 11-13 03:12:30:
         /markets/slug +0.6 s, /events/slug +0.8 s, /markets?slug= and /events?slug= +88 s)."""
-        data = await self._get(f"{GAMMA}/markets/slug/{slug}", params={"_": str(time.time_ns())})
-        return data if isinstance(data, dict) else None
+        data = await self._get(f"{GAMMA}/markets/slug/{name}", params={"_": str(time.time_ns())})
+        return data if isinstance(data, dict) and data.get("slug") == name else None
+
+    async def market(self, slug: str) -> dict | None:
+        """One market by the bot's slug, closed or not: under that name, else under the V2 test one."""
+        for name in (slug, V2_PREFIX + slug):
+            if (m := await self.path(name)) is not None:
+                return self.kept(m, slug)
+        return None
 
     async def markets(self, slugs: list[str]) -> dict[str, dict]:
-        """Several markets by the direct path, side by side (each coin's next window). A slug whose read failed is
-        left out (asked again at the next poll, never taken as unlisted for good); a 429 is raised for the caller to
-        back off."""
-        answers = await asyncio.gather(*(self.market(s) for s in slugs), return_exceptions=True)
+        """Several markets by the direct path, side by side (each coin's next window): each under the name its coin's
+        markets have, and the other name every OTHER_NAME_S (a coin moved to V2 found within seconds, at no double
+        rate). A slug whose read failed is left out (asked again at the next poll, never taken as unlisted for good);
+        a 429 is raised for the caller to back off."""
+        now = self.clock()
+        asks: list[tuple[str, str]] = []
+        for s in slugs:
+            coin = coin_of(s)
+            mine = self.prefix.get(coin, "")
+            asks.append((s, mine + s))
+            if now - self.other_asked.get(coin, float("-inf")) >= OTHER_NAME_S:
+                self.other_asked[coin] = now
+                asks.append((s, ("" if mine else V2_PREFIX) + s))
+        answers = await asyncio.gather(*(self.path(name) for _, name in asks), return_exceptions=True)
         for a in answers:
             if isinstance(a, PublicThrottled):
                 raise a
             if isinstance(a, BaseException) and not isinstance(a, Exception):
                 raise a
-        return {s: a for s, a in zip(slugs, answers) if isinstance(a, dict) and a.get("slug") == s}
+        out: dict[str, dict] = {}
+        for (s, name), a in zip(asks, answers):
+            if isinstance(a, dict) and (name == s or s not in out):   # both there: the bot's own name
+                out[s] = self.kept(a, s)
+        return out
 
     async def clob_market(self, condition_id: str) -> dict | None:
         """The CLOB's own record of a market: `ao` (accepting orders), `t` (its tokens), None when it has none."""
@@ -170,6 +215,11 @@ class PublicApi:
             return float(json.loads(json.dumps(data)))
         except (TypeError, ValueError):
             return None
+
+
+def coin_of(slug: str) -> str:
+    """The coin of a <coin>-updown-5m-<start> slug."""
+    return slug.split("-updown-", 1)[0]
 
 
 def best(book: dict | None, side: str) -> tuple[float, float] | None:

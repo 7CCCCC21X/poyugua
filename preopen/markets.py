@@ -135,6 +135,13 @@ class Listing:
         return "up" if asset == self.up else "down" if asset == self.down else None
 
 
+def outcome_ids(m: dict) -> list | None:
+    """A Gamma market's outcome ids to trade, by its protocol: positionIds (a plain array) on a Polymarket Protocol V2
+    market, clobTokenIds (JSON text) on a CTF (v1) one; chosen by `version` even when both are there (the docs' rule)."""
+    version = str(m.get("version") or "v1").lower()
+    return json_list(m.get("positionIds")) if version == "v2" else json_list(m.get("clobTokenIds"))
+
+
 def parse_listing(m: dict, coin: str, start: int, now: float = 0.0) -> tuple[Listing | None, str]:
     """The Listing of a Gamma market for window (coin, start), or (None, why not): the identity (slug, start and end
     times), the two outcomes Up and Down mapped to their tokens by name, and an order book that is on."""
@@ -151,7 +158,7 @@ def parse_listing(m: dict, coin: str, start: int, now: float = 0.0) -> tuple[Lis
         return None, "缺开始/结束时间"
     outcomes = json_list(m.get("outcomes"))
     version = str(m.get("version") or "v1").lower()
-    ids = json_list(m.get("positionIds")) if version == "v2" else json_list(m.get("clobTokenIds"))
+    ids = outcome_ids(m)
     if not outcomes or not ids or len(outcomes) != 2 or len(ids) != 2:
         return None, "缺结果或代币"
     by_name = {str(o).strip().lower(): str(i).strip() for o, i in zip(outcomes, ids)}

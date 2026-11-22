@@ -1,11 +1,14 @@
 """The engine on a paper book: discovery, placement, the cancel before the start, fills, results, restarts."""
 import asyncio
+import json
 import unittest
 from decimal import Decimal as D
 
 from helpers import T0, Clock, FakePublic, drain, make_engine, settings, tick, unpark
 
+from preopen import engine as eng
 from preopen import markets as mk
+from preopen import refusals
 from preopen.exchange import OrderSpec, PaperExchange
 from preopen.ledger import Ledger
 
@@ -876,6 +879,126 @@ class OperatorTest(unittest.IsolatedAsyncioTestCase):
         clock.t = far - 1200
         await tick(e, 1)
         self.assertIn((far, 1), {(q["start"], q["level"]) for q in quotes(e)})
+
+
+def v2_window(pub, coin, start, **kw):
+    """A Polymarket Protocol V2 market as Gamma lists it: the trading ids in positionIds (a plain array), other ids in
+    clobTokenIds (which a V2 market is not traded by)."""
+    m = pub.list_window(coin, start, version="v2", **kw)
+    m["positionIds"] = [str(int(t) + 1) for t in json.loads(m["clobTokenIds"])]
+    return m
+
+
+class ProtocolV2Test(unittest.IsolatedAsyncioTestCase):
+    """From 11-23 the new Up/Down markets are Polymarket Protocol V2 ones: their BUYs need the account's pUSD allowed to
+    ExchangeV3, which the CTF approvals do not cover. Without it only the V2 markets wait (told now and then); the
+    others go on; granted, they are quoted."""
+
+    async def test_v2_markets_wait_for_the_approval_and_the_others_go_on(self):
+        e, clock, pub, x = make_engine()
+        start = T0 + 1800
+        btc, eth = mk.slug_of("btc", start), mk.slug_of("eth", start)
+        v2_window(pub, "btc", start)
+        pub.list_window("eth", start)
+        x.v2_allowance = D(0)                     # the CLOB says ExchangeV3 may spend nothing
+        await tick(e)
+        self.assertEqual(e.listings[btc].version, "v2")
+        self.assertEqual({q["slug"] for q in quotes(e)}, {eth})
+        self.assertEqual(e.hold(), "")            # no hold of the whole account
+        self.assertIn("V2", e.hold_note)
+        self.assertNotIn(btc, {spec.ref.split("#")[0] for spec in x.placed})   # nothing sent for it
+        for _ in range(5):
+            await tick(e, 60)
+        self.assertEqual(len([n for n in e.notes if "V2" in n]), 1)   # said once in a while, not at every retry
+        self.assertIn("⛔ V2 市场：没授权", e.check_text())
+        x.v2_allowance = D(10**9)                 # approved on the website
+        await tick(e, 60)
+        self.assertIn(btc, {q["slug"] for q in quotes(e, phase="active")})
+        self.assertEqual({spec.asset for spec in x.placed if spec.ref.startswith(btc)},
+                         set(pub.listed[btc]["positionIds"]))   # traded by its position ids
+        self.assertIn("✅ V2 市场：已授权", e.check_text())
+
+    async def test_a_v2_refusal_for_the_balance_holds_v2_alone(self):
+        e, clock, pub, x = make_engine()
+        start = T0 + 1800
+        btc, eth = mk.slug_of("btc", start), mk.slug_of("eth", start)
+        v2_window(pub, "btc", start)
+        pub.list_window("eth", start)
+        x.reject[f"{btc}#0@0/up"] = ("rejected", "not_enough_balance")
+        x.reject[f"{btc}#0@0/down"] = ("rejected", "not_enough_balance")
+        await tick(e)                             # the CLOB names no ExchangeV3 allowance: tried, refused
+        self.assertEqual(e.hold(), "")            # not the account's balance: the CTF markets go on
+        self.assertEqual({q["slug"] for q in quotes(e, phase="active")}, {eth})
+        self.assertIn("V2", e.v2_blocked())
+        self.assertEqual(len([n for n in e.notes if "拒了 V2" in n]), 1)
+        check = await refusals.live_check(e)      # 🔬: Gamma's V2 ids are the exchange's
+        self.assertIn("BTC", check)
+        self.assertIn("Gamma 和交易所的代币一致 ✅", check)
+        later = start + 300
+        v2_window(pub, "btc", later)
+        pub.list_window("eth", later)
+        sent = len(x.placed)
+        await tick(e, 60)                         # within the hold no V2 order is sent; the CTF ones are
+        self.assertEqual({spec.ref.split("#")[0] for spec in x.placed[sent:]}, {mk.slug_of("eth", later)})
+        clock.advance(eng.V2_HOLD_S)
+        await tick(e)                             # the hold over (the refusal was a passing one): V2 placed
+        self.assertEqual(e.v2_blocked(), "")
+        self.assertTrue({btc, mk.slug_of("btc", later)} <= {q["slug"] for q in quotes(e, phase="active")})
+
+    async def test_a_v2_refusal_with_the_approval_granted_is_the_balance(self):
+        e, clock, pub, x = make_engine()
+        x.v2_allowance = D(10**9)
+        start = T0 + 1800
+        btc = mk.slug_of("btc", start)
+        v2_window(pub, "btc", start)
+        x.reject[f"{btc}#0@0/up"] = ("rejected", "not_enough_balance")
+        x.reject[f"{btc}#0@0/down"] = ("rejected", "not_enough_balance")
+        await tick(e)
+        self.assertIn("余额", e.hold())           # the old rule: every placement waits on the balance
+        self.assertEqual(e.v2_blocked(), "")
+
+    async def test_markets_listed_long_before_they_open_do_not_flood_the_clob(self):
+        """V2 markets may be created a day before their trading starts (docs, 11-22): dozens listed and shut are asked
+        within one rate over them all, not each every five seconds; once trading starts every one is placed."""
+        e, clock, pub, x = make_engine(settings(PREOPEN_MARKETS="sol,xrp,doge,hype,bnb"))
+        starts = mk.window_starts(clock.t, e.s)
+        for coin in e.s.coins:
+            for t in starts:
+                m = v2_window(pub, coin, t, created=clock.t - 3600, accepting=None)
+                pub.not_accepting.add(m["conditionId"])
+        windows = len(e.s.coins) * len(starts)
+        self.assertGreater(windows, 50)
+        await tick(e)
+        asked = pub.accept_asks
+        for _ in range(20):
+            await tick(e, 1)
+        self.assertLessEqual(pub.accept_asks - asked, 20 * eng.ARM_IDLE_RATE + 1)   # not 60 every 5 s
+        self.assertEqual(quotes(e), [])
+        pub.not_accepting.clear()                 # trading starts
+        for _ in range(3 * windows):
+            await tick(e, 1 / eng.ARM_IDLE_RATE)
+            if len({q["slug"] for q in quotes(e, phase="active")}) == windows:
+                break
+        self.assertEqual(len({q["slug"] for q in quotes(e, phase="active")}), windows)
+
+    async def test_the_allowances_are_read_afresh_while_v2_waits(self):
+        e, clock, pub, x = make_engine()
+        asked = []
+
+        async def refresh():
+            asked.append(clock.t)
+        x.refresh_allowance = refresh
+        await e.account_once()
+        self.assertEqual(asked, [])               # nothing waits: nothing asked
+        x.v2_allowance = D(0)
+        await e.account_once()
+        self.assertEqual(len(asked), 1)
+        clock.advance(60)
+        await e.account_once()
+        self.assertEqual(len(asked), 1)           # not more often than every five minutes
+        clock.advance(eng.V2_REFRESH_S)
+        await e.account_once()
+        self.assertEqual(len(asked), 2)
 
 
 if __name__ == "__main__":
