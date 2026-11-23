@@ -303,7 +303,7 @@ class Console:
         e = self.engine
         name = str(body.get("action") or "")
         if name == "pause":
-            return f"已暂停：{e.pause()} 场在撤单，不再新挂"
+            return f"已暂停：{e.pause('网页上点了 ⏸ 暂停')} 场在撤单，不再新挂"
         if name == "resume":
             e.resume()
             return "已恢复挂单"

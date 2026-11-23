@@ -29,6 +29,7 @@ import contextlib
 import heapq
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from decimal import Decimal as D
@@ -116,6 +117,7 @@ REFUSALS_KEPT = 300       # the latest refusals kept for /rejects (also across r
 REFUSALS_SAVE_S = 10      # ...written to the ledger at most this often
 EXTERNAL_MASS = 3         # the bot's orders cancelled elsewhere (plain CANCELED: the website's 取消所有, another program
 EXTERNAL_WINDOW_S = 60    # with the key) in this many windows within this long: taken as "stop", and the bot pauses
+PAUSE_LOOKBACK_S = 120    # a pause kept without its reason (an older version): the records closed this long before it
 
 
 def dnum(value: Any) -> D:
@@ -148,6 +150,7 @@ class Engine:
         self.by_id: dict[str, tuple[str, str]] = {}
         self.open_keys: set[str] = set()     # records not settled yet (the loops walk these, not the whole ledger)
         self.paused = ledger.get("paused") == "1"
+        self.pause_note: dict[str, Any] = self.read_pause_note() if self.paused else {}   # when, why, which windows
         self.id_is_hash: bool | None = {"1": True, "0": False}.get(ledger.get("id_is_hash"))
         self.cooldown_until = 0.0
         self.cooldown_reason = ""
@@ -309,7 +312,7 @@ class Engine:
         if self.stopping:
             return f"正在撤单停止（{self.stopping}）"
         if self.paused:
-            return "已暂停（/resume 恢复）"
+            return f"已暂停（{self.pause_text()}；/resume 恢复）"
         if risk := self.risk_hold():
             return risk
         if now < self.cooldown_until:
@@ -856,7 +859,7 @@ class Engine:
                 "key": quote_key(slug, i, attempt), "slug": slug, "coin": listing.coin, "start": listing.start, "level": i,
                 "attempt": attempt, "price": str(lv.price), "shares": str(lv.shares), "expiration": self.expiration(listing.start),
                 "condition_id": listing.condition_id, "market_id": listing.market_id, "neg_risk": listing.neg_risk,
-                "listed": listing.created, "seen": listing.seen, "created": now, "phase": "active", "reason": "",
+                "version": listing.version, "listed": listing.created, "seen": listing.seen, "created": now, "phase": "active", "reason": "",
                 "orders": {side: {"asset": listing.asset(side), "state": "placing", "id": "", "hash": "", "salt": 0,
                                   "filled": "0", "error": "", "sent": now} for side in mk.SIDES},
             }
@@ -1450,9 +1453,13 @@ class Engine:
                                 r["reason"] = str(r["reason"]).replace("挂单被撤（", "挂单被别处成批撤掉（")
                                 self.save(r)
                     if not self.paused:
-                        self.pause()
-                        self.problem("本程序的挂单在别处被成批撤掉（比如网页上的「取消所有」）：已暂停新挂并撤掉其余挂单。"
-                                     "要继续请在控制台点「恢复挂单」或发 /resume", key="external-cancel")
+                        batch = [r for s in {s for t, s in self.external if t > now - EXTERNAL_WINDOW_S}
+                                 for r in self.quotes_of(s) if "被别处成批撤掉" in str(r.get("reason") or "")]
+                        detail = self.external_detail(batch)
+                        self.pause("本程序的挂单在别处被成批撤掉", detail)
+                        self.problem(f"本程序的挂单在别处被成批撤掉（{detail}）：网页上的「取消所有」、用同一个 Key 的别的程序，"
+                                     "或者交易所撤的。已暂停新挂并撤掉其余挂单；要继续请在控制台点「恢复挂单」或发 /resume",
+                                     key="external-cancel")
                 else:  # one window: counted, quoted again up to the cap
                     self.close(q, f"{mk.SIDES_CN[side]}方挂单被撤（{row.status}）", free=False, save=False)
         self.save(q)
@@ -1715,7 +1722,7 @@ class Engine:
     async def emergency(self) -> str:
         """Pause, and cancel at once every order the bot signed (by id, an unknown one by its hash); with
         PREOPEN_KEY_EXCLUSIVE=on also every open order of the API key. The cancel loop keeps at whatever is left."""
-        n = self.pause()
+        n = self.pause("网页上点了 🛑 紧急停止")
         extra = ""
         if self.s.key_exclusive:
             try:
@@ -1735,14 +1742,58 @@ class Engine:
         return text
 
     # ------------------------------------------------------------------ operator
-    def pause(self) -> int:
+    def pause(self, why: str = "手动暂停", detail: str = "") -> int:
+        """Stop placing and withdraw everything; when and why kept (across a restart too) for 📊, 🩺 and the page."""
         self.paused = True
         self.ledger.put("paused", "1")
+        self.pause_note = {"at": self.now(), "why": why, "detail": detail}
+        self.ledger.put("pause_note", json.dumps(self.pause_note, ensure_ascii=False))
+        LOG.warning("暂停：%s %s", why, detail)
         return self.close_all("暂停")
+
+    def pause_text(self) -> str:
+        """Since when and why: "11-23 03:12 起：本程序的挂单在别处被成批撤掉"."""
+        at = float(self.pause_note.get("at") or 0)
+        return (f"{mk.hm(at)} 起：" if at else "") + str(self.pause_note.get("why") or "原因没有记下")
+
+    def read_pause_note(self) -> dict[str, Any]:
+        """The pause kept by pause(); one kept by an older version, which kept no reason, read from its records."""
+        try:
+            note = json.loads(self.ledger.get("pause_note") or "{}")
+        except ValueError:
+            note = {}
+        return note if isinstance(note, dict) and note.get("why") else self.pause_from_records()
+
+    def pause_from_records(self) -> dict[str, Any]:
+        """When and why from the records a pause closed: it closes every active record as 暂停 at once, and the guard's
+        pause follows a batch closed as 被别处成批撤掉 (the website's 取消所有, another program, the exchange)."""
+        rows = list(self.ledger.rows.values())
+        paused = [float(q.get("closing_at") or 0) for q in rows if q.get("reason") == "暂停"]
+        if not paused:
+            return {"at": 0.0, "why": "原因没有记下（升级前暂停的，暂停时没有挂着的单）", "detail": ""}
+        at = max(paused)
+        batch = [q for q in rows if "被别处成批撤掉" in str(q.get("reason") or "")
+                 and at - PAUSE_LOOKBACK_S <= float(q.get("closing_at") or 0) <= at + 1]
+        if batch:
+            return {"at": at, "why": "本程序的挂单在别处被成批撤掉", "detail": self.external_detail(batch)}
+        return {"at": at, "why": "手动暂停（Telegram 或网页上的 ⏸ 暂停，或网页上的 🛑 紧急停止）", "detail": ""}
+
+    @staticmethod
+    def external_detail(records: list[dict]) -> str:
+        """Which windows' orders went and the exchange's word for it: "SOL 11-24 03:10、XRP 11-24 03:10，共 2 场；
+        交易所状态 CANCELED；V2 市场"."""
+        windows = sorted({(int(q["start"]), str(q["coin"])) for q in records})
+        statuses = sorted({m.group(1) for q in records if (m := re.search(r"成批撤掉（([^）]*)）", str(q.get("reason") or "")))})
+        versions = sorted({str(q["version"]).upper() for q in records if q.get("version")})
+        names = "、".join(mk.window_name(c, t) for t, c in windows[:4])
+        return (names + (f" 等 {len(windows)} 场" if len(windows) > 4 else f"，共 {len(windows)} 场")
+                + (f"；交易所状态 {'/'.join(statuses)}" if statuses else "") + (f"；{'/'.join(versions)} 市场" if versions else ""))
 
     def resume(self) -> None:
         self.paused = False
         self.ledger.put("paused", "0")
+        self.pause_note = {}
+        self.ledger.put("pause_note", "")
         for slug in list(self.timers):
             self.timers.pop(slug).cancel()
             self.enqueue(slug)
@@ -2221,6 +2272,7 @@ class Engine:
             "lags": {"open": median(self.open_lags), "place": median(self.place_lags), "cancel": median(self.cancel_lags),
                      "listing": median(self.listing_lags)},
             "today": t, "hold": self.hold(), "budget_note": self.budget_note, "blocked": self.blocked,
+            "pause_detail": str(self.pause_note.get("detail") or "") if self.paused else "",
             "exposure": float(self.exposure()), "day_pnl": float(self.day_pnl()), "risk": self.risk_hold(),
             "limits": {"exposure": float(self.s.max_exposure_usd), "daily_loss": float(self.s.max_daily_loss_usd)},
             "key_exclusive": self.s.key_exclusive,
@@ -2243,7 +2295,7 @@ class Engine:
         front = self.frontier(starts)
         listed_until = max((l.start for l in self.listings.values()), default=0)
         lines = [
-            f"📌 Polymarket 5 分钟涨跌预挂 · {self.s.mode()}" + (" · ⏸ 已暂停" if self.paused else ""),
+            f"📌 Polymarket 5 分钟涨跌预挂 · {self.s.mode()}" + (f" · ⏸ 已暂停（{self.pause_text()}）" if self.paused else ""),
             f"币种：{' '.join(mk.name_of(x) for x in self.s.coins) or '无'}",
             f"每边：{self.s.levels_text()}（post-only GTD）；每场占用 ${self.s.window_usd:.2f}（各场分别核对余额，不共用）",
             f"时间：开场前 {self.s.ahead_s // 60} 分钟内的场次；开场前 {self.s.cancel_s} 秒撤单，{self.s.expiry_s} 秒到期，"
@@ -2301,7 +2353,8 @@ class Engine:
         if self.blocked:
             verdict = f"⛔ 不工作：{self.blocked}"
         elif self.paused:
-            verdict = "⏸ 已暂停，不挂单（▶️ 恢复 或 /resume）"
+            verdict = f"⏸ 已暂停（{self.pause_text()}），不挂单（▶️ 恢复 或 /resume）" + (
+                f"\n   暂停时：{self.pause_note['detail']}" if self.pause_note.get("detail") else "")
         elif hold:
             verdict = f"⛔ 暂不新挂：{hold}"
         elif not total:

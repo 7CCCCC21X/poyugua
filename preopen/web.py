@@ -472,7 +472,7 @@ const STATE = {open:"挂着", placing:"发送中", unknown:"状态不明", gone:
 function renderOverview(d) {
   $("blocked").hidden = !d.blocked; $("blockedText").textContent = d.blocked ? "⛔ " + d.blocked : "";
   const hold = d.blocked ? "" : (d.hold || d.cooldown);
-  $("hold").hidden = !hold && !d.budget_note; $("hold").textContent = [hold && ("暂不新挂：" + hold), d.budget_note && ("资金：" + d.budget_note)].filter(Boolean).join("　");
+  $("hold").hidden = !hold && !d.budget_note; $("hold").textContent = [hold && ("暂不新挂：" + hold), d.pause_detail && ("暂停时：" + d.pause_detail), d.budget_note && ("资金：" + d.budget_note)].filter(Boolean).join("　");
   const t = d.today || {};
   $("cards").innerHTML = [
     card("挂着", `${d.windows} 场`, `${d.resting} 张单，合计 ${money(d.reserved)}` + (d.unknown ? `，<span class="warn">${d.unknown} 张状态不明</span>` : "")),

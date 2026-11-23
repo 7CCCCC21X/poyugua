@@ -217,7 +217,7 @@ def commander(settings: config.Settings, engine: Engine, pub: PublicApi, console
             return Reply(f"确定暂停吗？会撤掉本程序挂着的 {c['resting']} 张单（{c['windows']} 场），之后不再新挂，直到恢复。",
                          confirm_markup(CONFIRM_PAUSE, "确认暂停并撤单"))
         if cmd == "/" + CONFIRM_PAUSE:
-            n = engine.pause()
+            n = engine.pause("Telegram 上点了 ⏸ 暂停")
             return f"⏸ 已暂停：{n} 场在撤单，不再新挂（▶️ 恢复 / /resume）"
         if cmd == "/resume":
             engine.resume()

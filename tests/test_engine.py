@@ -235,10 +235,55 @@ class PlacementTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("external-cancel" in k for k in e.notified))
         self.assertFalse(any(q.get("counted") for q in quotes(e)))  # no window charged for it
         self.assertEqual(x.book, {})
+        # why and since when, in 📊, 🩺 and the page (11-23: "⏸ 已暂停" alone said nothing of it)
+        self.assertEqual(e.pause_note["why"], "本程序的挂单在别处被成批撤掉")
+        self.assertIn("BTC", e.pause_note["detail"])
+        self.assertIn("交易所状态 CANCELED", e.pause_note["detail"])
+        self.assertIn("V1 市场", e.pause_note["detail"])
+        self.assertIn("成批撤掉", e.hold())
+        self.assertIn("暂停时：BTC", e.check_text())
+        self.assertIn("成批撤掉", e.status_text().splitlines()[0])
+        self.assertIn("BTC", e.report()["pause_detail"])
+        e2, *_ = make_engine(ledger=e.ledger, clock=clock)   # kept across a restart
+        self.assertEqual((e2.paused, e2.pause_note["detail"]), (True, e.pause_note["detail"]))
         e.resume()
+        self.assertEqual((e.pause_note, e.hold()), ({}, ""))
         await tick(e, 5)
         await tick(e, 1)
         self.assertEqual({q["start"] for q in quotes(e, phase="active")}, set(starts))
+
+    async def test_a_pause_says_who_and_one_from_before_is_read_from_its_records(self):
+        import tempfile
+        from pathlib import Path
+        from preopen.console import Console
+        e, clock, pub, x = make_engine()
+        starts = mk.window_starts(clock.t, e.s)[:4]
+        pub.list_range(["btc"], starts)
+        await tick(e)
+        c = Console(e, {}, Path(tempfile.mkdtemp()) / "c.json", {})
+        paused_at = clock.t
+        await c.action({"action": "pause"})
+        await tick(e, 5)                         # withdrawn
+        self.assertIn("网页上点了 ⏸ 暂停", e.hold())
+        self.assertIn("网页上点了 ⏸ 暂停", e.check_text().splitlines()[1])
+        # paused by the version before this one, which kept no reason: told from the records the pause closed
+        e.ledger.put("pause_note", "")
+        e2, *_ = make_engine(ledger=e.ledger, clock=clock)
+        self.assertIn("手动暂停", e2.pause_note["why"])
+        self.assertEqual(e2.pause_note["at"], paused_at)
+        e.resume()
+        for _ in range(6):
+            await tick(e, 5)
+        self.assertEqual(len(quotes(e, phase="active")), 4)
+        x.cancel_elsewhere()                     # the guard's pause, kept without its reason
+        for _ in range(3):
+            await tick(e, 6)
+        self.assertTrue(e.paused)
+        e.ledger.put("pause_note", "")
+        e3, *_ = make_engine(ledger=e.ledger, clock=clock)
+        self.assertEqual(e3.pause_note["why"], "本程序的挂单在别处被成批撤掉")
+        self.assertIn("交易所状态 CANCELED", e3.pause_note["detail"])
+        self.assertIn(mk.window_name("btc", starts[0]), e3.pause_note["detail"])
 
     async def test_one_window_cancelled_elsewhere_counts_and_is_quoted_again(self):
         e, clock, pub, x = make_engine()
