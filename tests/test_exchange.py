@@ -321,6 +321,43 @@ class RowAndCancelTest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(row(status).resting, status)
         self.assertFalse(row("LIVE", "10").resting)
 
+    def test_matched_is_a_fill_whatever_its_size_matched(self):
+        from preopen.exchange import Row
+        row = lambda status, matched="0": Row("0x1", "1", "0xc", "BUY", D("0.47"), D("30"), D(matched), status)
+        for status in ("MATCHED", "matched", "ORDER_STATUS_MATCHED", "FILLED"):
+            self.assertTrue(row(status, "29.990568").matched_out, status)
+        for status in ("CANCELED", "CANCELED_MARKET_RESOLVED", "INVALID", "LIVE", "EXPIRED"):
+            self.assertFalse(row(status, "29.990568").matched_out, status)
+
+    async def test_the_paper_book_ends_an_order_as_the_exchange_was_seen_to(self):
+        """11-25 16:30-16:31 (Beijing), the public trades of three 16:35 markets: a 47¢ bid of 30 shares each, eaten by
+        takers buying the other side by the dollar. What is left of an order goes down by each fill rounded up to 0.01
+        share; the last taker gets what is left, and the order ends MATCHED short of 30."""
+        from preopen.exchange import PaperExchange
+        seen = {
+            "btc": (["5.936604", "4.716982", "4.716982", "14.62"], "29.990568"),
+            "eth": (["4.716982"] * 4 + ["2.415095", "4.716982", "3.98"], "29.980005"),
+            "sol": (["4.716982"] * 6 + ["1.68"], "29.981892"),
+        }
+        for coin, (fills, total) in seen.items():
+            x = PaperExchange(D("1000"))
+            (r,) = await x.place([OrderSpec(f"{coin}/up", "1", D("0.47"), D("30"), 0, market="0xc")])
+            for i, shares in enumerate(fills):
+                self.assertIn(r.order_id, x.book, (coin, i))                 # resting until the last one
+                # the last taker wanted more than was left: it got what was left, as the exchange counts it
+                x.fill(r.order_id, D(shares) + (1 if i == len(fills) - 1 else 0))
+            row = x.gone[r.order_id]
+            self.assertEqual((row.status, row.matched), ("MATCHED", D(total)), coin)
+            self.assertTrue(row.matched_out and row.matched < row.size)
+            self.assertEqual(x.cash, D("1000") - D(total) * D("0.47"))
+        # whole hundredths end at the size, as before
+        x = PaperExchange(D("1000"))
+        (r,) = await x.place([OrderSpec("a/up", "1", D("0.47"), D("30"), 0, market="0xc")])
+        x.fill(r.order_id, D("12.5"))
+        self.assertEqual(x.book[r.order_id].matched, D("12.5"))
+        x.fill(r.order_id, D("40"))
+        self.assertEqual((x.gone[r.order_id].status, x.gone[r.order_id].matched), ("MATCHED", D("30")))
+
     async def test_a_429_midway_keeps_the_earlier_chunks(self):
         x, c = live()
         x.cancels = Bucket(1000, 2)  # chunks of two ids

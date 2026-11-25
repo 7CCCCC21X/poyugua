@@ -21,7 +21,7 @@ import contextlib
 import logging
 import time
 from dataclasses import dataclass, field
-from decimal import Decimal as D
+from decimal import ROUND_UP, Decimal as D
 from typing import Any, Callable, Protocol
 
 LOG = logging.getLogger(__name__)
@@ -95,6 +95,8 @@ def unrecognised(code: str) -> bool:
 
 OnSigned = Callable[[list[tuple[str, str, int]]], None]   # [(ref, hash, salt)] of the orders signed, before any is sent
 TERMINAL = {"MATCHED", "INVALID", "EXPIRED", "FILLED", "REJECTED"}  # ...and every CANCELED* status
+MATCHED_STATES = ("MATCHED", "FILLED")  # ended by matching (the CLOB's word is MATCHED), full to the last share or not
+LOT = D("0.01")                         # the CLOB counts what is left of an order in hundredths of a share
 
 STANDARD_EXCHANGE = "0xE111180000d2663C0091e4f400237545B87B996B"
 NEG_RISK_EXCHANGE = "0xe2222d279d744050d28e00520010520000310F59"
@@ -153,6 +155,13 @@ class Row:
         if self.matched >= self.size or state in TERMINAL or state.startswith("CANCEL"):
             return False
         return True
+
+    @property
+    def matched_out(self) -> bool:
+        """Ended by matching, whatever size_matched says. The CLOB takes each fill off what is left of an order rounded
+        up to 0.01 share, and takers buy by the dollar ($2.50 at 53¢ is 4.716982 shares): an order eaten whole ends
+        MATCHED a hair under its size (11-25: 29.990568, 29.980005 and 29.981892 of 30). A fill, nobody's cancel."""
+        return self.state in MATCHED_STATES
 
 
 @dataclass
@@ -854,6 +863,7 @@ class PaperExchange:
         self.fail_balance: Exception | None = None   # set: every balance() raises it (tests)
         self.markets: dict[str, str] = {}      # asset -> condition id (rows of the paper book carry it)
         self.fill_log: dict[str, list[tuple[float, D]]] = {}   # order id -> [(when, shares)] of fill() (tests)
+        self.left: dict[str, D] = {}           # order id -> what is left of it as the CLOB counts (after its first fill)
         self.v2_allowance: D | None = None   # V2 approvals do not exist on paper; a test sets D(0) to play them missing
 
     async def start(self) -> None:
@@ -983,11 +993,17 @@ class PaperExchange:
 
     # --- test helpers ---
     def fill(self, order_id: str, shares: D) -> None:
+        """A fill as the CLOB books it: what is left of the order goes down by the fill rounded up to 0.01 share, and
+        at nothing left the order ends MATCHED, its size_matched the shares really bought (a hair under its size when
+        the fills were odd amounts; measured 11-25 on seven orders of three markets)."""
         row = self.book[order_id]
-        self.fill_log.setdefault(order_id, []).append((self.clock(), min(shares, row.size - row.matched)))
-        row.matched = min(row.size, row.matched + shares)
-        self.cash -= shares * row.price
-        if row.matched >= row.size:
+        left = self.left.get(order_id, row.size - row.matched)
+        took = min(shares, left)
+        self.fill_log.setdefault(order_id, []).append((self.clock(), took))
+        row.matched += took
+        self.cash -= took * row.price
+        self.left[order_id] = left - took.quantize(LOT, rounding=ROUND_UP)
+        if self.left[order_id] <= 0:
             row.status = "MATCHED"
             self.gone[order_id] = self.book.pop(order_id)
         self.enforce()

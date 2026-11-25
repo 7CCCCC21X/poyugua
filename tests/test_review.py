@@ -425,6 +425,34 @@ class RiskTest(unittest.IsolatedAsyncioTestCase):
         await tick(e, 30)
         self.assertEqual(len(quotes(e, phase="active")), 1)  # nothing new while the limit holds
 
+    async def test_an_order_eaten_whole_a_hair_short_keeps_its_hedge(self):
+        """The up order was eaten whole by odd amounts and ended MATCHED at 9.993964 of 10 (the exchange takes each fill
+        off an order rounded up to 0.01 share). The down order's 10 are a hair over that gap and still pair it."""
+        e, clock, pub, x = make_engine(settings(PREOPEN_MAX_EXPOSURE_USD="4"))
+        pub.list_range(["btc", "eth"], mk.window_starts(clock.t, e.s)[:2])
+        await tick(e)
+        hit = quotes(e)[0]
+        for shares in ("4.716982", "4.716982", "0.56"):
+            x.fill(hit["orders"]["up"]["id"], D(shares))
+        self.assertEqual(x.gone[hit["orders"]["up"]["id"]].status, "MATCHED")
+        await tick(e, 10)
+        await tick(e, 6)
+        self.assertIn("最坏亏损", e.hold())   # 9.993964 x 49¢ = $4.90 one-sided: over the $4 cap
+        await e.cancel_pass()
+        active = quotes(e, phase="active")
+        self.assertEqual([q["key"] for q in active], [hit["key"]])
+        self.assertEqual(active[0]["orders"]["down"]["state"], "open")
+        self.assertEqual(e.risk_withdrawals(hit["slug"]), [])
+        # ...but an order plainly larger than the gap still goes (a tenth of a share is not the exchange's rounding)
+        e2, clock2, pub2, x2 = make_engine(settings(PREOPEN_MAX_EXPOSURE_USD="4"))
+        pub2.list_range(["btc"], mk.window_starts(clock2.t, e2.s)[:1])
+        await tick(e2)
+        (q,) = quotes(e2)
+        x2.fill(q["orders"]["up"]["id"], D("9.85"))
+        x2.cancel_elsewhere([q["orders"]["up"]["id"]])   # its remainder gone: 9.85 up, the down order's 10 overshoot
+        await tick(e2, 10)
+        self.assertIn(q, e2.risk_withdrawals(q["slug"]))
+
     async def test_a_partly_filled_record_is_withdrawn_on_both_sides(self):
         """11-19 review: ten shares a side, one up share bought: its nine left could still fill one-sided, and the ten
         down could overshoot the one share they pair into one-sided the other way. Both are withdrawn."""

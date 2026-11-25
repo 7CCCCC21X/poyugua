@@ -326,6 +326,69 @@ class PlacementTest(unittest.IsolatedAsyncioTestCase):
         await tick(e, 1)
         self.assertEqual(quotes(e, a["slug"])[-1]["phase"], "active")  # quoted again (attempt 1 of the cap)
 
+    async def test_orders_eaten_whole_a_hair_short_are_fills_not_a_cancel_elsewhere(self):
+        """11-25 16:31: takers buying the other side by the dollar ate the 47¢ up orders of BTC, ETH and SOL 16:35 within
+        52 seconds: 29.99, 29.98 and 29.98 of 30 shares. The exchange ended the three as MATCHED (it takes each fill off
+        an order rounded up to 0.01 share). Short of their size, they were taken for orders cancelled elsewhere: each
+        window's other side was withdrawn, and the third paused the bot and withdrew every order it had."""
+        e, clock, pub, x = make_engine()
+        starts = mk.window_starts(clock.t, e.s)[:4]
+        pub.list_range(["btc"], starts)
+        await tick(e)
+        *hit, spared = quotes(e)
+        for q in hit:
+            oid = q["orders"]["up"]["id"]
+            x.fill(oid, D("4.716982"))   # $2.50 at 53¢ on the other side
+            x.fill(oid, D("4.716982"))
+            x.fill(oid, D("5"))          # wants more than is left as the exchange counts it: 10 - 4.72 - 4.72 = 0.56
+            self.assertEqual((x.gone[oid].status, x.gone[oid].matched), ("MATCHED", D("9.993964")))
+        for _ in range(3):
+            await tick(e, 6)
+        self.assertFalse(e.paused)
+        self.assertEqual((e.hold(), list(e.external)), ("", []))
+        self.assertFalse(any("external-cancel" in k for k in e.notified))
+        for q in hit:
+            self.assertEqual((q["phase"], bool(q.get("counted")), q.get("reason") or ""), ("active", False, ""))
+            self.assertEqual((q["orders"]["up"]["state"], q["orders"]["up"]["status"]), ("final", "MATCHED"))
+            self.assertEqual(D(q["orders"]["up"]["filled"]), D("9.993964"))
+            self.assertEqual(q["orders"]["down"]["state"], "open")   # the other side rests on: it is what pairs the fill
+            self.assertIn(q["orders"]["down"]["id"], x.book)
+        self.assertEqual((len(quotes(e)), len(x.book)), (4, 5))      # nothing withdrawn, nothing quoted again
+        self.assertEqual(x.cancel_calls, [])
+        # the other side bought later: a pair, $1 back whatever wins. Nothing is at risk any more.
+        self.assertEqual(e.exposure(), 3 * D("9.993964") * D("0.49"))
+        for q in hit:
+            x.fill(q["orders"]["down"]["id"], D("10"))
+        await tick(e, 10)
+        await tick(e, 6)
+        self.assertEqual(e.exposure(), D(0))
+        self.assertEqual({(q["phase"], q["reason"], bool(q.get("counted"))) for q in hit}, {("closed", "挂单都已结束", False)})
+        # an order really cancelled elsewhere is still told apart: one window counts, three in a minute pause
+        x.cancel_elsewhere([spared["orders"]["up"]["id"]])
+        for _ in range(3):
+            await tick(e, 6)
+        self.assertFalse(e.paused)
+        self.assertTrue(spared["counted"])
+        self.assertIn("挂单被撤（CANCELED）", spared["reason"])
+
+    async def test_a_pause_an_older_version_made_for_matched_orders_says_it_was_a_false_alarm(self):
+        e, clock, pub, x = make_engine()
+        detail = "BTC 11-25 16:35、ETH 11-25 16:35、SOL 11-25 16:35，共 3 场；交易所状态 MATCHED；V1/V2 市场"
+        e.pause(eng.EXTERNAL_WHY, detail)                       # as the version before this one kept it
+        e2, *_ = make_engine(ledger=e.ledger, clock=clock)      # ...read by this one after the deploy
+        self.assertTrue(e2.paused)                              # still paused: resuming is the operator's
+        for text in (e2.check_text(), e2.report()["pause_detail"]):
+            self.assertIn("暂停时：BTC 11-25 16:35" if text.startswith("🩺") else "BTC 11-25 16:35", text)
+            self.assertIn("这次是误报：MATCHED 是成交，不是撤单", text)
+            self.assertIn("▶️ 恢复", text)
+        self.assertEqual(e2.pause_note["detail"], detail)       # what was kept is not rewritten
+        for real in ("交易所状态 CANCELED；V1 市场", "交易所状态 CANCELED/MATCHED；V1/V2 市场", ""):
+            e2.pause(eng.EXTERNAL_WHY, "BTC 11-25 16:35，共 3 场；" + real)
+            self.assertNotIn("误报", e2.check_text())
+            self.assertNotIn("误报", e2.report()["pause_detail"])
+        e2.pause("网页上点了 ⏸ 暂停", "交易所状态 MATCHED")      # not the guard's pause: nothing to add
+        self.assertNotIn("误报", e2.check_text())
+
     async def test_hold_without_snapshot_and_during_cooldown(self):
         e, clock, pub, x = make_engine()
         pub.list_window("btc", T0 + 1800)

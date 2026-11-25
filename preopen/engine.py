@@ -39,7 +39,8 @@ from . import config
 from . import markets as mk
 from . import refusals
 from .config import GTD_THRESHOLD_S, Settings
-from .exchange import WINDOW_CODES, Cancelled, Exchange, OrderSpec, Placed, Row, Throttled, refusal_code, retryable, unrecognised
+from .exchange import (MATCHED_STATES, WINDOW_CODES, Cancelled, Exchange, OrderSpec, Placed, Row, Throttled, refusal_code,
+                       retryable, unrecognised)
 from .gamma import PublicThrottled
 from .ledger import ENDED, MAY_REST, NEVER_PLACED, Ledger, quote_key
 
@@ -148,6 +149,10 @@ REFUSALS_SAVE_S = 10      # ...written to the ledger at most this often
 EXTERNAL_MASS = 3         # the bot's orders cancelled elsewhere (plain CANCELED: the website's 取消所有, another program
 EXTERNAL_WINDOW_S = 60    # with the key) in this many windows within this long: taken as "stop", and the bot pauses
 PAUSE_LOOKBACK_S = 120    # a pause kept without its reason (an older version): the records closed this long before it
+EXTERNAL_WHY = "本程序的挂单在别处被成批撤掉"   # the guard's pause, as 📊, 🩺 and the page word it
+PAIR_DUST = D("0.01")     # of an order's shares: what an order eaten whole may end short of its size (the CLOB takes each
+                          # fill off it rounded up to 0.01 share: 30 shares in seven fills ended at 29.98). The other
+                          # side's whole order still pairs it.
 
 
 def dnum(value: Any) -> D:
@@ -475,8 +480,8 @@ class Engine:
                 out.append(q)
             elif other["state"] in MAY_REST:
                 left = dnum(q["shares"]) - dnum(other.get("filled"))
-                if left <= room:
-                    room -= left
+                if left <= room + dnum(q["shares"]) * PAIR_DUST:  # the side ahead, eaten whole, is a hair short of it
+                    room = max(D(0), room - left)
                 else:
                     out.append(q)
         return out
@@ -1550,7 +1555,13 @@ class Engine:
             self.save(q)
             return
         o.update(state="final", final_at=self.now(), status=row.status)
-        if q["phase"] == "active" and row.matched < row.size and self.now() < q["start"] - self.s.cancel_s:
+        if row.matched_out:
+            # Eaten whole, a hair under its size or not (Row.matched_out): a fill like any other. The record stays as it
+            # is, its other side resting to pair it. Until 11-25 one short of its size was taken for an order cancelled
+            # elsewhere: the other side was withdrawn, and three such windows in a minute paused the bot (11-25 16:31:
+            # BTC, ETH and SOL bought 29.99, 29.98 and 29.98 of 30 within 52 seconds).
+            pass
+        elif q["phase"] == "active" and row.matched < row.size and self.now() < q["start"] - self.s.cancel_s:
             state = row.state
             if state == "CANCELED_NOT_ENOUGH_BALANCE":  # fills elsewhere took the balance below this market's orders
                 self.close(q, f"{mk.SIDES_CN[side]}方挂单因余额不足被交易所撤掉", free=True, save=False)
@@ -1580,8 +1591,8 @@ class Engine:
                         batch = [r for s in {s for t, s in self.external if t > now - EXTERNAL_WINDOW_S}
                                  for r in self.quotes_of(s) if "被别处成批撤掉" in str(r.get("reason") or "")]
                         detail = self.external_detail(batch)
-                        self.pause("本程序的挂单在别处被成批撤掉", detail)
-                        self.problem(f"本程序的挂单在别处被成批撤掉（{detail}）：网页上的「取消所有」、用同一个 Key 的别的程序，"
+                        self.pause(EXTERNAL_WHY, detail)
+                        self.problem(f"{EXTERNAL_WHY}（{detail}）：网页上的「取消所有」、用同一个 Key 的别的程序，"
                                      "或者交易所撤的。已暂停新挂并撤掉其余挂单；要继续请在控制台点「恢复挂单」或发 /resume",
                                      key="external-cancel")
                 else:  # one window: counted, quoted again up to the cap
@@ -1880,6 +1891,16 @@ class Engine:
         at = float(self.pause_note.get("at") or 0)
         return (f"{mk.hm(at)} 起：" if at else "") + str(self.pause_note.get("why") or "原因没有记下")
 
+    def pause_detail(self) -> str:
+        """Which windows and the exchange's word for it, as the pause kept them. A pause made by the versions up to
+        11-25 for orders the exchange had ended as MATCHED says so: those were fills, nothing was cancelled elsewhere."""
+        detail = str(self.pause_note.get("detail") or "")
+        said = re.search(r"交易所状态 ([A-Za-z_/]+)", detail)
+        words = {w.upper().removeprefix("ORDER_STATUS_") for w in said.group(1).split("/")} if said else set()
+        if words and words <= set(MATCHED_STATES) and self.pause_note.get("why") == EXTERNAL_WHY:
+            detail += "。这次是误报：MATCHED 是成交，不是撤单（旧版本把吃满的单当成了被别处撤掉，已修复），点 ▶️ 恢复即可"
+        return detail
+
     def read_pause_note(self) -> dict[str, Any]:
         """The pause kept by pause(); one kept by an older version, which kept no reason, read from its records."""
         try:
@@ -1899,7 +1920,7 @@ class Engine:
         batch = [q for q in rows if "被别处成批撤掉" in str(q.get("reason") or "")
                  and at - PAUSE_LOOKBACK_S <= float(q.get("closing_at") or 0) <= at + 1]
         if batch:
-            return {"at": at, "why": "本程序的挂单在别处被成批撤掉", "detail": self.external_detail(batch)}
+            return {"at": at, "why": EXTERNAL_WHY, "detail": self.external_detail(batch)}
         return {"at": at, "why": "手动暂停（Telegram 或网页上的 ⏸ 暂停，或网页上的 🛑 紧急停止）", "detail": ""}
 
     @staticmethod
@@ -2406,7 +2427,7 @@ class Engine:
             "lags": {"open": median(self.open_lags), "place": median(self.place_lags), "cancel": median(self.cancel_lags),
                      "listing": median(self.listing_lags)},
             "today": t, "hold": self.hold(), "budget_note": self.budget_note, "blocked": self.blocked,
-            "pause_detail": str(self.pause_note.get("detail") or "") if self.paused else "",
+            "pause_detail": self.pause_detail() if self.paused else "",
             "exposure": float(self.exposure()), "day_pnl": float(self.day_pnl()), "risk": self.risk_hold(),
             "limits": {"exposure": float(self.s.max_exposure_usd), "daily_loss": float(self.s.max_daily_loss_usd)},
             "key_exclusive": self.s.key_exclusive,
@@ -2488,7 +2509,7 @@ class Engine:
             verdict = f"⛔ 不工作：{self.blocked}"
         elif self.paused:
             verdict = f"⏸ 已暂停（{self.pause_text()}），不挂单（▶️ 恢复 或 /resume）" + (
-                f"\n   暂停时：{self.pause_note['detail']}" if self.pause_note.get("detail") else "")
+                f"\n   暂停时：{self.pause_detail()}" if self.pause_note.get("detail") else "")
         elif hold:
             verdict = f"⛔ 暂不新挂：{hold}"
         elif not total:
