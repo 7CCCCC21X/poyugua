@@ -1049,6 +1049,68 @@ class ProtocolV2Test(unittest.IsolatedAsyncioTestCase):
         self.assertIn("余额", e.hold())           # the old rule: every placement waits on the balance
         self.assertEqual(e.v2_blocked(), "")
 
+    async def test_a_v2_markets_first_order_waits_after_the_opening_and_a_refused_token_is_not_hammered(self):
+        """Live 11-25 15:26, asked every 0.2 s and sent at once: SOL, BNB and HYPE refused "invalid token id" 40 times
+        in a row, 20 s and more (retried every half second); a round stopped two seconds by a 429 went in at the next
+        try. A V2 market's first order goes 2.5 s after its opening is seen, and a refused one is tried again after two
+        seconds; a CTF market's as before (at once; half a second)."""
+        loop = asyncio.get_running_loop()
+        e, clock, pub, x = make_engine()
+        start = T0 + 1800
+        v2, v1 = mk.slug_of("btc", start), mk.slug_of("eth", start)
+        for m in (v2_window(pub, "btc", start, created=clock.t - 5, accepting=None, active=False),
+                  pub.list_window("eth", start, created=clock.t - 5, accepting=None, active=False)):
+            pub.not_accepting.add(m["conditionId"])
+        await e.account_once()
+        await e.discover()
+        await drain(e)
+        self.assertEqual(x.placed, [])
+        pub.not_accepting.clear()                                   # both open
+        unpark(e)
+        await drain(e)
+        self.assertEqual({spec.ref.split("#")[0] for spec in x.placed}, {v1})          # the CTF one at once
+        self.assertEqual(e.listings[v2].opened, clock.t)
+        wait = e.timers[v2].when() - loop.time()
+        self.assertTrue(eng.OPEN_SETTLE_V2_S - 0.2 < wait <= eng.OPEN_SETTLE_V2_S)     # the V2 one parked for the settle
+        self.assertIn("V2 市场刚开放", e.hold_note)
+        clock.advance(1.0)
+        unpark(e)
+        await drain(e)                                                # asked again too soon: still waiting
+        self.assertEqual({spec.ref.split("#")[0] for spec in x.placed}, {v1})
+        self.assertAlmostEqual(e.timers[v2].when() - loop.time(), eng.OPEN_SETTLE_V2_S - 1.0, delta=0.2)
+        x.reject[f"{v2}#0@0/up"] = ("rejected", "token_not_ready")
+        x.reject[f"{v2}#0@0/down"] = ("rejected", "token_not_ready")
+        clock.advance(eng.OPEN_SETTLE_V2_S - 1.0)
+        unpark(e)
+        await drain(e)                                                # sent 2.5 s after the opening: refused once
+        self.assertEqual(e.token_refusals[v2], 1)
+        self.assertAlmostEqual(e.timers[v2].when() - loop.time(), eng.TOKEN_RETRY_V2_S, delta=0.2)   # two seconds, not half
+        clock.advance(eng.TOKEN_RETRY_V2_S)
+        unpark(e)
+        await drain(e)
+        self.assertEqual(len(quotes(e, v2, phase="active")), 1)       # placed at the next try
+        self.assertAlmostEqual(quotes(e, v2)[0]["placed"] - quotes(e, v2)[0]["opened"],
+                               eng.OPEN_SETTLE_V2_S + eng.TOKEN_RETRY_V2_S, delta=0.01)
+        # refused ten times running (20 s): read again from Gamma and tried the slow way, as a CTF market after forty
+        e, clock, pub, x = make_engine()
+        v2_window(pub, "btc", start)                                  # open already when found: no settle
+        await e.account_once()
+        await e.discover()
+        for i in range(eng.TOKEN_FAST_TRIES_V2):
+            x.reject[f"{v2}#0@0/up"] = ("rejected", "token_not_ready")
+            x.reject[f"{v2}#0@0/down"] = ("rejected", "token_not_ready")
+            if i:
+                e.enqueue(v2)
+            await drain(e)
+            for handle in list(e.timers.values()):
+                handle.cancel()
+            waited = e.timers.pop(v2).when() - loop.time() if v2 in e.timers else None
+            if i < eng.TOKEN_FAST_TRIES_V2 - 1:
+                self.assertAlmostEqual(waited, eng.TOKEN_RETRY_V2_S, delta=0.2)
+        self.assertEqual(e.token_refusals[v2], eng.TOKEN_FAST_TRIES_V2)
+        self.assertNotIn(v2, e.listings)                              # its listing dropped: read afresh
+        self.assertTrue(any("重新读一遍" in text for _, text in e.errors))
+
     async def test_each_coin_is_expected_by_its_own_listing_lead(self):
         """11-25: a V2 market is created 23 h 59 min before its start, a CTF one 23 h 53 min. One median over every
         coin had the other kind's listings found by the slow poll, 7 s after their creation: a V2 market opens after

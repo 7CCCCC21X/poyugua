@@ -17,7 +17,8 @@ from . import markets as mk
 EXPLAIN: dict[str, tuple[str, str, str]] = {
     "token_not_ready": ("交易所撮合引擎还不认这个代币",
                         "市场刚开放时常见：市场显示能下单了，撮合引擎要再过一会儿才登记这一场的代币",
-                        "只把这一场半秒后再挂（开放那一刻只挂第一档，被拒也不浪费多少额度），其他场次照常；"
+                        "只把这一场过一会儿再挂（旧市场半秒；V2 市场 2 秒，而且开放后先等 2.5 秒才发第一张单："
+                        "追得太紧交易所会一直不认），其他场次照常；开放那一刻只挂第一档，被拒也不浪费多少额度；"
                         "连续 20 秒还不认就改成每 10 秒试一次，并重新读一遍这一场的市场信息"),
     "market_not_ready": ("市场还没开放下单", "新发布的场次要过一会儿才开放（V2 市场约在创建后 10 秒开放，旧市场 70～90 秒）", "每 0.2 秒问一次，开放了马上挂"),
     "not_enough_balance": ("余额或授权不够",
@@ -84,27 +85,30 @@ def table(log: Iterable[dict], span: tuple[float, float] | None = None) -> list[
 
 
 def rate_note(rate: dict | None) -> str:
-    """Whose doing the last hour's 429s were ("" without one), from the adapter's rate_status: its own count of the
-    signer's order bucket (own_left) against the request, and what the exchange said was left (remaining). A request
-    that fitted by the bot's own count was refused for something else: another program spending the same signer's
-    tokens when the exchange reports the bucket short, another limiter when it reports no bucket at all."""
+    """Whose doing the last hour's 429s were ("" without one), from the adapter's rate_status: for each kind (see
+    LiveExchange.note_limited) how many, and the latest one's numbers: the orders asked for, what the bot's own orders
+    had left of the signer's bucket, what the exchange said was left."""
     if not rate or not rate.get("limited_hour"):
         return ""
-    total, others = int(rate["limited_hour"]), int(rate.get("others") or 0)
+    kinds, last_of = rate.get("kinds") or {}, rate.get("last_of") or {}
     parts = []
-    if total - others:
-        parts.append(f"{total - others} 次是本程序自己发得太密，已自动减速、之后慢慢恢复")
-    last = rate.get("last_other")
-    if others and last:
-        head = (f"{others} 次不是本程序发多了：最近一次请求 {last.get('orders')} 张单，按本程序自己发的量额度应该还有 "
-                f"{float(last.get('own_left') or 0):.0f} 张（满 {last.get('burst')} 张、每秒补 {last.get('per_s')} 张，"
-                f"10 秒内自己共发 {last.get('own10')} 张）")
-        if last.get("remaining") is not None:
-            parts.append(head + f"，交易所却说只剩 {float(last['remaining']):.0f} 张：有别的程序在用同一个签名地址（私钥）下单"
-                         "（另一个机器人、脚本、别处还在跑的旧版本）。停掉它，或给本程序单独配一把 Session Key，各用各的额度")
-        else:
-            parts.append(head + "，而交易所这次没有报这个签名地址的额度：不像是按私钥限的，可能是交易所入口按 IP 限流"
-                         "（Railway 的出口 IP 很多人共用）")
+
+    def numbers(x: dict) -> str:
+        return (f"最近一次请求 {x.get('orders')} 张单，按本程序自己发的量额度应该还有 {float(x.get('own_left') or 0):.0f} 张"
+                f"（满 {x.get('burst')} 张、每秒补 {x.get('per_s')} 张，10 秒内自己共发 {x.get('own10')} 张）")
+    if kinds.get("elsewhere"):
+        x = last_of["elsewhere"]
+        parts.append(f"{kinds['elsewhere']} 次不是按私钥的额度限的：最近一次请求 {x.get('orders')} 张单时，交易所报这个签名地址的额度还剩 "
+                     f"{float(x['remaining']):.0f} 张（满 {x.get('burst')} 张），够用；是交易所另一道限流，多在新市场开放的那几秒。"
+                     "按它给的秒数等一下再发，本程序不用减速；也说明没有别的程序在用这把私钥的额度")
+    if kinds.get("own"):
+        parts.append(f"{kinds['own']} 次是本程序自己发得太密，已自动减速、之后慢慢恢复")
+    if kinds.get("signer"):
+        x = last_of["signer"]
+        parts.append(f"{kinds['signer']} 次是这个签名地址的额度被别的程序用掉了：{numbers(x)}，交易所却说只剩 {float(x['remaining']):.0f} 张。"
+                     "有别的程序在用同一把私钥下单（另一个机器人、脚本、别处还在跑的旧版本）：停掉它，或给本程序单独配一把 Session Key，各用各的额度")
+    if kinds.get("unreported"):
+        parts.append(f"{kinds['unreported']} 次交易所没有报这个签名地址的额度（{numbers(last_of['unreported'])}）：不像是按私钥限的")
     return "；".join(parts)
 
 

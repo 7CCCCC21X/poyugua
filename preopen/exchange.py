@@ -413,23 +413,30 @@ class LiveExchange:
     def note_limited(self, error: Any, orders: int = 0) -> None:
         """A 429 on an order request of `orders` orders: kept with what tells whose doing it was. `own_left`: what this
         program's own orders had left in the signer's bucket; `remaining`: what the exchange said was left (its
-        Poly-RateLimit-Remaining; None when the answer carried no such state: not the per-signer limiter's). The
-        request fitting by the program's own count, the 429 was not its doing (11-25: 35 an hour, every one at a
-        market's opening, the last with 8 orders sent in ten seconds: something else spends this signer's tokens, or
-        another limiter answered). Only when it was the program's own is its pace halved and its bucket emptied:
-        slowing down for someone else's orders left it at 5 orders a second through every opening."""
+        Poly-RateLimit-Remaining; None when the answer carried no such state). `kind`:
+          elsewhere   the exchange's own count covers the request: the signer's bucket was not what refused it, another
+                      limiter did (live 11-25 15:31: 2 orders refused with 58 of 60 left; every such 429 came within
+                      seconds of a market's opening)
+          own         by this program's own count the bucket was short: it sent too fast
+          signer      the exchange says the bucket was short though this program's own orders had left enough:
+                      something else spends this signer's tokens
+          unreported  no state with the answer and the program's own count fits: not told which limiter
+        Only for its own doing is the program's pace halved and its bucket emptied: slowing down for the others (as it
+        did until 11-25) left it at 5 orders a second through every opening."""
         now = time.monotonic()
         if self.sent:
             self.sent[-1][2] = False   # the request just answered (one POST is in flight at a time): not processed
         own = sum(n for t, n, _ in self.sent if now - t <= 10)
         left = self.own_left(now)
         tier = TIER_LIMITS.get(self.tier.lower(), TIER_LIMITS["standard"])
-        state = getattr(error, "rate_limit", None)
-        mine = left < orders
+        remaining = getattr(getattr(error, "rate_limit", None), "remaining", None)
+        kind = ("elsewhere" if remaining is not None and remaining >= orders else "own" if left < orders
+                else "signer" if remaining is not None else "unreported")
+        mine = kind == "own"
         self.limited.append({"at": time.time(), "orders": orders, "own10": own, "own_left": round(left, 1),
                              "allowance": tier[1] + 10 * tier[0], "burst": tier[1], "per_s": tier[0],
-                             "remaining": getattr(state, "remaining", None), "retry": float(error.retry_after or 0),
-                             "rate": round(self.orders.rate, 1), "mine": mine})
+                             "remaining": remaining, "retry": float(error.retry_after or 0),
+                             "rate": round(self.orders.rate, 1), "mine": mine, "kind": kind})
         if mine:
             self.orders.rate = max(MIN_ORDER_RATE, self.orders.rate / 2)
             self.orders.tokens = 0.0
@@ -443,17 +450,16 @@ class LiveExchange:
             self.backoff_at = now
 
     def rate_status(self) -> dict[str, Any]:
-        """The order pace for /check and 🧾 拒单: now, the cap, the tier, the 429s of the last hour, how many of them the
-        bot's own orders do not explain (`others`; of those, `unreported`: answered without the signer's rate-limit
-        state) and the latest of each kind."""
+        """The order pace for /check and 🧾 拒单: now, the cap, the tier, the 429s of the last hour, how many of each kind
+        (note_limited; `others`: all but the bot's own) and the latest of each kind."""
         hour = [x for x in self.limited if time.time() - x["at"] <= 3600]
         cap, _ = self.order_cap()
         tier = TIER_LIMITS.get(self.tier.lower())
-        others = [x for x in hour if not x.get("mine")]
+        kinds = collections.Counter(x.get("kind") or "own" for x in hour)
         return {"rate": round(self.orders.rate, 1), "cap": round(cap, 1), "configured": self.configured[0], "tier": self.tier,
-                "tier_rate": tier[0] if tier else None, "limited_hour": len(hour), "others": len(others),
-                "unreported": sum(1 for x in others if x.get("remaining") is None),
-                "last": hour[-1] if hour else None, "last_other": others[-1] if others else None}
+                "tier_rate": tier[0] if tier else None, "limited_hour": len(hour), "others": len(hour) - kinds["own"],
+                "kinds": dict(kinds), "last": hour[-1] if hour else None,
+                "last_of": {kind: next(x for x in reversed(hour) if (x.get("kind") or "own") == kind) for kind in kinds}}
 
     async def start(self) -> None:
         from polymarket import ApiKeyCreds, AsyncSecureClient, RelayerApiKey

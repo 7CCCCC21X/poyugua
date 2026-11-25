@@ -272,11 +272,18 @@ class CancelReviewTest(unittest.TestCase):
         self.assertIn("9/12 次在新场次开放后 5 秒内（中位 1.2 秒）", g["evidence"])
         # 11-25: whose orders used the signer's allowance is told from each 429's own evidence, not assumed
         self.assertNotIn("开放那一刻同时下单太多", g["evidence"])
-        rate = {"limited_hour": 12, "others": 12, "unreported": 0, "configured": 30, "cap": 36,
-                "last_other": {"orders": 4, "own_left": 60.0, "burst": 60, "per_s": 40, "own10": 8, "remaining": 1.5}}
+        short = {"orders": 4, "own_left": 60.0, "burst": 60, "per_s": 40, "own10": 8, "remaining": 1.5}
+        rate = {"limited_hour": 12, "others": 12, "kinds": {"signer": 12}, "last_of": {"signer": short}, "configured": 30, "cap": 36}
         (g,) = refusals.summary(log, now, 24, rate)
-        self.assertIn("12 次不是本程序发多了：最近一次请求 4 张单，按本程序自己发的量额度应该还有 60 张"
+        self.assertIn("12 次是这个签名地址的额度被别的程序用掉了：最近一次请求 4 张单，按本程序自己发的量额度应该还有 60 张"
                       "（满 60 张、每秒补 40 张，10 秒内自己共发 8 张），交易所却说只剩 2 张", g["evidence"])
+        # live 11-25 15:31: two orders refused with 58 of 60 left: not the signer's allowance, and no one else on the key
+        fine = {"orders": 2, "own_left": 60.0, "burst": 60, "per_s": 40, "own10": 94, "remaining": 58.0}
+        rate = {"limited_hour": 5, "others": 5, "kinds": {"elsewhere": 5}, "last_of": {"elsewhere": fine}, "configured": 30, "cap": 36}
+        note = refusals.rate_note(rate)
+        self.assertIn("5 次不是按私钥的额度限的：最近一次请求 2 张单时，交易所报这个签名地址的额度还剩 58 张（满 60 张），够用", note)
+        self.assertIn("没有别的程序在用这把私钥的额度", note)
+        self.assertNotIn("停掉它", note)
         (g,) = refusals.summary([dict(x, code="timed_out") for x in log], now, 24)
         self.assertIn("9/12 次在新场次开放后 5 秒内（中位 1.2 秒）：开放那一刻同时下单太多", g["evidence"])
         quiet = [dict(x, opened_ago=None) for x in log]

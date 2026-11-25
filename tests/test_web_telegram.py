@@ -343,7 +343,7 @@ class TelegramTest(unittest.IsolatedAsyncioTestCase):
         reply = await handle("/rejects", [])
         self.assertIsInstance(reply, Reply)
         self.assertIn("交易所撮合引擎还不认这个代币", reply.text)
-        self.assertIn("机器人：只把这一场半秒后再挂", reply.text)
+        self.assertIn("机器人：只把这一场过一会儿再挂（旧市场半秒；V2 市场 2 秒", reply.text)
         self.assertEqual(reply.markup["inline_keyboard"][0][0]["callback_data"], "chk_rejects")
         self.assertIn("最近 1 小时拒单", e.check_text())
         self.assertEqual(e.hold(), "")
