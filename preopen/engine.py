@@ -132,6 +132,9 @@ TOKEN_FAST_TRIES_V2 = 10  # every half second, kept it refused: live 11-25 15:26
                           # 2.7 s after it, the crowd's first order 6-7 s after. So: nothing before +2.5 s, and after a
                           # refusal two seconds (as the exchange's own Retry-After says), ten times, then the slow way.
                           # The CTF markets keep the half second: their push comes 0.35 s after the opening.
+OPENINGS_KEPT = 40        # the latest fresh windows' openings kept: when each order request went and what it was answered
+OPENING_WATCH_S = 90      # ...for this long after the opening was seen
+WAIT_MARGIN_S = 0.05      # a window refused with a wait (a 429's Retry-After) is tried again this long after it ends
 TWINS_ALERT = 6           # this many of the bot's own kind of orders on the account, not the bot's: another copy runs
 REFUSALS_KEPT = 300       # the latest refusals kept for /rejects (also across restarts)
 REFUSALS_SAVE_S = 10      # ...written to the ledger at most this often
@@ -232,6 +235,7 @@ class Engine:
         self.stopping = ""                    # a withdrawal began (the exit, a switch to paper): nothing new is placed
         self.v2_hold_until = 0.0              # V2 markets wait (their approval seems missing) until then
         self.idle_ask_at = 0.0                # the next CLOB "accepting?" read of a long-idle listing not before then
+        self.openings: dict[str, dict] = {}   # slug -> a fresh window's opening: its order requests and their answers
         self.v2_refreshed = 0.0               # when the CLOB was last asked to read the allowances afresh
         self.cancel_wait_until = 0.0          # a cancel refused before processing (429, a restart): asked again after this
         self._risk: tuple[Any, str] = (None, "")
@@ -533,6 +537,42 @@ class Engine:
         help_ = REFUSAL_HELP.get(code, "")
         self.problem(f"交易所拒单（{self.refused_reason}）" + (f"。{help_}" if help_ else "")
                      + f"。所有新挂暂停 {wait:.0f} 秒后再试（连续第 {self.refused_streak} 次），场次不作废", key=f"refused-{code}")
+
+    def hold_retry(self) -> float | None:
+        """When a window held back is tried again: as the cooldown ends when that is what holds it (the exchange said
+        how long: a 429's Retry-After is a second or two), else HOLD_RETRY_S on; not at all while paused (the sweep
+        queues it on resume). Live 11-25: the first order request of every opening is answered 429 with Retry-After
+        1-2 s; tried again five seconds on, the orders rested 8-10 s after the opening."""
+        if self.paused:
+            return None
+        left = self.cooldown_until - self.now()
+        return min(HOLD_RETRY_S, left + WAIT_MARGIN_S) if left > 0 else HOLD_RETRY_S
+
+    def note_opening(self, listing: mk.Listing, sent: float, done: float, outcome: str) -> None:
+        """A fresh window's order request, for /check's 最近开盘: sent and answered this long after its opening was
+        seen, and what the answer was. Only until its first level rests, or OPENING_WATCH_S on."""
+        if not listing.opened or done - listing.opened > OPENING_WATCH_S:
+            return
+        o = self.openings.get(listing.slug)
+        if o is None:
+            while len(self.openings) >= OPENINGS_KEPT:
+                self.openings.pop(next(iter(self.openings)))
+            o = self.openings[listing.slug] = {"coin": listing.coin, "start": listing.start, "version": listing.version,
+                                               "opened": listing.opened, "tries": [], "rested": None}
+        if o["rested"] is None and len(o["tries"]) < 30:
+            o["tries"].append((round(sent - listing.opened, 1), round(done - listing.opened, 1), outcome))
+            if outcome == "挂上":
+                o["rested"] = round(done - listing.opened, 1)
+
+    def openings_text(self, limit: int = 10) -> list[str]:
+        """The latest openings, newest first: "SOL 11-26 16:00 V2：2.6→429 等2秒；4.7→挂上(4.9)" (seconds after the
+        opening was seen: sent→answer; a resting one with when it was answered)."""
+        lines = []
+        for o in sorted(self.openings.values(), key=lambda o: -o["opened"])[:limit]:
+            tries = "；".join(f"{sent:g}→{what}" + (f"({done:g})" if what == "挂上" else "") for sent, done, what in o["tries"])
+            lines.append(f"  {mk.window_name(o['coin'], o['start'])} {'V2' if o['version'] == 'v2' else '旧'}"
+                         f"（{mk.hms(o['opened'])} 开放）：{tries or '还没发单'}")
+        return lines
 
     def set_cooldown(self, reason: str, seconds: float) -> None:
         """A refusal before processing (429, a restart, a timeout): every placement waits. Said once per cooldown: one
@@ -869,7 +909,7 @@ class Engine:
         if not levels:
             return None
         if why := self.hold():
-            return Hold(why, None if self.paused else HOLD_RETRY_S)
+            return Hold(why, self.hold_retry())
         if listing.version == "v2" and (why := self.v2_blocked()):  # V2 alone waits; the CTF markets go on
             self.v2_warn(f"{mk.window_name(listing.coin, listing.start)} 是 V2 市场，没挂：{V2_HELP}")
             return Hold(why, HOLD_RETRY_S * 12)
@@ -896,7 +936,7 @@ class Engine:
             if not levels:
                 return None
             if why := self.hold():
-                return Hold(why, None if self.paused else HOLD_RETRY_S)
+                return Hold(why, self.hold_retry())
         if listing.version == "v2" and listing.opened and (settle := listing.opened + OPEN_SETTLE_V2_S - self.now()) > 0:
             return Hold("V2 市场刚开放：等撮合引擎认它的代币再发第一张单", settle)
         opened_ago = self.now() - listing.opened if listing.opened else None
@@ -958,6 +998,14 @@ class Engine:
         by_ref = {r.ref: r for r in results}
         done = self.now()
         hold: Hold | None = None
+        first = [by_ref.get(f"{q['key']}/{side}") for q in quotes if int(q["level"]) == 0 for side in mk.SIDES]
+        if first and all(first):  # the nearest level's request, for the opening's timeline
+            bad = next((r for r in first if r.status != "open"), None)
+            self.note_opening(listing, now, done, "挂上" if bad is None else
+                              f"429 等{bad.wait:g}秒" if bad.code == "rate_limited" else
+                              {"token_not_ready": "不认代币", "market_not_ready": "没开放", "not_enough_balance": "余额不足"}.get(
+                                  bad.code, bad.code or bad.status) + (f" 等{bad.wait:g}秒" if bad.wait > 0 else ""))
+        waits = [r.wait for r in results if r.wait > 0]
         for q in quotes:
             for side in mk.SIDES:
                 r = by_ref.get(f"{q['key']}/{side}") or Placed("", "unknown", code="missing", message="没有应答")
@@ -1029,7 +1077,8 @@ class Engine:
                     self.recent_refusals.append((done, slug, account[0]))
                     self.refuse(account[0], next((o["error"] for o in q["orders"].values() if o.get("code") == account[0]), ""))
                     hold = hold or Hold(f"交易所拒单（{account[0]}）", None)
-                hold = hold or Hold(next((o["error"] for o in q["orders"].values() if o["error"]), "没发出"), HOLD_RETRY_S)
+                hold = hold or Hold(next((o["error"] for o in q["orders"].values() if o["error"]), "没发出"),
+                                    max(waits) + WAIT_MARGIN_S if waits else HOLD_RETRY_S)  # the exchange said how long
                 continue
             if states == {"open"}:
                 self.rested(q, listing, done)
@@ -2555,6 +2604,9 @@ class Engine:
         lines.append(("⚠️" if "失败" in health or "限流" in health else "✅") + f" 公共接口：{health or '—'}")
         if self.ghosts:
             lines.append(f"ℹ️ 按哈希待撤（判为没发出的）：{len(self.ghosts)}")
+        if self.openings:
+            lines.append("【最近开盘】看到开放后几秒发单→结果（挂上的括号里是挂上的秒数）")
+            lines += self.openings_text()
         recent = [(ts, text) for ts, text in self.errors if now - ts < 600]
         lines.append("【最近 10 分钟的问题】" + ("" if recent else "无"))
         lines += [f"  {mk.hms(ts)} {text[:160]}" for ts, text in recent[-8:]]

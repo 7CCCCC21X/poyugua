@@ -1111,6 +1111,50 @@ class ProtocolV2Test(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(v2, e.listings)                              # its listing dropped: read afresh
         self.assertTrue(any("重新读一遍" in text for _, text in e.errors))
 
+    async def test_a_window_refused_with_a_wait_is_tried_again_as_the_wait_ends(self):
+        """Live 11-25 15:48-15:58: the first order request of every opening answered 429 with Retry-After 1-2 s; the
+        window was tried again HOLD_RETRY_S = 5 s on, and its orders rested 8-10 s after the opening. Now as the wait
+        ends: the refused window, and the windows the cooldown holds back."""
+        from preopen.exchange import Placed
+        loop = asyncio.get_running_loop()
+        e, clock, pub, x = make_engine()
+        start = T0 + 1800
+        slugs = [mk.slug_of(coin, start) for coin in ("btc", "eth")]
+        for coin in ("btc", "eth"):
+            m = pub.list_window(coin, start, created=clock.t - 80, accepting=None, active=False)
+            pub.not_accepting.add(m["conditionId"])
+        await e.account_once()
+        await e.discover()
+        await drain(e)
+        pub.not_accepting.clear()                                     # both open; the first request: 429, wait 2 s
+        real, asked = x.place, []
+
+        async def limited(specs, on_signed=None):
+            x.place = real
+            asked.append(specs[0].ref.split("#")[0])
+            return [Placed(spec.ref, "not_sent", code="rate_limited", message="下单被限流（429）", wait=2.0) for spec in specs]
+        x.place = limited
+        unpark(e)
+        await drain(e)
+        self.assertEqual((quotes(e), len(asked)), ([], 1))            # one refused; the other held by the cooldown
+        self.assertIn("接口冷却", e.hold_note)
+        for slug in slugs:                                            # both tried again as the wait ends, not 5 s on
+            self.assertAlmostEqual(e.timers[slug].when() - loop.time(), 2.0 + eng.WAIT_MARGIN_S, delta=0.2)
+        clock.advance(2.1)
+        unpark(e)
+        await drain(e)
+        self.assertEqual({q["slug"] for q in quotes(e, phase="active")}, set(slugs))
+        # the openings' timeline, as /check shows it: the one sent at once and refused with the wait, then both resting
+        lines = e.openings_text()
+        refused = next(text for text in lines if mk.window_name(*mk.parse_slug(asked[0])) in text)
+        other = next(text for text in lines if text is not refused)
+        self.assertIn("旧", refused)
+        self.assertIn("0→429 等2秒；2.1→挂上(2.1)", refused)
+        self.assertTrue(other.endswith("：0→挂上(0)"))                  # held by the cooldown: seen open 2.1 s later, sent at once
+        self.assertIn("【最近开盘】", e.check_text())
+        e.pause("测试")                                                 # paused: nothing parked for a retry
+        self.assertIsNone(e.hold_retry())
+
     async def test_each_coin_is_expected_by_its_own_listing_lead(self):
         """11-25: a V2 market is created 23 h 59 min before its start, a CTF one 23 h 53 min. One median over every
         coin had the other kind's listings found by the slow poll, 7 s after their creation: a V2 market opens after
