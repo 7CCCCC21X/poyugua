@@ -13,7 +13,7 @@ try:
 except ImportError:  # the SDK is in the image (requirements.lock); a light checkout without it skips this suite
     raise unittest.SkipTest("polymarket-client is not installed") from None
 from preopen import gamma
-from preopen.exchange import V2_EXCHANGE, Bucket, LiveExchange, OrderSpec, order_hash, v2_allowance_of
+from preopen.exchange import V2_EXCHANGE, Bucket, LiveExchange, OrderSpec, order_hash, signing_speed, v2_allowance_of
 
 WALLET = "0x1111111111111111111111111111111111111111"
 ZERO32 = "0x" + "00" * 32
@@ -357,6 +357,36 @@ class OrderHashTest(unittest.TestCase):
         self.assertEqual(order_hash(object(), neg_risk=False), "")
 
 
+class SigningTest(unittest.TestCase):
+    """The orders are signed by eth-keys' backend: coincurve (libsecp256k1) when it is installed, as in the image
+    (requirements.lock), else its own pure-Python one. 11-25: 1.0 ms an order against 6.2."""
+
+    def test_the_backend_in_use_signs_and_the_signature_recovers_the_key(self):
+        from eth_keys import KeyAPI
+        from eth_keys.backends import get_backend
+        from eth_utils.crypto import keccak
+        api = KeyAPI(get_backend())
+        for i in range(20):
+            key, digest = api.PrivateKey(keccak(b"key %d" % i)), keccak(b"order %d" % i)
+            self.assertEqual(api.ecdsa_recover(digest, api.ecdsa_sign(digest, key)), key.public_key)
+        backend, ms = signing_speed(rounds=2)
+        self.assertEqual(backend, type(get_backend()).__name__)
+        self.assertGreater(ms, 0)
+
+    def test_coincurve_signs_byte_for_byte_as_the_pure_python_backend(self):
+        from eth_keys import KeyAPI
+        from eth_keys.backends import CoinCurveECCBackend, NativeECCBackend, get_backend, is_coincurve_available
+        from eth_utils.crypto import keccak
+        if not is_coincurve_available():
+            self.skipTest("coincurve is not installed here (the image has it): eth-keys signs with its own backend")
+        self.assertIsInstance(get_backend(), CoinCurveECCBackend)   # picked by itself once it is importable
+        fast, slow = KeyAPI(CoinCurveECCBackend()), KeyAPI(NativeECCBackend())
+        for i in range(50):
+            secret, digest = keccak(b"key %d" % i), keccak(b"order %d" % i)
+            self.assertEqual(fast.ecdsa_sign(digest, fast.PrivateKey(secret)).to_bytes(),
+                             slow.ecdsa_sign(digest, slow.PrivateKey(secret)).to_bytes())
+
+
 class PublicApiTest(unittest.IsolatedAsyncioTestCase):
     async def test_listings_bust_the_cache_and_cover_the_limit(self):
         seen = []
@@ -371,56 +401,34 @@ class PublicApiTest(unittest.IsolatedAsyncioTestCase):
         api = gamma.PublicApi(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
         slugs = [f"btc-updown-5m-{1794537000 + 300 * i}" for i in range(50)]
         found = await api.listings(slugs)
-        self.assertEqual(len(seen), 6)  # (20 + 20 + 10) x (v1, v2): each slug under both names, 40 names a request
+        self.assertEqual(len(seen), 4)  # (40 + 10) x (v1, v2)
         self.assertEqual(set(found), {s for s in slugs if s.endswith("0")})
         self.assertEqual({m["version"] for s, m in found.items() if s.endswith("00")}, {"v2"})   # 11-22: V2 ones too
-        self.assertEqual(sorted(u.params["version"] for u in seen), ["v1"] * 3 + ["v2"] * 3)
+        self.assertEqual(sorted(u.params["version"] for u in seen), ["v1", "v1", "v2", "v2"])
         for url in seen:
             self.assertTrue(url.params.get("_"))
             self.assertGreaterEqual(int(url.params["limit"]), len(url.params.get_list("slug")))
-            self.assertLessEqual(len(url.params.get_list("slug")), gamma.SLUGS_PER_REQUEST)
-        self.assertIn("polyv2" + slugs[0], seen[0].params.get_list("slug"))
+            # 11-25: the V2 markets have the CTF ones' names; the test markets' polyv2... names are not asked for
+            self.assertFalse([name for name in url.params.get_list("slug") if name.startswith("polyv2")])
         self.assertNotEqual(seen[0].params["_"], seen[1].params["_"])
         await api.close()
 
-    async def test_a_market_under_the_v2_test_name_is_kept_under_the_bots(self):
-        """11-20's V2 test markets were polyv2<coin>-updown-5m-<t>: the V2 ones may keep that name."""
-        t = 1795216800
-        listed = {f"polyv2sol-updown-5m-{t}", f"btc-updown-5m-{t}", f"polyv2btc-updown-5m-{t}"}
+    async def test_the_next_windows_are_read_by_their_own_names_one_request_each(self):
+        t = 1795674900
+        listed = {f"sol-updown-5m-{t}"}
         paths = []
 
         def handler(request: httpx.Request) -> httpx.Response:
-            if request.url.path.startswith("/markets/slug/"):
-                name = request.url.path.rsplit("/", 1)[1]
-                paths.append(name)
-                return httpx.Response(200, json={"slug": name, "version": "v2"}) if name in listed else httpx.Response(404)
-            names = request.url.params.get_list("slug")
-            return httpx.Response(200, json=[{"slug": n, "version": "v2"} for n in names if n in listed])
-        now = [100.0]
-        api = gamma.PublicApi(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)), clock=lambda: now[0])
-        sol, btc, eth = (f"{c}-updown-5m-{t}" for c in ("sol", "btc", "eth"))
-        found = await api.listings([sol, btc, eth])
-        self.assertEqual(set(found), {sol, btc})
-        self.assertEqual((found[sol]["slug"], found[sol]["listedSlug"]), (sol, "polyv2" + sol))
-        self.assertNotIn("listedSlug", found[btc])            # both names there: the bot's own
-        self.assertEqual((await api.market(sol))["listedSlug"], "polyv2" + sol)
-        self.assertIsNone(await api.market(eth))
-        self.assertEqual(paths[-2:], [eth, "polyv2" + eth])
-        # the fast path: SOL's markets are asked by the V2 test name now, the other name only every 5 s
-        later = [f"{c}-updown-5m-{t + 300}" for c in ("sol", "eth")]
-        listed.add("polyv2" + later[0])
-        paths.clear()
-        got = await api.markets(later)
-        self.assertEqual(set(got), {later[0]})
-        self.assertEqual(sorted(paths), sorted(["polyv2" + later[0], later[0], later[1], "polyv2" + later[1]]))
-        paths.clear()
-        now[0] += 1
-        await api.markets(later)
-        self.assertEqual(sorted(paths), sorted(["polyv2" + later[0], later[1]]))   # each coin's own name alone
-        now[0] += gamma.OTHER_NAME_S
-        paths.clear()
-        await api.markets(later)
-        self.assertEqual(len(paths), 4)
+            name = request.url.path.rsplit("/", 1)[1]
+            paths.append(name)
+            return httpx.Response(200, json={"slug": name, "version": "v2"}) if name in listed else httpx.Response(404)
+        api = gamma.PublicApi(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+        slugs = [f"{c}-updown-5m-{t}" for c in ("sol", "xrp", "btc")]
+        for _ in range(3):
+            self.assertEqual(set(await api.markets(slugs)), listed)
+        self.assertEqual(sorted(paths), sorted(slugs * 3))           # no second name tried, at no poll
+        self.assertIsNone(await api.market(slugs[1]))
+        self.assertEqual((await api.market(slugs[0]))["version"], "v2")
         await api.close()
 
     async def test_accepting_reads_the_clob_flag(self):

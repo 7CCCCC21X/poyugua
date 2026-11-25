@@ -481,7 +481,7 @@ function renderOverview(d) {
       (d.settings.max_open ? `<br>挂单合计上限 ${money(d.settings.max_open)}` : "")),
     card("今天成交", `${t.fills || 0} 场`, `双边 ${t.both || 0}，已结算 ${t.settled || 0}`),
     card("今天盈亏", signed(t.pnl || 0), "已结算部分"),
-    card("开放→挂上", d.lags.open == null ? "—" : d.lags.open + " 秒", "中位（市场约在创建后 75～90 秒开放）"),
+    card("开放→挂上", d.lags.open == null ? "—" : d.lags.open + " 秒", "中位，从看到开放算起（V2 市场约在创建后 10 秒开放，旧市场 70～90 秒）"),
     card("撤单确认", d.lags.cancel == null ? "—" : "开场前 " + d.lags.cancel + " 秒", "中位"),
     card("持仓最坏亏损", money(d.exposure), (d.limits.exposure ? `上限 ${money(d.limits.exposure)}` : "未设上限") +
       (d.limits.daily_loss ? `；日亏损上限 ${money(d.limits.daily_loss)}` : "") + (d.risk ? `<br><span class="warn">${esc(d.risk)}</span>` : "")),

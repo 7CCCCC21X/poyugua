@@ -5,3 +5,6 @@
 polymarket-client==0.18.0
 # Public reads (Gamma listings, the CLOB's accepting flag and books) and Telegram; already an SDK dependency.
 httpx[http2]==0.28.1
+# The ECDSA library eth-keys signs with when it is installed (libsecp256k1), in place of its pure-Python one: an order
+# signed in 1.0 ms, not 6.2 (measured 11-25, Python 3.12; the signatures verify alike). Nothing imports it by name.
+coincurve==21.0.0

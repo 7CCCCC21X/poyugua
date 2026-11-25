@@ -244,6 +244,38 @@ def order_hash(signed: Any, *, neg_risk: bool, chain_id: int = 137) -> str:
         return ""
 
 
+def signing_speed(rounds: int = 5) -> tuple[str, float]:
+    """The ECDSA backend eth-keys signs with, and the milliseconds one order takes to sign: measured on a throwaway key
+    over a message of an order's shape. coincurve (libsecp256k1, in requirements.lock) ~1 ms; eth-keys' own pure-Python
+    backend, which it falls back to when coincurve cannot be imported, ~6 ms: the same signatures, byte for byte.
+    ("", 0.0) when it cannot be measured."""
+    try:
+        from eth_account import Account
+        from eth_keys.backends import get_backend
+        account = Account.create()
+        message = {
+            "types": {
+                "EIP712Domain": [{"name": "name", "type": "string"}, {"name": "version", "type": "string"},
+                                 {"name": "chainId", "type": "uint256"}, {"name": "verifyingContract", "type": "address"}],
+                "Order": [{"name": n, "type": t} for n, t in (
+                    ("salt", "uint256"), ("maker", "address"), ("signer", "address"), ("tokenId", "uint256"),
+                    ("makerAmount", "uint256"), ("takerAmount", "uint256"), ("side", "uint8"), ("signatureType", "uint8"),
+                    ("timestamp", "uint256"), ("metadata", "bytes32"), ("builder", "bytes32"))]},
+            "primaryType": "Order",
+            "domain": {"name": "Polymarket CTF Exchange", "version": "3", "chainId": 137, "verifyingContract": V2_EXCHANGE},
+            "message": {"salt": 1, "maker": account.address, "signer": account.address, "tokenId": 10**70,
+                        "makerAmount": 4_900_000, "takerAmount": 10_000_000, "side": 0, "signatureType": 3,
+                        "timestamp": 1795500000000, "metadata": b"\x00" * 32, "builder": b"\x00" * 32}}
+        account.sign_typed_data(full_message=message)   # the first one loads the library
+        began = time.perf_counter()
+        for _ in range(rounds):
+            account.sign_typed_data(full_message=message)
+        return type(get_backend()).__name__, (time.perf_counter() - began) / rounds * 1000
+    except Exception as error:
+        LOG.debug("signing speed: %s", error)
+        return "", 0.0
+
+
 def v2_allowance_of(allowances: Any) -> D | None:
     """The pUSD that ExchangeV3 (Polymarket Protocol V2's exchange) may spend for the account, from the CLOB's COLLATERAL
     allowances by spender; None when the CLOB names no allowance for it (not known). A V2 BUY needs it: the CTF
@@ -326,6 +358,7 @@ class LiveExchange:
         self.wallet = ""
         self.wallet_type = ""
         self.v2_allowance: D | None = None   # what ExchangeV3 may spend (None: the CLOB does not say), read with the balance
+        self.signing: tuple[str, float] = ("", 0.0)   # the ECDSA backend and the ms an order takes to sign (start())
         self.tier = ""
         self.rate_warning = False
         self.wallet_list_off_until = 0.0
@@ -408,6 +441,8 @@ class LiveExchange:
         self.wallet = str(self.client.wallet)
         self.wallet_type = str(self.client.wallet_type)
         LOG.info("Polymarket 账户 %s（%s），签名地址 %s", self.wallet, self.wallet_type, self.client.signer)
+        self.signing = signing_speed()
+        LOG.info("签名：%s，每张单约 %.1f 毫秒", *self.signing)
 
     async def close(self) -> None:
         for task in self._senders:

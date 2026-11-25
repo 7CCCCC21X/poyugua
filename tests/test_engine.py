@@ -110,6 +110,26 @@ class PlacementTest(unittest.IsolatedAsyncioTestCase):
         await drain(e)
         self.assertEqual(len(x.placed), 2)
 
+    async def test_a_listing_is_asked_five_times_a_second_from_the_moment_it_is_found(self):
+        """11-25: a V2 market opens 9.4 s or more after its creation, with the exchange's next ten-second batch (a CTF
+        one after 70-94 s). Asked once a second until +55 s, as before, its opening was found half a second late."""
+        loop = asyncio.get_running_loop()
+        for age, within in ((1, 0.25), (9, 0.25), (60, 0.25), (119, 0.25), (130, 1.05), (400, 5.05), (2000, 30.05)):
+            e, clock, pub, x = make_engine()
+            start = T0 + 1800
+            m = pub.list_window("btc", start, created=clock.t - age, accepting=None, active=False)
+            pub.not_accepting.add(m["conditionId"])
+            await e.account_once()
+            await e.discover()
+            await drain(e)
+            wait = e.timers[mk.slug_of("btc", start)].when() - loop.time()
+            with self.subTest(age=age):
+                self.assertLessEqual(wait, within)
+                self.assertGreater(wait, within - 0.2 if within < 1 else within * 0.8)
+            unpark(e)
+            for handle in e.timers.values():
+                handle.cancel()
+
     async def test_every_window_is_quoted_on_the_balance_one_window_needs(self):
         e, clock, pub, x = make_engine(balance="15")  # one window takes $9.80: each market is checked on its own
         starts = mk.window_starts(clock.t, e.s)
@@ -885,6 +905,28 @@ class OperatorTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("BTC ETH", text)
         self.assertIn("体检", e.check_text())
 
+    async def test_the_summaries_are_worked_out_once_per_change_of_the_records(self):
+        """The page asks every five seconds: counts, today's fills and the exposure are kept until a record changes."""
+        e, clock, pub, x = make_engine()
+        pub.list_range(["btc", "eth"], mk.window_starts(clock.t, e.s)[:3])
+        await tick(e)
+        await tick(e, 5)
+        first = e.counts()
+        self.assertEqual((first["windows"], first["resting"]), (6, 12))
+        self.assertIs(e.counts(), first)                       # nothing changed: not worked out again
+        self.assertIs(e.today(), e.today())
+        self.assertEqual(e.report()["resting"], 12)
+        q = quotes(e)[0]
+        x.fill(q["orders"]["up"]["id"], D("10"))               # a fill: read at the next snapshot, the record saved
+        await tick(e, 10)
+        await tick(e, 6)
+        self.assertEqual(e.today()["fills"], 1)
+        self.assertEqual(e.counts()["resting"], 11)
+        self.assertEqual(float(e.exposure()), 4.9)             # one-sided: its cost is the worst case
+        self.assertEqual([f["up"] for f in e.report()["fills"]], [10.0])
+        e.pause("测试")
+        self.assertEqual(e.counts()["active"], 0)              # every record closing: counted at once
+
     async def test_check_says_first_whether_every_window_is_quoted_and_why_not(self):
         def verdict(e):
             return e.check_text().splitlines()[1]
@@ -896,6 +938,11 @@ class OperatorTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("✅ 状态不明的单：0", e.check_text())
         e.pause()
         self.assertTrue(verdict(e).startswith("⏸ 已暂停"))
+        self.assertNotIn("签名：", e.check_text())               # paper: nothing is signed
+        x.signing = ("CoinCurveECCBackend", 1.04)              # live: the library the orders are signed with
+        self.assertIn("✅ 签名：coincurve，每张单约 1.0 毫秒", e.check_text())
+        x.signing = ("NativeECCBackend", 6.2)
+        self.assertIn("⚠️ 签名：纯 Python", e.check_text())
 
         e, clock, pub, x = make_engine(balance="9")  # not enough for a window
         pub.list_range(["btc"], mk.window_starts(clock.t, e.s)[:3])
@@ -1001,6 +1048,42 @@ class ProtocolV2Test(unittest.IsolatedAsyncioTestCase):
         await tick(e)
         self.assertIn("余额", e.hold())           # the old rule: every placement waits on the balance
         self.assertEqual(e.v2_blocked(), "")
+
+    async def test_each_coin_is_expected_by_its_own_listing_lead(self):
+        """11-25: a V2 market is created 23 h 59 min before its start, a CTF one 23 h 53 min. One median over every
+        coin had the other kind's listings found by the slow poll, 7 s after their creation: a V2 market opens after
+        9.4. Whatever the coins' order, each one's next listing is polled fast around its own moment."""
+        v2_lead, v1_lead = 86346, 86000
+        for coins in ("sol,btc", "btc,sol"):
+            e, clock, pub, x = make_engine(settings(PREOPEN_MARKETS=coins, PREOPEN_AHEAD_MINUTES="1440"))
+            for t in mk.window_starts(clock.t, e.s):      # every window whose listing moment has passed
+                if t - v2_lead <= clock.t:
+                    v2_window(pub, "sol", t, created=t - v2_lead)
+                if t - v1_lead <= clock.t:
+                    pub.list_window("btc", t, created=t - v1_lead)
+            await tick(e)
+            with self.subTest(coins=coins):
+                self.assertEqual((round(e.lead_of("sol")), round(e.lead_of("btc"))), (v2_lead, v1_lead))
+                front = e.frontier(mk.window_starts(clock.t, e.s))
+                sol_at, btc_at = front["sol"] - v2_lead, front["btc"] - v1_lead   # T0+54 and T0+100
+                self.assertEqual((sol_at - T0, btc_at - T0), (54, 100))
+                self.assertEqual(e.poll_wait(), e.s.poll_s)                        # T0+1: neither is near
+                self.assertEqual(e.next_listing(front), (front["sol"], sol_at))
+                clock.t = sol_at - 10
+                self.assertEqual(e.poll_wait(), e.s.fast_poll_s)                   # SOL's is: asked twice a second
+                v2_window(pub, "sol", front["sol"], created=sol_at)
+                clock.t = sol_at + 2
+                await e.scan_front()
+                self.assertIn(mk.slug_of("sol", front["sol"]), e.listings)
+                self.assertEqual(e.poll_wait(), e.s.poll_s)                        # found; BTC's is 44 s away
+                clock.t = btc_at - 10
+                self.assertEqual(e.poll_wait(), e.s.fast_poll_s)
+                pub.list_window("btc", front["btc"], created=btc_at)
+                clock.t = btc_at + 1
+                await e.scan_front()
+                self.assertEqual(e.poll_wait(), e.s.poll_s)
+                self.assertIn("各币不同", e.lead_text())
+                self.assertIn("23.89～23.98 小时", e.check_text())
 
     async def test_markets_listed_long_before_they_open_do_not_flood_the_clob(self):
         """V2 markets may be created a day before their trading starts (docs, 11-22): dozens listed and shut are asked

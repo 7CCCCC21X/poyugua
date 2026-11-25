@@ -49,12 +49,23 @@ FULL_SCAN_S = 60          # a full pass over the range's unlisted windows this o
 SKIP_RETRY_S = 60         # a listed window that is no candidate is read again this often
 FAST_BEFORE_S = 15        # poll fast from this long before a listing's expected moment...
 FAST_AFTER_S = 180        # ...to this long after (a listing can come minutes late: 11-13 02:52)
+LEADS_KEPT = 5            # a coin's listings are expected by the median lead of its latest this many: a V2 market is
+                          # created 23 h 59 min before its start, a CTF one 23 h 53 min. One median over every coin, as
+                          # it was, had the other kind's listings found by the slow poll: 7 s after their creation, when
+                          # a V2 market opens after 9.4 (11-25, on a paper run beside a probe)
 HOLD_RETRY_S = 5          # a window held back (pause, cooldown, stale snapshot) is tried again this long on
 BUDGET_RETRY_S = 30       # ...held back by the budget
-ARM_EARLY_S = 1.0         # a fresh listing the CLOB does not accept yet is asked again this often...
-ARM_RETRY_S = 0.2         # ...and this often from ARM_FAST_AFTER_S on: markets turn active ~75-90 s after their
-ARM_FAST_AFTER_S = 55     #    creation (11-13: +71 to +92 s), and the crowd posts within a second of it
-ARM_FRESH_S = 300         # ...while this young; an older one waits HOLD_RETRY_S
+ARM_RETRY_S = 0.2         # a fresh listing the CLOB does not accept yet is asked again this often from the moment it is
+ARM_FAST_UNTIL_S = 120    # found, to this age. Measured 11-25 over seven listings: V2 markets are opened in batches ten
+                          # seconds apart, a market by the first batch 9.4 s or more after its creation: 9.4-10.2 s for
+                          # most, the coins of a round together; 19.5 s for one created a moment late (07:01: DOGE and
+                          # HYPE, ten seconds after SOL, XRP and BNB). Polymarket's new_market push comes 2.7 s after
+                          # the opening and the first resting order of anyone 6-7 s after it. A CTF market opens after
+                          # 70-94 s (11-13, 11-25), the push 0.35 s later. (Once a second until +55 s, as it was for
+                          # the CTF markets, found a V2 opening half a second late; on a paper run beside a probe the
+                          # five coins' opening is now seen 0.15-0.5 s after it, the round trip included.)
+ARM_SLOW_S = 1.0          # ...past that age once a second,
+ARM_FRESH_S = 300         # ...and from this age every HOLD_RETRY_S
 ARM_IDLE_S = 900          # still not accepting this long after its creation (V2 markets may be created a day before their
 ARM_IDLE_RETRY_S = 30     # trading starts, docs 11-22): asked every 30 s, and ARM_IDLE_RATE a second over all such
 ARM_IDLE_RATE = 2.0       # listings, so hundreds of them never flood the CLOB (a 429 there would stall every opening)
@@ -87,7 +98,7 @@ V2_HOLD_S = 600           # a V2 market refused for the balance or allowance wit
 V2_REFRESH_S = 300        # ...and the CLOB is asked to read the allowances afresh this often meanwhile
 V2_NOTE_S = 1800          # V2 markets left unquoted for the approval: told on Telegram this often
 V2_HELP = ("账户的 pUSD 还没授权给 Polymarket Protocol V2 的交易所（ExchangeV3），V2 市场的单会被拒。到 Polymarket 网页或 App "
-           "打开一个 V2 市场（11-23 起 SOL、XRP、DOGE、HYPE、BNB 的 5 分钟场，11-24 起 BTC、ETH），按提示完成授权；授权后几分钟内"
+           "打开一个 V2 市场（比如 SOL 的 5 分钟涨跌场），按提示完成授权；授权后几分钟内"
            "机器人自己开始挂 V2 市场。旧的（CTF）市场照常挂，不受影响")
 STALE_EXTRA_S = 15
 BALANCE_HOLD_S = 60       # the CLOB refused or cancelled an order for the balance: no new order this long
@@ -163,8 +174,8 @@ class Engine:
         self.full_scan_at = 0.0
         self.sweep_at = 0.0
         self.swept: dict[str, float] = {}
-        self.lead = float(settings.publish_lead_s)
-        self.leads: collections.deque = collections.deque(maxlen=200)
+        self.lead = float(settings.publish_lead_s)   # the coins' leads' median: for the reports, and a coin never seen
+        self.leads: dict[str, collections.deque] = {}   # coin -> start - createdAt of its latest listings
         self.listing_lags: collections.deque = collections.deque(maxlen=50)   # seen - createdAt of fresh listings
         self.place_lags: collections.deque = collections.deque(maxlen=50)     # placed - createdAt
         self.open_lags: collections.deque = collections.deque(maxlen=50)      # placed - when the CLOB was first seen accepting
@@ -181,6 +192,7 @@ class Engine:
         self.counters = collections.Counter()
         self.version = 0                      # bumped on every record change: reserved() is cached by it
         self._reserved: tuple[int, D] = (-1, D(0))
+        self._memo: dict[str, tuple[Any, Any]] = {}   # per_version(): name -> ((version, extra), value)
         self.budget_note = ""
         self.balance_hold_until = 0.0         # the CLOB said the balance was short: no new order until then
         self.refused_until = 0.0              # the CLOB refused orders for the account's sake, not the window's: no new
@@ -333,11 +345,28 @@ class Engine:
             return f"余额过期（{now - self.balance_at:.0f} 秒前读到的，读余额一直失败）"
         return ""
 
+    def per_version(self, name: str, work: Callable[[], Any], extra: Any = None) -> Any:
+        """work()'s value, worked out once per version of the records (every change of a record bumps it, as reserved()
+        relies on) and per `extra` (whatever else it depends on: the day). The page, 📊 and 🩺 ask for the same
+        summaries every few seconds; worked out anew each time, a page's refresh held the event loop 52 ms at 2000
+        windows x 3 levels (11-25). The value is shared: the callers only read it."""
+        key = (self.version, extra)
+        hit = self._memo.get(name)
+        if hit is None or hit[0] != key:
+            hit = self._memo[name] = (key, work())
+        return hit[1]
+
+    def day(self) -> Any:
+        return mk.dt.datetime.fromtimestamp(self.now(), mk.BEIJING).date()
+
     # ------------------------------------------------------------------ risk
     def exposure(self) -> D:
         """The worst case of the positions not settled yet: per window (its levels together), what its fills cost less
         the smaller side's shares, since a pair of opposite shares pays $1 whichever side wins. One-sided fills are the
         whole of it; a window filled evenly on both sides adds nothing."""
+        return self.per_version("exposure", self._exposure)
+
+    def _exposure(self) -> D:
         windows: dict[str, list[D]] = {}
         for q in self.open_quotes():
             f = {side: dnum(o.get("filled")) for side, o in q["orders"].items()}
@@ -351,7 +380,10 @@ class Engine:
 
     def day_pnl(self) -> D:
         """Today's (Beijing time) settled profit and loss, by the windows' start."""
-        day = mk.dt.datetime.fromtimestamp(self.now(), mk.BEIJING).date()
+        return self.per_version("day_pnl", self._day_pnl, self.day())
+
+    def _day_pnl(self) -> D:
+        day = self.day()
         total = D(0)
         for q in self.ledger.rows.values():
             if q.get("phase") == "settled" and q.get("pnl") is not None and \
@@ -594,11 +626,32 @@ class Engine:
                     break
         return out
 
+    def lead_of(self, coin: str) -> float:
+        """How long before its start this coin's windows are listed: the median over its own latest listings."""
+        leads = self.leads.get(coin)
+        return sorted(leads)[len(leads) // 2] if leads else self.lead
+
+    def next_listing(self, front: dict[str, int]) -> tuple[int, float] | None:
+        """The listing expected next among each coin's next window: (its start, when its coin's listings come)."""
+        if not front:
+            return None
+        when, start = min((t - self.lead_of(coin), t) for coin, t in front.items())
+        return start, when
+
+    def lead_text(self) -> str:
+        """23.98 小时, or the span when the coins differ (V2 and CTF markets are listed six minutes apart)."""
+        hours = sorted(self.lead_of(coin) / 3600 for coin in self.leads) or [self.lead / 3600]
+        return f"{hours[0]:.2f} 小时" if hours[-1] - hours[0] < 0.01 else f"{hours[0]:.2f}～{hours[-1]:.2f} 小时，各币不同"
+
+    def coming_text(self, front: dict[str, int]) -> str:
+        coming = self.next_listing(front)
+        return f"下一场 {mk.hm(coming[0])} 预计 {mk.hms(coming[1])} 发布" if coming else "范围内都已发布"
+
     def poll_wait(self) -> float:
         now = self.now()
         starts = mk.window_starts(now, self.s)
-        for t in self.frontier(starts).values():
-            expected = t - self.lead
+        for coin, t in self.frontier(starts).items():
+            expected = t - self.lead_of(coin)
             if expected - FAST_BEFORE_S <= now <= expected + FAST_AFTER_S:
                 return self.s.fast_poll_s
         return self.s.poll_s
@@ -634,7 +687,7 @@ class Engine:
             found = self.take(front, got)
             self.scan_note = f"{mk.hms(now)} 问了下一场 {len(front)} 个，新发现 {found} 场"
         if self.leads:
-            ordered = sorted(self.leads)
+            ordered = sorted(self.lead_of(coin) for coin in self.leads)
             self.lead = ordered[len(ordered) // 2]
         if now - self.sweep_at >= self.s.poll_s:
             self.sweep_at = now
@@ -663,7 +716,7 @@ class Engine:
             self.skipped.pop(slug, None)
             self.listings[slug] = listing  # kept (the coin's next window moves on); wanted() refuses a maker-fee market
             if listing.created:
-                self.leads.append(start - listing.created)
+                self.leads.setdefault(coin, collections.deque(maxlen=LEADS_KEPT)).append(start - listing.created)
                 if seen - listing.created < 120:
                     self.listing_lags.append(seen - listing.created)
             if listing.maker_fee:
@@ -701,10 +754,11 @@ class Engine:
                     continue
                 listing = self.listings[slug]
                 wanted = self.wanted(listing)
+                if not wanted:  # every level rests (nearly every window, nearly every sweep): its room is not worked
+                    continue    # out (11-25: more than half of a sweep's 37 ms at 2000 windows x 3 levels)
                 levels = self.fit(wanted, min(self.market_room(listing), cap))
                 if not levels:
-                    if wanted:
-                        short[self.short_of(listing, wanted, cap) or "balance"] += 1
+                    short[self.short_of(listing, wanted, cap) or "balance"] += 1
                     continue
                 cap -= self.need_of(levels)
                 self.enqueue(slug)
@@ -825,7 +879,7 @@ class Engine:
                 accepting = None
             if not accepting:
                 retry = (ARM_IDLE_RETRY_S if age >= ARM_IDLE_S else HOLD_RETRY_S if age >= ARM_FRESH_S
-                         else ARM_EARLY_S if age < ARM_FAST_AFTER_S else ARM_RETRY_S)
+                         else ARM_RETRY_S if age < ARM_FAST_UNTIL_S else ARM_SLOW_S)
                 return Hold("市场还没开放下单", retry)
             listing.accepting = True
             listing.opened = self.now()
@@ -1953,6 +2007,7 @@ class Engine:
                     archive_at = self.now()
                     n = self.ledger.archive_old(self.now())
                     if n:
+                        self.version += 1  # records left the working set: what is worked out per version is again
                         for key in [k for k in self.open_keys if k not in self.ledger.rows]:
                             self.open_keys.discard(key)
                         self.rebuild_index()
@@ -2158,6 +2213,9 @@ class Engine:
 
     def counts(self) -> dict[str, Any]:
         """resting: orders the CLOB accepted and holds; sending: signed, the answer not back yet (not resting yet)."""
+        return self.per_version("counts", self._counts)
+
+    def _counts(self) -> dict[str, Any]:
         active = [q for q in self.open_quotes() if q["phase"] == "active"]
         states = [o["state"] for q in self.open_quotes() for o in q["orders"].values()]
         windows = {q["slug"] for q in active if any(o["state"] == "open" for o in q["orders"].values())}
@@ -2168,7 +2226,10 @@ class Engine:
     def today(self) -> dict[str, Any]:
         """Today's (Beijing time) windows with a fill, by window (its levels and attempts together): how many, how many
         bought both sides, how many settled, and the settled P&L."""
-        day = mk.dt.datetime.fromtimestamp(self.now(), mk.BEIJING).date()
+        return self.per_version("today", self._today, self.day())
+
+    def _today(self) -> dict[str, Any]:
+        day = self.day()
         windows: dict[str, dict[str, Any]] = {}
         pnl = 0.0
         for q in self.ledger.rows.values():
@@ -2236,17 +2297,19 @@ class Engine:
         starts = mk.window_starts(now, self.s)
         front = self.frontier(starts)
         listed_until = max((l.start for l in self.listings.values()), default=0)
-        nxt = min(front.values()) if front else 0
-        active = sorted((q for q in self.open_quotes() if q["phase"] in ("active", "closing")),
-                        key=lambda q: (q["start"], q["coin"], q["level"]))
+        coming = self.next_listing(front)
+        active = self.per_version("soonest", lambda: heapq.nsmallest(
+            40, (q for q in self.open_quotes() if q["phase"] in ("active", "closing")),
+            key=lambda q: (q["start"], q["coin"], q["level"])))
         upcoming = [{
             "coin": mk.name_of(q["coin"]), "start": q["start"], "when": mk.hm(q["start"]), "in": mk.span(q["start"] - now),
             "level": int(q["level"]), "price": f(q["price"]) * 100, "shares": f(q["shares"]), "phase": q["phase"],
             "up": q["orders"]["up"]["state"], "down": q["orders"]["down"]["state"],
             "up_filled": f(q["orders"]["up"].get("filled")), "down_filled": f(q["orders"]["down"].get("filled")),
         } for q in active[:40]]
-        filled = sorted((q for q in self.ledger.rows.values() if any(f(o.get("filled")) > 0 for o in q["orders"].values())),
-                        key=lambda q: -q["start"])
+        filled = self.per_version("filled", lambda: heapq.nlargest(
+            30, (q for q in self.ledger.rows.values() if any(dnum(o.get("filled")) > 0 for o in q["orders"].values())),
+            key=lambda q: q["start"]))
         fills = [{
             "coin": mk.name_of(q["coin"]), "start": q["start"], "when": mk.hm(q["start"]), "level": int(q["level"]),
             "price": f(q["price"]) * 100, "up": f(q["orders"]["up"].get("filled")), "down": f(q["orders"]["down"].get("filled")),
@@ -2268,7 +2331,7 @@ class Engine:
             "unmanaged": len(self.unmanaged), "unmanaged_usd": float(self.unmanaged_usd()),
             "windows": c["windows"], "resting": c["resting"], "unknown": c["unknown"], "closing": c["closing"],
             "listed_until": mk.hm(listed_until) if listed_until else "",
-            "next_listing": {"start": mk.hm(nxt), "expected": mk.hms(nxt - self.lead)} if nxt else None,
+            "next_listing": {"start": mk.hm(coming[0]), "expected": mk.hms(coming[1])} if coming else None,
             "lags": {"open": median(self.open_lags), "place": median(self.place_lags), "cancel": median(self.cancel_lags),
                      "listing": median(self.listing_lags)},
             "today": t, "hold": self.hold(), "budget_note": self.budget_note, "blocked": self.blocked,
@@ -2314,11 +2377,11 @@ class Engine:
             lines.append(f"风控：未结算持仓最坏亏损 ${worst:.2f}" + (f"（上限 ${self.s.max_exposure_usd}）" if self.s.max_exposure_usd else "")
                          + f"；今天已结算 {self.day_pnl():+.2f}" + (f"（日亏损上限 ${self.s.max_daily_loss_usd}）" if self.s.max_daily_loss_usd else ""))
         if listed_until:
-            lines.append(f"已发布到：{mk.hm(listed_until)}；" + (
-                f"下一场 {mk.hm(min(front.values()))} 预计 {mk.hms(min(front.values()) - self.lead)} 发布" if front else "范围内都已发布"))
+            lines.append(f"已发布到：{mk.hm(listed_until)}；" + self.coming_text(front))
         if self.open_lags:
             lags = sorted(self.open_lags)
-            lines.append(f"开放接单→挂上：中位 {lags[len(lags) // 2]:.2f} 秒（最近 {len(lags)} 场；市场约在创建后 75～90 秒开放）")
+            lines.append(f"开放接单→挂上：中位 {lags[len(lags) // 2]:.2f} 秒（最近 {len(lags)} 场，从看到开放算起；"
+                         f"开放前每 {ARM_RETRY_S:g} 秒问一次；V2 市场约在创建后 10 秒开放，旧市场 70～90 秒）")
         elif self.place_lags:
             lags = sorted(self.place_lags)
             lines.append(f"创建→挂上：中位 {lags[len(lags) // 2]:.1f} 秒（最近 {len(lags)} 场）")
@@ -2454,6 +2517,11 @@ class Engine:
         lines.append(f"ℹ️ 订单号=哈希：{'是' if self.id_is_hash else '否' if self.id_is_hash is False else '未知'}；"
                      f"限流档位：{getattr(self.x, 'tier', '') or '未知'}"
                      + ("；⚠️ 交易所发过限流警告" if getattr(self.x, "rate_warning", False) else ""))
+        backend, ms = getattr(self.x, "signing", None) or ("", 0.0)
+        if backend:  # live: which library signs the orders (the fast one is in the image; eth-keys falls back by itself)
+            fast = "CoinCurve" in backend
+            lines.append(("✅ 签名：coincurve" if fast else "⚠️ 签名：纯 Python（慢：coincurve 没装上或加载不了）")
+                         + f"，每张单约 {ms:.1f} 毫秒")
         rs = self.x.rate_status() if hasattr(self.x, "rate_status") else None
         if rs:
             line = (f"{'⚠️' if rs['limited_hour'] else '✅'} 下单速度：现在 {rs['rate']:g} 单/秒（设置 {rs['configured']:g}"
@@ -2470,8 +2538,7 @@ class Engine:
         front = self.frontier(mk.window_starts(now, self.s))
         lines.append(("✅" if listed_until else "⚠️") + " 发现市场："
                      + (f"已发布到 {mk.hm(listed_until)}；" if listed_until else "还没找到；")
-                     + (f"下一场 {mk.hm(min(front.values()))} 预计 {mk.hms(min(front.values()) - self.lead)} 发布" if front else "范围内都已发布")
-                     + f"（发布提前量 {self.lead / 3600:.2f} 小时）")
+                     + self.coming_text(front) + f"（发布提前量 {self.lead_text()}）")
         public = getattr(self.pub, "health", None)
         health = public() if callable(public) else ""
         lines.append(("⚠️" if "失败" in health or "限流" in health else "✅") + f" 公共接口：{health or '—'}")

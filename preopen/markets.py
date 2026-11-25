@@ -1,9 +1,13 @@
 """The 5-minute up/down windows: their slugs, which ones are in range, and what a Gamma listing must say to be quoted.
 
 A window starting at epoch second t (a multiple of 300) is the market <coin>-updown-5m-<t>, e.g.
-btc-updown-5m-1794536700 = "Bitcoin Up or Down - November 12, 9:25PM-9:30PM ET". Polymarket creates each one about
-23 h 52.5 min before its start (all coins within the same second); it turns active, and the CLOB accepts orders, some
-75-90 s later (measured 11-13; the acceptingOrdersTimestamp field is backdated to ~6 s after the creation).
+btc-updown-5m-1794536700 = "Bitcoin Up or Down - November 12, 9:25PM-9:30PM ET". Polymarket creates a CTF (v1) one
+about 23 h 52.5 min before its start (all coins within the same second); it turns active, and the CLOB accepts orders,
+some 70-92 s later (measured 11-13 and 11-25; the acceptingOrdersTimestamp field is backdated to ~6 s after the
+creation). A Polymarket Protocol V2 one (SOL, XRP, DOGE, HYPE and BNB since 11-23) is created about 23 h 59 min before
+its start and opens with the exchange's next ten-second batch 9.4 s or more later: after 9.4-10.2 s as a rule, the
+coins of a round together, after 19.5 s when created a moment late (measured 11-25; its acceptingOrdersTimestamp is
+the real moment).
 """
 from __future__ import annotations
 
