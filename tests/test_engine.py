@@ -108,6 +108,11 @@ class PlacementTest(unittest.IsolatedAsyncioTestCase):
         pub.not_accepting.clear()
         unpark(e)
         await drain(e)
+        self.assertEqual(x.placed, [])                                 # seen open: its first order waits out the settle
+        self.assertAlmostEqual(e.timers[slug].when() - asyncio.get_running_loop().time(), eng.OPEN_SETTLE_S, delta=0.2)
+        clock.advance(eng.OPEN_SETTLE_S)
+        unpark(e)
+        await drain(e)
         self.assertEqual(len(x.placed), 2)
 
     async def test_a_listing_is_asked_five_times_a_second_from_the_moment_it_is_found(self):
@@ -189,6 +194,7 @@ class PlacementTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(x.placed, [])                               # not open yet
         pub.not_accepting.clear()                                    # it opens
         await tick(e, 0.2)
+        await tick(e, eng.OPEN_SETTLE_S)                             # its first order a moment after the opening
         self.assertEqual({q["level"] for q in quotes(e, phase="active")}, {0})   # the race: the nearest level only
         self.assertEqual(len(x.placed), 2)
         await tick(e, 10)
@@ -742,6 +748,9 @@ class ReviewRegressionTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(slug, e.timers)
         self.assertLessEqual(e.timers[slug].when() - asyncio.get_running_loop().time(), 0.25)
         unpark(e)
+        await drain(e)                                  # the CLOB accepts now: seen open, its order after the settle
+        clock.advance(eng.OPEN_SETTLE_S)
+        unpark(e)
         await drain(e)
         self.assertEqual(len(quotes(e, phase="active")), 1)
 
@@ -755,6 +764,9 @@ class ReviewRegressionTest(unittest.IsolatedAsyncioTestCase):
         await e.discover()
         await drain(e)
         pub.not_accepting.clear()  # they all open at once
+        unpark(e)
+        await drain(e)             # seen open: parked for the settle
+        clock.advance(eng.OPEN_SETTLE_S)
         unpark(e)
         slugs = []
         while not e.queue.empty():
@@ -1050,10 +1062,11 @@ class ProtocolV2Test(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(e.v2_blocked(), "")
 
     async def test_a_v2_markets_first_order_waits_after_the_opening_and_a_refused_token_is_not_hammered(self):
-        """Live 11-25 15:26, asked every 0.2 s and sent at once: SOL, BNB and HYPE refused "invalid token id" 40 times
-        in a row, 20 s and more (retried every half second); a round stopped two seconds by a 429 went in at the next
-        try. A V2 market's first order goes 2.5 s after its opening is seen, and a refused one is tried again after two
-        seconds; a CTF market's as before (at once; half a second)."""
+        """Live 11-25. 15:26, V2, asked every 0.2 s and sent at once: SOL, BNB and HYPE refused "invalid token id" 40
+        times in a row, 20 s and more. 16:07, CTF, sent at once: BTC "invalid token id", then 429 after 429 until 8.2 s
+        after its opening, ETH refused with it. 16:06 and 16:11, V2: sent 2.5 s after the opening, 429 for three of
+        four; 3.5 s after, resting, seven of seven. A market's first order goes a while after its opening is seen (a
+        CTF one 0.6 s, a V2 one 3 s), and a V2 token refused all the same is tried again after two seconds."""
         loop = asyncio.get_running_loop()
         e, clock, pub, x = make_engine()
         start = T0 + 1800
@@ -1068,21 +1081,22 @@ class ProtocolV2Test(unittest.IsolatedAsyncioTestCase):
         pub.not_accepting.clear()                                   # both open
         unpark(e)
         await drain(e)
-        self.assertEqual({spec.ref.split("#")[0] for spec in x.placed}, {v1})          # the CTF one at once
-        self.assertEqual(e.listings[v2].opened, clock.t)
-        wait = e.timers[v2].when() - loop.time()
-        self.assertTrue(eng.OPEN_SETTLE_V2_S - 0.2 < wait <= eng.OPEN_SETTLE_V2_S)     # the V2 one parked for the settle
-        self.assertIn("V2 市场刚开放", e.hold_note)
-        clock.advance(1.0)
+        self.assertEqual(x.placed, [])                                # seen open: neither sent yet
+        self.assertEqual((e.listings[v1].opened, e.listings[v2].opened), (clock.t, clock.t))
+        self.assertIn("市场刚开放", e.hold_note)
+        for slug, settle in ((v1, eng.OPEN_SETTLE_S), (v2, eng.OPEN_SETTLE_V2_S)):   # each parked for its settle
+            self.assertAlmostEqual(e.timers[slug].when() - loop.time(), settle, delta=0.2)
+        self.assertLess(eng.OPEN_SETTLE_S, 1.0)                        # the CTF crowd's orders rest from 1.25 s
+        clock.advance(eng.OPEN_SETTLE_S)
         unpark(e)
-        await drain(e)                                                # asked again too soon: still waiting
+        await drain(e)                                                # the CTF one goes; the V2 one, asked too soon, waits on
         self.assertEqual({spec.ref.split("#")[0] for spec in x.placed}, {v1})
-        self.assertAlmostEqual(e.timers[v2].when() - loop.time(), eng.OPEN_SETTLE_V2_S - 1.0, delta=0.2)
+        self.assertAlmostEqual(e.timers[v2].when() - loop.time(), eng.OPEN_SETTLE_V2_S - eng.OPEN_SETTLE_S, delta=0.2)
         x.reject[f"{v2}#0@0/up"] = ("rejected", "token_not_ready")
         x.reject[f"{v2}#0@0/down"] = ("rejected", "token_not_ready")
-        clock.advance(eng.OPEN_SETTLE_V2_S - 1.0)
+        clock.advance(eng.OPEN_SETTLE_V2_S - eng.OPEN_SETTLE_S)
         unpark(e)
-        await drain(e)                                                # sent 2.5 s after the opening: refused once
+        await drain(e)                                                # sent 3 s after the opening: refused once
         self.assertEqual(e.token_refusals[v2], 1)
         self.assertAlmostEqual(e.timers[v2].when() - loop.time(), eng.TOKEN_RETRY_V2_S, delta=0.2)   # two seconds, not half
         clock.advance(eng.TOKEN_RETRY_V2_S)
@@ -1127,6 +1141,9 @@ class ProtocolV2Test(unittest.IsolatedAsyncioTestCase):
         await e.discover()
         await drain(e)
         pub.not_accepting.clear()                                     # both open; the first request: 429, wait 2 s
+        unpark(e)
+        await drain(e)                                                # seen open: parked for the settle
+        clock.advance(eng.OPEN_SETTLE_S)
         real, asked = x.place, []
 
         async def limited(specs, on_signed=None):
@@ -1149,8 +1166,8 @@ class ProtocolV2Test(unittest.IsolatedAsyncioTestCase):
         refused = next(text for text in lines if mk.window_name(*mk.parse_slug(asked[0])) in text)
         other = next(text for text in lines if text is not refused)
         self.assertIn("旧", refused)
-        self.assertIn("0→429 等2秒；2.1→挂上(2.1)", refused)
-        self.assertTrue(other.endswith("：0→挂上(0)"))                  # held by the cooldown: seen open 2.1 s later, sent at once
+        self.assertIn("0.6→429 等2秒；2.7→挂上(2.7)", refused)
+        self.assertTrue(other.endswith("：2.7→挂上(2.7)"))              # held by the cooldown, sent as it ended
         self.assertIn("【最近开盘】", e.check_text())
         e.pause("测试")                                                 # paused: nothing parked for a retry
         self.assertIsNone(e.hold_retry())

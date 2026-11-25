@@ -123,15 +123,22 @@ DEEP_AFTER_OPEN_S = 30    # a market just opened: only its nearest level goes at
 TOKEN_RETRY_S = 0.5       # a market whose tokens the matching engine does not know yet ("invalid token id", common in
 TOKEN_FAST_TRIES = 40     # the seconds after a market opens): its window alone is tried again this often, this many times (20 s);
 TOKEN_SLOW_RETRY_S = 10   # then this often, and the listing is read again from Gamma once (its tokens may have changed)
-OPEN_SETTLE_V2_S = 2.5    # a V2 market just seen accepting: its first order goes this long after. Its token is refused as
-TOKEN_RETRY_V2_S = 2.0    # "invalid token id" for a while after the CLOB says accepting, and orders sent in that while,
-TOKEN_FAST_TRIES_V2 = 10  # every half second, kept it refused: live 11-25 15:26, the first round asked every 0.2 s and
-                          # sent at once: SOL, BNB and HYPE 40 refusals in a row, 20 s and more; in the next round (15:31)
-                          # a 429 stopped everything two seconds and the orders went in at the next try. The orders seen
-                          # earliest on a V2 book rested 2.1 s after the opening, Polymarket's own new_market push comes
-                          # 2.7 s after it, the crowd's first order 6-7 s after. So: nothing before +2.5 s, and after a
-                          # refusal two seconds (as the exchange's own Retry-After says), ten times, then the slow way.
-                          # The CTF markets keep the half second: their push comes 0.35 s after the opening.
+OPEN_SETTLE_S = 0.6       # a market just seen accepting: its first order goes this long after (a CTF market),
+OPEN_SETTLE_V2_S = 3.0    # ...or this long (a V2 one). An order sent before the matching engine knows the token is not
+TOKEN_RETRY_V2_S = 2.0    # just refused ("invalid token id"): what follows is refused too, for seconds. Live 11-25:
+TOKEN_FAST_TRIES_V2 = 10  #  15:26  V2, asked every 0.2 s and sent at once: SOL, BNB, HYPE refused 40 times in a row, 20 s
+                          #         and more (a try every half second);
+                          #  16:07  CTF, sent at once: BTC "invalid token id", then 429 after 429 (Retry-After 1-2 s each)
+                          #         until 8.2 s after its opening; ETH, opened 4 s after BTC, refused with it until the
+                          #         same moment: the refusals are the account's, not the market's;
+                          #  16:06, 16:11  V2, sent 2.5 s after the opening: 429 (1 s) for three of four, resting at once
+                          #         for one; sent 3.5 s after: resting, seven of seven.
+                          # The engine knows a token about when Polymarket pushes new_market: 0.35 s after a CTF market's
+                          # opening, 2.7 s after a V2 one's (11-25, a listener beside a probe); on a CTF book the first
+                          # order of anyone rested 0.38 s after the opening and the crowd's from 1.25 s, on a V2 book
+                          # 6-7 s after. So the first order waits out the push with a margin, and a V2 token refused all
+                          # the same is tried again after two seconds, ten times, then the slow way (a CTF one: half a
+                          # second, forty times, as before).
 OPENINGS_KEPT = 40        # the latest fresh windows' openings kept: when each order request went and what it was answered
 OPENING_WATCH_S = 90      # ...for this long after the opening was seen
 WAIT_MARGIN_S = 0.05      # a window refused with a wait (a 429's Retry-After) is tried again this long after it ends
@@ -937,8 +944,9 @@ class Engine:
                 return None
             if why := self.hold():
                 return Hold(why, self.hold_retry())
-        if listing.version == "v2" and listing.opened and (settle := listing.opened + OPEN_SETTLE_V2_S - self.now()) > 0:
-            return Hold("V2 市场刚开放：等撮合引擎认它的代币再发第一张单", settle)
+        settle = listing.opened + (OPEN_SETTLE_V2_S if listing.version == "v2" else OPEN_SETTLE_S) - self.now()
+        if listing.opened and settle > 0:
+            return Hold("市场刚开放：等撮合引擎认它的代币再发第一张单", settle)
         opened_ago = self.now() - listing.opened if listing.opened else None
         if opened_ago is not None and opened_ago < DEEP_AFTER_OPEN_S and len(self.s.levels) > 1:
             if levels[0] != 0:  # the nearest level rests: the deeper ones once the opening's rush is over
