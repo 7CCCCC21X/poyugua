@@ -269,6 +269,15 @@ class CancelReviewTest(unittest.TestCase):
                 "words": "下单被限流（429）", "status": "not_sent", "whole": True, "batch": 14, "http": 429,
                 "opened_ago": 1.2 if i < 9 else None, "listed_ago": 76.0} for i in range(12)]
         (g,) = refusals.summary(log, now, 24)
+        self.assertIn("9/12 次在新场次开放后 5 秒内（中位 1.2 秒）", g["evidence"])
+        # 11-25: whose orders used the signer's allowance is told from each 429's own evidence, not assumed
+        self.assertNotIn("开放那一刻同时下单太多", g["evidence"])
+        rate = {"limited_hour": 12, "others": 12, "unreported": 0, "configured": 30, "cap": 36,
+                "last_other": {"orders": 4, "own_left": 60.0, "burst": 60, "per_s": 40, "own10": 8, "remaining": 1.5}}
+        (g,) = refusals.summary(log, now, 24, rate)
+        self.assertIn("12 次不是本程序发多了：最近一次请求 4 张单，按本程序自己发的量额度应该还有 60 张"
+                      "（满 60 张、每秒补 40 张，10 秒内自己共发 8 张），交易所却说只剩 2 张", g["evidence"])
+        (g,) = refusals.summary([dict(x, code="timed_out") for x in log], now, 24)
         self.assertIn("9/12 次在新场次开放后 5 秒内（中位 1.2 秒）：开放那一刻同时下单太多", g["evidence"])
         quiet = [dict(x, opened_ago=None) for x in log]
         self.assertNotIn("开放后", refusals.summary(quiet, now, 24)[0]["evidence"])

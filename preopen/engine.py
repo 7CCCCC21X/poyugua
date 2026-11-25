@@ -2298,6 +2298,7 @@ class Engine:
         front = self.frontier(starts)
         listed_until = max((l.start for l in self.listings.values()), default=0)
         coming = self.next_listing(front)
+        rate = self.x.rate_status() if hasattr(self.x, "rate_status") else None
         active = self.per_version("soonest", lambda: heapq.nsmallest(
             40, (q for q in self.open_quotes() if q["phase"] in ("active", "closing")),
             key=lambda q: (q["start"], q["coin"], q["level"])))
@@ -2325,7 +2326,7 @@ class Engine:
             "buffer": float(self.balance - self.s.window_usd) if self.balance is not None else None,
             "refused": self.refused_reason if now < self.refused_until else "",
             "coverage": self.coverage(),
-            "rate": self.x.rate_status() if hasattr(self.x, "rate_status") else None, "twins": self.twins(),
+            "rate": rate, "rate_note": refusals.rate_note(rate), "twins": self.twins(),
             "refusals": [{k: g[k] for k in ("code", "title", "count", "last_text", "words", "evidence", "action")}
                          for g in refusals.summary(self.refusal_log, now, 24)[:6]],
             "unmanaged": len(self.unmanaged), "unmanaged_usd": float(self.unmanaged_usd()),
@@ -2529,10 +2530,7 @@ class Engine:
             if rs["configured"] > rs["cap"]:
                 line += f"；设置超过档位上限，按 {rs['cap']:g} 跑"
             if rs["limited_hour"]:
-                line += f"；最近 1 小时被限流（429）{rs['limited_hour']} 次，每次自动减速、之后慢慢恢复"
-            if rs["others"] and rs["last"]:
-                line += (f"。其中 {rs['others']} 次本程序 10 秒内自己只发了 {rs['last']['own10']} 张（交易所允许 {rs['last']['allowance']} 张）"
-                         "：同一个私钥还有别的程序在下单（另一个机器人、脚本）")
+                line += f"；最近 1 小时被限流（429）{rs['limited_hour']} 次：" + refusals.rate_note(rs)
             lines.append(line)
         listed_until = max((l.start for l in self.listings.values()), default=0)
         front = self.frontier(mk.window_starts(now, self.s))

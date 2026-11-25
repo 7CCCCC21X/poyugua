@@ -752,9 +752,12 @@ class InvalidTokenTest(unittest.IsolatedAsyncioTestCase):
 class RateLimitTest(unittest.IsolatedAsyncioTestCase):
     """11-17 18:54: ten lines "接口冷却 … rate_limited … 429" in two seconds: one 429 answered for a request of many
     windows, each window saying it again. The bot's own bucket is under the Standard tier's: a 429 means something else
-    spends the same signer's tokens, or the speed setting is above the tier."""
+    spends the same signer's tokens, or the speed setting is above the tier. 11-25: 35 an hour, each at a market's
+    opening, the bot having sent 8 orders in ten seconds: not its doing, and halving its pace for them left it at 5
+    orders a second. Each 429 is now kept with what the bot's own orders left of the signer's bucket and what the
+    exchange said was left."""
 
-    async def test_one_429_is_one_line_one_entry_and_the_pace_backs_off(self):
+    async def test_one_429_is_one_line_one_entry_and_not_the_bots_doing_keeps_its_pace(self):
         clock = Clock()
         fake, pub = FakeClob(clock), FakePublic(clock)
         s = seven_coins(clock, fake, pub)
@@ -774,20 +777,58 @@ class RateLimitTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(cooldowns), 1)                                  # one event, one line
         (entry,) = [x_ for x_ in e.refusal_log if x_["code"] == "rate_limited"]
         self.assertEqual(entry.get("windows"), 5)                            # however many windows it held up
-        self.assertEqual(x.orders.rate, 15.0)                                # halved
         status = x.rate_status()
-        self.assertEqual((status["limited_hour"], status["others"]), (1, 1))  # the bot had sent nearly nothing itself
+        self.assertEqual((status["limited_hour"], status["others"], status["unreported"]), (1, 1, 0))
+        last = status["last_other"]
+        # ten orders asked for; by the bot's own count the bucket was full (60), the exchange said -2 were left
+        self.assertEqual((last["orders"], last["own_left"], last["remaining"], last["mine"]), (10, 60.0, -2, False))
+        self.assertEqual(x.orders.rate, 30.0)                                # not its doing: its pace kept
         report = e.check_text()
-        self.assertIn("同一个私钥还有别的程序在下单", report)
-        self.assertIn("额度是被别的程序用掉的", refusals.text(e.refusal_log, clock.t, 24, status))
-        x.backoff_at -= 31                                                   # half a minute quiet: half again
-        x.recover()
-        self.assertEqual(x.orders.rate, 22.5)
+        self.assertIn("1 次不是本程序发多了：最近一次请求 10 张单，按本程序自己发的量额度应该还有 60 张", report)
+        self.assertIn("交易所却说只剩 -2 张：有别的程序在用同一个签名地址（私钥）下单", report)
+        self.assertNotIn("自动减速", report)
+        self.assertIn("有别的程序在用同一个签名地址", refusals.text(e.refusal_log, clock.t, 24, status))
+        self.assertIn("有别的程序在用同一个签名地址", e.report()["rate_note"])
         x.orders.rate = x.orders.burst = x.orders.tokens = 1000              # the rest at test speed
         for _ in range(3):
             await tick(e, 2)
         self.assertGreater(len(fake.live()), 100)                            # placed after the wait
         self.assertIn("一次挡住 5 场", refusals.text(e.refusal_log, clock.t, 24, status))
+
+    async def test_a_429_the_bots_own_orders_explain_halves_its_pace(self):
+        clock = Clock()
+        fake, pub = FakeClob(clock), FakePublic(clock)
+        s = settings()
+        x = adapter(fake, s)
+        x.configured = (30.0, 50)
+        x.orders.rate, x.orders.burst, x.orders.tokens = 30.0, 50, 50.0
+        x._on_rate(N(tier="standard", remaining=50, reset=None, warning=False))
+        import time as real_time
+        from polymarket import RateLimitError
+        now = real_time.monotonic()
+        self.assertEqual(x.own_left(now), 60.0)                              # nothing sent: the tier's burst
+        x.sent.extend([[now - 0.4, 30, True], [now - 0.2, 25, True], [now - 0.1, 10, True]])   # 65 orders in half a second
+        self.assertAlmostEqual(x.own_left(now), 60 - 30 + 8 - 25 + 4 - 10 + 4, delta=0.5)   # 11 left of 60, at 40 a second
+        x.sent.append([now, 15, True])                                       # ...and fifteen more: refused
+        x.note_limited(RateLimitError("rate limited", retry_after=1.0, rate_limit=N(remaining=11, reset=None, tier="standard", warning=False)), 15)
+        last = x.rate_status()["last"]
+        self.assertTrue(last["mine"])                                        # 15 asked of the 11 its own orders left
+        self.assertEqual((x.orders.rate, x.orders.tokens), (15.0, 0.0))      # halved, its bucket emptied
+        self.assertFalse(x.sent[-1][2])                                      # the refused request took no tokens
+        note = refusals.rate_note(x.rate_status())
+        self.assertIn("1 次是本程序自己发得太密，已自动减速", note)
+        self.assertNotIn("别的程序", note)
+        x.backoff_at -= 31                                                   # half a minute quiet: half again
+        x.recover()
+        self.assertEqual(x.orders.rate, 22.5)
+        # a 429 without the signer's state, the bot having sent next to nothing: another limiter's, said so
+        x.sent.clear()
+        x.sent.append([real_time.monotonic(), 4, True])
+        x.note_limited(RateLimitError("rate limited", retry_after=2.0), 4)
+        status = x.rate_status()
+        self.assertEqual((status["others"], status["unreported"], x.orders.rate), (1, 1, 22.5))
+        self.assertIn("交易所这次没有报这个签名地址的额度：不像是按私钥限的", refusals.rate_note(status))
+        self.assertEqual(refusals.rate_note({"limited_hour": 0}), "")
 
     async def test_a_speed_above_the_tier_is_capped(self):
         clock = Clock()

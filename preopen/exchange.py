@@ -365,7 +365,7 @@ class LiveExchange:
         self.orders = order_bucket or Bucket(settings.order_rate, settings.order_burst)
         self.cancels = cancel_bucket or Bucket(settings.cancel_rate, settings.cancel_burst)
         self.configured = (float(settings.order_rate), int(settings.order_burst))   # the settings' order bucket
-        self.sent: collections.deque = collections.deque(maxlen=4000)   # (monotonic, orders) of every order request
+        self.sent: collections.deque = collections.deque(maxlen=4000)   # [monotonic, orders, tokens taken?] of every order request
         self.limited: collections.deque = collections.deque(maxlen=200)  # each 429 of the order bucket, with the bot's own pace
         self.backoff_at = 0.0
         self._outbox: list[tuple[list[tuple[OrderSpec, Any, str]], asyncio.Future]] = []   # signed, waiting for the sender
@@ -395,19 +395,45 @@ class LiveExchange:
         self.orders.rate, self.orders.burst = cap_rate, cap_burst
         self.orders.tokens = min(self.orders.tokens, float(cap_burst))
 
-    def note_limited(self, error: Any) -> None:
-        """A 429 on an order request: the local rate halved, the bucket emptied; and what the bot itself had sent in the
-        last 10 s against what the tier admits, which tells whether something else spends this signer's tokens."""
+    def own_left(self, now: float) -> float:
+        """What the signer's order bucket would hold now had this program alone spent from it: the tier's burst, filled
+        again at the tier's rate, less every order this program sent (docs, trading rate limits: POST /orders costs a
+        token an order, whatever becomes of it; a request answered 429 is not processed and takes none). Below zero:
+        this program sent more than the tier admits."""
+        rate, burst = TIER_LIMITS.get(self.tier.lower(), TIER_LIMITS["standard"])
+        level, at = float(burst), None
+        for t, n, taken in self.sent:
+            if at is not None:
+                level = min(float(burst), level + (t - at) * rate)
+            at = t
+            if taken:
+                level -= n
+        return level if at is None else min(float(burst), level + (now - at) * rate)
+
+    def note_limited(self, error: Any, orders: int = 0) -> None:
+        """A 429 on an order request of `orders` orders: kept with what tells whose doing it was. `own_left`: what this
+        program's own orders had left in the signer's bucket; `remaining`: what the exchange said was left (its
+        Poly-RateLimit-Remaining; None when the answer carried no such state: not the per-signer limiter's). The
+        request fitting by the program's own count, the 429 was not its doing (11-25: 35 an hour, every one at a
+        market's opening, the last with 8 orders sent in ten seconds: something else spends this signer's tokens, or
+        another limiter answered). Only when it was the program's own is its pace halved and its bucket emptied:
+        slowing down for someone else's orders left it at 5 orders a second through every opening."""
         now = time.monotonic()
-        own = sum(n for t, n in self.sent if now - t <= 10)
+        if self.sent:
+            self.sent[-1][2] = False   # the request just answered (one POST is in flight at a time): not processed
+        own = sum(n for t, n, _ in self.sent if now - t <= 10)
+        left = self.own_left(now)
         tier = TIER_LIMITS.get(self.tier.lower(), TIER_LIMITS["standard"])
         state = getattr(error, "rate_limit", None)
-        self.limited.append({"at": time.time(), "own10": own, "allowance": tier[1] + 10 * tier[0],
+        mine = left < orders
+        self.limited.append({"at": time.time(), "orders": orders, "own10": own, "own_left": round(left, 1),
+                             "allowance": tier[1] + 10 * tier[0], "burst": tier[1], "per_s": tier[0],
                              "remaining": getattr(state, "remaining", None), "retry": float(error.retry_after or 0),
-                             "rate": round(self.orders.rate, 1)})
-        self.orders.rate = max(MIN_ORDER_RATE, self.orders.rate / 2)
-        self.orders.tokens = 0.0
-        self.backoff_at = now
+                             "rate": round(self.orders.rate, 1), "mine": mine})
+        if mine:
+            self.orders.rate = max(MIN_ORDER_RATE, self.orders.rate / 2)
+            self.orders.tokens = 0.0
+            self.backoff_at = now
 
     def recover(self) -> None:
         cap, _ = self.order_cap()
@@ -417,14 +443,17 @@ class LiveExchange:
             self.backoff_at = now
 
     def rate_status(self) -> dict[str, Any]:
-        """The order pace for /check and 🧾 拒单: now, the cap, the tier, the 429s of the last hour and how many of them
-        came while the bot itself sent well under the tier's allowance (something else spending the same signer's)."""
+        """The order pace for /check and 🧾 拒单: now, the cap, the tier, the 429s of the last hour, how many of them the
+        bot's own orders do not explain (`others`; of those, `unreported`: answered without the signer's rate-limit
+        state) and the latest of each kind."""
         hour = [x for x in self.limited if time.time() - x["at"] <= 3600]
         cap, _ = self.order_cap()
         tier = TIER_LIMITS.get(self.tier.lower())
+        others = [x for x in hour if not x.get("mine")]
         return {"rate": round(self.orders.rate, 1), "cap": round(cap, 1), "configured": self.configured[0], "tier": self.tier,
-                "tier_rate": tier[0] if tier else None, "limited_hour": len(hour),
-                "others": sum(1 for x in hour if x["own10"] < 0.5 * x["allowance"]), "last": hour[-1] if hour else None}
+                "tier_rate": tier[0] if tier else None, "limited_hour": len(hour), "others": len(others),
+                "unreported": sum(1 for x in others if x.get("remaining") is None),
+                "last": hour[-1] if hour else None, "last_other": others[-1] if others else None}
 
     async def start(self) -> None:
         from polymarket import ApiKeyCreds, AsyncSecureClient, RelayerApiKey
@@ -579,11 +608,11 @@ class LiveExchange:
                 continue
             self.recover()
             await self.orders.take(len(batch))
-            self.sent.append((time.monotonic(), len(batch)))
+            self.sent.append([time.monotonic(), len(batch), True])
             try:
                 responses = await self.client.post_orders([o for _, o, _ in batch])
             except RateLimitError as error:  # refused at the gate: nothing processed
-                self.note_limited(error)
+                self.note_limited(error, len(batch))
                 stopped = Placed("", "not_sent", code="rate_limited", message=f"下单被限流（429）：{error}",
                                  wait=float(error.retry_after or 10.0))
                 for spec, o, h in batch:
