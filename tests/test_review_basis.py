@@ -207,6 +207,147 @@ class ConsoleTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ch["before_hours"], ch["after_hours"])
 
 
+class ModelTest(unittest.TestCase):
+    """模型 EV 对实际盈亏: the plan (before a window starts either side wins half the time) against what happened, and
+    how much of the gap between them luck explains."""
+
+    @staticmethod
+    def model(records):
+        return journal.journal(records, T0 + 40 * 86400, 60)["model"]
+
+    def test_one_side_alone_is_all_luck_and_a_pair_is_none(self):
+        t = self.model([rec("btc", T0, 0, "down", {"up": [(100, 30)]}, shares=30)])["total"]   # 30 up at 47¢, down won
+        self.assertEqual((t["windows"], t["shares"], t["cost"], t["ev"], t["pnl"], t["diff"], t["sd"], t["z"]),
+                         (1, 30.0, 14.1, 0.9, -14.1, -15.0, 15.0, -1.0))   # worth 50¢ a share; half the stake is one deviation
+        m = self.model([rec("btc", T0, 0, "down", {"up": [(100, 30)], "down": [(90, 30)]}, shares=30)])
+        t = m["total"]
+        self.assertEqual((t["ev"], t["pnl"], t["sd"], t["z"]), (1.8, 1.8, 0.0, None))   # $1 back whatever wins
+        self.assertIn("没有运气成分", m["verdict"])
+        levels = self.model([rec("btc", T0, 0, "up", {"up": [(100, 10)]}), rec("btc", T0, 1, "up", {"down": [(80, 20)]}, price="0.40")])
+        t = levels["total"]   # one window, its levels together: 10 up and 20 down are 10 apart
+        self.assertEqual((t["windows"], t["cost"], t["ev"], t["pnl"], t["sd"], t["z"]), (1, 12.7, 2.3, -2.7, 5.0, -1.0))
+
+    def test_the_coins_of_one_start_share_their_luck(self):
+        """Two coins of one window agree four times in five (11-20 to 11-25: 81% of 36,288 pairs): 30 up on each is
+        nearer one bet of 60 than two of 30."""
+        up = {"up": [(100, 30)]}
+        same = self.model([rec("btc", T0, 0, "down", up, shares=30), rec("eth", T0, 0, "down", up, shares=30)])
+        self.assertEqual(same["total"]["sd"], 27.0)                              # sqrt(0.25 x (0.38 x 1800 + 0.62 x 3600))
+        self.assertEqual([(r["name"], r["sd"], r["z"]) for r in same["by_coin"]], [("BTC", 15.0, -1.0), ("ETH", 15.0, -1.0)])
+        self.assertEqual(same["total"]["z"], round(-30 / 27, 2))                 # together -1.11, not two times -1
+        opposite = self.model([rec("btc", T0, 0, "down", up, shares=30), rec("eth", T0, 0, "down", {"down": [(100, 30)]}, shares=30)])
+        self.assertEqual(opposite["total"]["sd"], round((0.25 * 0.38 * 1800) ** 0.5, 4))   # mostly a hedge: 13.08
+        apart = self.model([rec("btc", T0, 0, "down", up, shares=30), rec("eth", T0 + 300, 0, "down", up, shares=30)])
+        self.assertEqual(apart["total"]["sd"], round(450 ** 0.5, 4))             # another window is another toss: 21.21
+        self.assertEqual(same["rho"], journal.COIN_RHO)
+
+    def test_the_curve_steps_by_window_hour_or_day(self):
+        won = {"up": [(100, 10)]}
+        m = self.model([rec("btc", T0 + 300 * i, 0, "up", won) for i in range(3)])     # ten minutes: a point a window
+        self.assertEqual((m["step"], [(p["label"], p["pnl"], p["ev"], p["sd"]) for p in m["points"]]),
+                         (300, [(mk.hm(T0), 5.3, 0.3, 5.0), (mk.hm(T0 + 300), 10.6, 0.6, 7.07), (mk.hm(T0 + 600), 15.9, 0.9, 8.66)]))
+        m = self.model([rec("btc", T0 + 1500 * i, 0, "up", won) for i in range(60)])   # a day: a point an hour
+        self.assertEqual((m["step"], len(m["points"])), (3600, 26))   # 10:30 to 11:05 the next day: 26 hours touched
+        self.assertEqual((m["points"][0]["label"], m["points"][0]["pnl"]), (mk.hm(T0 - 1800), 10.6))   # 10:30 and 10:55 in 10:00's
+        self.assertEqual(m["points"][-1]["pnl"], round(5.3 * 60, 2))
+        m = self.model([rec("btc", T0 + 43200 * i, 0, "up", won) for i in range(20)])  # ten days: a point a (Beijing) day
+        self.assertEqual((m["step"], [p["label"] for p in m["points"]][:3], len(m["points"])), (86400, ["11-13", "11-14", "11-15"], 10))
+        self.assertEqual(m["points"][-1]["pnl"], m["total"]["pnl"])
+
+    def test_what_is_said_of_the_gap(self):
+        lost = [rec("btc", T0 + 300 * i, 0, "down", {"up": [(100, 10)]}) for i in range(40)]
+        m = self.model(lost)                                # 40 windows, the side bought never won
+        self.assertEqual((m["total"]["pnl"], m["total"]["ev"], m["total"]["z"]), (-188.0, 12.0, round(-200 / 1000 ** 0.5, 2)))
+        self.assertIn("实际比模型少 200.00 美元（-6.3σ），超出了运气能解释的范围", m["verdict"])
+        self.assertIn("吃单的人比我们知道得多", m["verdict"])
+        even = self.model([rec("btc", T0 + 300 * i, 0, "down" if i % 2 else "up", {"up": [(100, 10)]}) for i in range(40)])
+        self.assertIn("在运气能解释的范围内", even["verdict"])
+        self.assertIn("样本太少", self.model(lost[:10])["verdict"])
+        self.assertEqual(self.model([])["verdict"], "还没有已结算的成交")
+        waiting = rec("btc", T0 + 300 * 50, 0, "up", {"up": [(100, 10)]}, phase="closed")
+        m = self.model(lost + [waiting])
+        self.assertEqual((m["waiting"], m["total"]["windows"]), (1, 40))   # a fill not settled yet is in neither line
+        self.assertIn("模型对实际：模型 EV +12.00（每边按 50% 胜率），实际 -188.00。", journal.review_text(lost, T0 + 40 * 86400, 60))
+
+
+class UpdateSpanTest(unittest.IsolatedAsyncioTestCase):
+    """上次更新起: the review from the latest settings change or new version of the trading until now."""
+
+    def test_the_span_since_an_update_and_since_a_moment(self):
+        now = T0 + 6 * 3600
+        ups = [{"at": now - 3600, "kind": "改参数", "text": "网页：挂哪些币", "when": mk.hm(now - 3600)},
+               {"at": now - 86400, "kind": "版本更新", "text": "吃满的单按成交算", "when": mk.hm(now - 86400)}]
+        span, info = journal.span_from("update", "", "", now, ups)
+        self.assertEqual(span, (now - 3600, float("inf")))
+        self.assertEqual((info["range"], info["label"], info["to"]), ("update", f"上次更新（{mk.hm(now - 3600)} 改参数）以来", ""))
+        self.assertEqual([u["from"] for u in info["updates"]], ["2026-11-13T15:30", "2026-11-12T16:30"])
+        span, info = journal.span_from("update", "", "", now, [])           # none kept: everything, and it says so
+        self.assertEqual((span, info["label"]), (None, "全部（还没有更新记录）"))
+        span, info = journal.span_from("since", info["presets"]["today"]["from"], "", now, ups)   # from a moment, no end
+        self.assertEqual((span, info["label"], info["from"]), ((journal.day_start(now), float("inf")), "11-13 00:00 以来", "2026-11-13T00:00"))
+        with self.assertRaises(ValueError):
+            journal.span_from("since", "", "", now, ups)
+        self.assertNotIn("update", info["presets"])
+        span, label, rest = journal.span_args(["更新", "btc"], now, ups)    # Telegram's word for it
+        self.assertEqual((span, label, rest), ((now - 3600, float("inf")), f"上次更新（{mk.hm(now - 3600)} 改参数）以来", ["btc"]))
+        with self.assertRaisesRegex(ValueError, "还没有更新记录"):
+            journal.span_args(["更新"], now, [])
+
+    def test_versions_and_settings_changes_are_the_update_points(self):
+        from unittest import mock
+
+        from preopen import config
+        first = (("2026-11-12 09:00", "第一版"),)
+        with mock.patch.object(config, "TRADING_VERSIONS", first):
+            e, clock, pub, x = make_engine()
+            self.assertEqual([(v["id"], mk.hm(v["at"]), v["note"]) for v in e.version_log], [("2026-11-12 09:00", "11-12 09:00", "第一版")])
+            self.assertEqual([(p["kind"], p["when"], p["text"]) for p in e.update_points()], [("版本更新", "11-12 09:00", "第一版")])
+        clock.advance(3600)
+        with mock.patch.object(config, "TRADING_VERSIONS", first + (("2026-11-13 10:00", "第二版"),)):
+            e2, *_ = make_engine(ledger=e.ledger, clock=clock)   # a deploy: the new version is seen starting now
+            self.assertEqual([v["at"] for v in e2.version_log][1], float(int(clock.t)))
+            e2.settings_log.append({"at": clock.t + 60, "via": "网页", "changes": [["PREOPEN_SHARES", "10", "30"], ["PREOPEN_MARKETS", "btc,eth", "btc"]]})
+            self.assertEqual([p["kind"] for p in e2.update_points()], ["版本更新", "版本更新"])   # the change is a minute ahead
+            clock.advance(120)
+            points = e2.update_points()
+            self.assertEqual([(p["kind"], p["text"]) for p in points],
+                             [("改参数", "网页：每边份数、挂哪些币"), ("版本更新", "第二版"), ("版本更新", "第一版")])
+            e3, *_ = make_engine(ledger=e.ledger, clock=clock)   # a restart on the same version: nothing new
+            self.assertEqual(e3.version_log, e2.version_log)
+        e4, *_ = make_engine()   # the versions the list names for later than now have not happened yet
+        self.assertEqual(e4.update_points(), [])
+        self.assertEqual(len(e4.version_log), len(config.TRADING_VERSIONS))
+
+    async def test_the_page_and_telegram_review_since_the_last_update(self):
+        now = T0 + 300 * 40
+        e, clock, pub, x = make_engine(settings(**ENV), clock=Clock(now))
+        for i in range(30):
+            e.save(rec("btc", T0 + 300 * i, 0, "up" if i % 3 else "down", {"up": [(100, 10)]}))
+        c = Console(e, ENV, Path(tempfile.mkdtemp()) / "c.json", {})
+        self.assertEqual((await c.review({"range": "update"}))["span"]["label"], "全部（还没有更新记录）")
+        self.assertIn("还没有更新记录", main.review(e, ["更新"]))
+        self.assertNotIn("exp_update", str(main.export(e, []).markup))
+        changed = T0 + 300 * 20
+        e.settings_log.append({"at": changed, "via": "网页", "changes": [["PREOPEN_MARKETS", "btc,eth", "btc"]]})
+        d = await c.review({"range": "update"})
+        self.assertEqual(d["span"]["label"], f"上次更新（{mk.hm(changed)} 改参数）以来")
+        self.assertEqual((d["totals"]["range"]["quoted"], d["model"]["total"]["windows"]), (10, 10))   # windows 20 to 29
+        self.assertEqual((d["span"]["updates"][0]["kind"], d["span"]["updates"][0]["text"]), ("改参数", "网页：挂哪些币"))
+        since = await c.review({"range": "since", "from": d["span"]["updates"][0]["from"]})
+        self.assertEqual((since["totals"]["range"]["quoted"], since["span"]["label"]), (10, f"{mk.hm(changed)} 以来"))
+        name, data = await c.xlsx({"range": "update"})
+        self.assertTrue(name.startswith("复盘_上次更新") and data[:2] == b"PK")
+        reply = main.review(e, ["更新"])
+        self.assertIn(f"（上次更新（{mk.hm(changed)} 改参数）以来）", reply.text.splitlines()[0])
+        self.assertIn("模型对实际：模型 EV +3.00", reply.text)
+        self.assertEqual(reply.markup["inline_keyboard"][-1], [{"text": f"上次更新起（{mk.hm(changed)} 改参数）", "callback_data": "rev_update"}])
+        handle = main.commander(settings(**ENV), e, pub, c)
+        book = await handle("/exp_update", [])               # 📤 导出 → 上次更新起
+        self.assertTrue(book.files[0][0].startswith("复盘_上次更新"))
+        self.assertIn("模型EV", (await handle("/export", [])).text)
+        self.assertEqual((await handle("/export", ["更新"])).files[0][0], book.files[0][0])
+
+
 class MimeTest(unittest.IsolatedAsyncioTestCase):
     async def test_each_file_goes_with_its_own_type(self):
         seen = []

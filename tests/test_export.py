@@ -108,8 +108,8 @@ class WorkbookTest(unittest.TestCase):
 
     def test_every_sheet_and_the_guide(self):
         sheets, totals = self.build()
-        self.assertEqual(list(sheets), ["总览", "每日", "市场盈亏", "档位", "成交时刻", "撤单时间", "方向", "速度", "改参对比", "币种", "时段",
-                                        "成交明细", "全部报价", "拒单", "参数"])
+        self.assertEqual(list(sheets), ["总览", "每日", "模型EV", "市场盈亏", "档位", "成交时刻", "撤单时间", "方向", "速度", "改参对比", "币种",
+                                        "时段", "成交明细", "全部报价", "拒单", "参数"])
         overview = {r[0]: r[1:] for r in sheets["总览"] if r}
         self.assertEqual(overview["时间范围（按开场，北京时间）"], ["全部"])
         self.assertEqual(overview["成交场次"], ["2"])
@@ -118,6 +118,30 @@ class WorkbookTest(unittest.TestCase):
             self.assertIn(name, overview)
         self.assertIn("40¢（赢 0% < 保本 40%）", overview["亏钱的价格"][0])
         self.assertEqual((totals["filled"], totals["pnl"]), (2, -2.1))
+
+    def test_the_model_sheet_and_the_versions(self):
+        """btc yesterday: 10 up at 47¢ won and 20 down at 40¢ lost (one window: 0.5 x 30 - 12.70 expected, luck half of
+        the 10 shares apart); eth today: a pair of 10 at 47¢ (0.60 either way, no luck in it)."""
+        data, _ = export.build(self.records, self.now, 60, None, "全部", refusal_log=self.log, settings=self.settings,
+                               settings_log=self.changes, mode="模拟",
+                               versions=[{"id": "2026-11-12 09:00", "at": self.now - 86400, "note": "吃满的单按成交算"}])
+        sheets = read(data)
+        rows = sheets["模型EV"]
+        self.assertEqual(rows[0][0], "结论")
+        self.assertIn("样本太少", rows[0][1])
+        head = next(i for i, r in enumerate(rows) if r and r[0] == "币种")
+        self.assertEqual(rows[head], journal.MODEL_HEAD)
+        self.assertEqual(rows[head + 1], ["BTC", "1", "30", "12.7", "2.3", "-2.7", "-5", "5", "-1"])
+        self.assertEqual(rows[head + 2][:8], ["ETH", "1", "20", "9.4", "0.6", "0.6", "0", "0"])   # a pair: no luck, no z
+        self.assertEqual(rows[head + 3], ["合计", "2", "50", "22.1", "2.9", "-2.1", "-5", "5", "-1"])
+        curve = next(i for i, r in enumerate(rows) if r and r[0].startswith("曲线"))
+        self.assertEqual(rows[curve + 1][1:], ["-2.7", "2.3", "-7.7", "12.3"])   # the plan and two of luck's deviations
+        self.assertEqual(rows[curve + 2][1:], ["-2.1", "2.9", "-7.1", "12.9"])
+        overview = {r[0]: r[1:] for r in sheets["总览"] if r}
+        self.assertIn("模型 EV +2.90", overview["模型对实际"][0])
+        tail = sheets["参数"]
+        at = next(i for i, r in enumerate(tail) if r and r[0].startswith("交易逻辑什么时候更新的"))
+        self.assertEqual(tail[at + 1], [mk.hm(self.now - 86400), "吃满的单按成交算"])
 
     def test_the_prices_quoted(self):
         sheets, _ = self.build()

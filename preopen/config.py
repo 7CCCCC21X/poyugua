@@ -16,6 +16,16 @@ from pathlib import Path
 COINS = ("btc", "eth", "sol", "xrp", "doge", "hype", "bnb")
 MAX_LEVELS = 8           # the first level and at most seven deeper ones (a window's batch stays within two POST /orders of 15)
 MIN_SHARES = D("5")      # Polymarket's orderMinSize on these markets; a market asking more is checked again when placing
+# The versions of what the bot does with orders (not of how it shows or exports things), the latest last: when each
+# went out (Beijing time) and what changed. The review's 上次更新起 starts at the latest one or at the latest settings
+# change, whichever came last (Engine.update_points). Add a line whenever the trading itself changes;
+# tests/test_version.py fails when the trading files change and asks which it was.
+TRADING_VERSIONS: tuple[tuple[str, str], ...] = (
+    ("2026-11-22 10:58", "支持 Polymarket V2 市场"),
+    ("2026-11-25 15:08", "新市场开放后更快下单（0.2 秒问一次、签名提速）"),
+    ("2026-11-25 16:17", "开放后等一下再发第一张单（旧市场 0.6 秒、V2 3 秒），被限流后按交易所给的秒数重试"),
+    ("2026-11-25 16:59", "吃满的单（MATCHED）按成交算，另一边照常挂着，不再误暂停"),
+)
 GTD_MIN_AHEAD_S = 180    # the CLOB rejects a GTD expiration less than 3 minutes away
 GTD_THRESHOLD_S = 60     # ...and expires an order one minute before its stated expiration
 ENTRY_MARGIN_S = 30      # extra room for latency and clock skew on the stated expiration of a late placement

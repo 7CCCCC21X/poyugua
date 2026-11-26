@@ -77,17 +77,22 @@ def acquire_lock(ledger_path: str):
 
 
 REVIEW_USAGE = ("用法：/review（全部）、/review 今天、/review 昨天、/review 7（最近 7 天）、/review 11-20（那一天）、"
-                "/review 11-18 11-20（这几天）、/review btc、/review btc eth 3")
+                "/review 11-18 11-20（这几天）、/review 更新（上次改参数或更新版本以来）、/review btc、/review btc eth 3")
 EXPORT_USAGE = ("用法：/export（点按钮选时间）、/export 今天、/export 昨天、/export 7（最近 7 天）、/export 11-20、/export 11-18 11-20、"
-                "/export 全部；/export csv 7 = 旧的 CSV 文件")
-RANGE_BUTTONS = (("今天", "today"), ("昨天", "yesterday"), ("近 7 天", "7"), ("近 30 天", "30"), ("全部", "all"))
-RANGE_WORDS = {"today": "今天", "yesterday": "昨天", "all": "全部"}   # a button's callback -> the time word it stands for
+                "/export 更新（上次改参数或更新版本以来）、/export 全部；/export csv 7 = 旧的 CSV 文件")
+RANGE_BUTTONS = (("今天", "today"), ("昨天", "yesterday"), ("近 7 天", "7"), ("近 30 天", "30"), ("全部", "all"), ("上次更新起", "update"))
+RANGE_WORDS = {"today": "今天", "yesterday": "昨天", "all": "全部", "update": "更新"}   # a button's callback -> the time word it stands for
 
 
-def range_buttons(prefix: str) -> list[list[dict]]:
-    """今天 / 昨天 / 近 7 天 / 近 30 天 / 全部 as inline buttons whose callback is prefix + the range."""
-    keys = [{"text": text, "callback_data": f"{prefix}{key}"} for text, key in RANGE_BUTTONS]
-    return [keys[:3], keys[3:]]
+def range_buttons(prefix: str, engine: Engine | None = None) -> list[list[dict]]:
+    """今天 / 昨天 / 近 7 天 / 近 30 天 / 全部 / 上次更新起 as inline buttons whose callback is prefix + the range (the last
+    one says which update it starts from, and is left out while no update is kept)."""
+    keys = [{"text": text, "callback_data": f"{prefix}{key}"} for text, key in RANGE_BUTTONS if key != "update"]
+    rows = [keys[:3], keys[3:]]
+    latest = (engine.update_points(1) if engine is not None else [])[:1]
+    if latest:
+        rows.append([{"text": f"上次更新起（{latest[0]['when']} {latest[0]['kind']}）", "callback_data": f"{prefix}update"}])
+    return rows
 
 
 def review(engine: Engine, args: list[str], read: Any = None) -> Reply | str:
@@ -96,7 +101,7 @@ def review(engine: Engine, args: list[str], read: Any = None) -> Reply | str:
     event loop (Engine.review_reader), so that this runs in a thread of its own."""
     now = engine.now()
     try:
-        span, label, rest = journal.span_args(args, now)
+        span, label, rest = journal.span_args(args, now, engine.update_points())
     except ValueError as error:
         return f"{error}。{REVIEW_USAGE}"
     coins, bad = set(), []
@@ -115,7 +120,7 @@ def review(engine: Engine, args: list[str], read: Any = None) -> Reply | str:
         j = journal.journal((q for q in read(lo, hi) if not coins or q["coin"] in coins), now, engine.s.cancel_s, market_limit=0)
     text = journal.review_text([], now, engine.s.cancel_s, scope, float(engine.s.max_daily_loss_usd), j)
     rec = j["cancel"]["recommend"]   # the same recommendation as the page's (none on a tie, a thin sample, a cent)
-    rows = range_buttons("rev_")   # the same review for another time, a tap away
+    rows = range_buttons("rev_", engine)   # the same review for another time, a tap away
     if rec and not coins:  # one coin's sample is no reason to change them all
         rows = [[{"text": f"改成开场前 {journal.secs_label(rec)}撤单", "callback_data": f"set_cancel_{rec}"}]] + rows
     return Reply(text, {"inline_keyboard": rows})
@@ -133,13 +138,14 @@ def export(engine: Engine, args: list[str], read: Any = None) -> Reply:
     the refusals, the settings and their changes, a first sheet saying what each is for); /export csv [time]: the
     tables as CSV files, as before. The time as /review takes it."""
     if not args:
-        return Reply("📤 导出哪段时间的复盘数据？一个 Excel 文件，里面 12 张表：总览、每日、市场盈亏、档位、成交时刻、撤单时间、"
-                     "币种、时段、成交明细、全部报价、拒单、参数（第一张表说明每张表看什么）。",
-                     {"inline_keyboard": range_buttons("exp_")})
+        names = ["总览"] + [name for name, _ in xls.GUIDE]
+        return Reply(f"📤 导出哪段时间的复盘数据？一个 Excel 文件，里面 {len(names)} 张表：{'、'.join(names)}"
+                     "（第一张表说明每张表看什么）。要拿去复盘分析，把这个文件直接发过去就行。",
+                     {"inline_keyboard": range_buttons("exp_", engine)})
     now = engine.now()
     csv_files = args[0].lower() == "csv"
     try:
-        span, label, rest = journal.span_args(args[1:] if csv_files else args, now)
+        span, label, rest = journal.span_args(args[1:] if csv_files else args, now, engine.update_points())
     except ValueError as error:
         return Reply(f"{error}。{EXPORT_USAGE}")
     if rest:

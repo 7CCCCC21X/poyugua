@@ -29,7 +29,13 @@ TABS = ("open", "filled", "closed", "all")
 CANCEL_CHOICES = (10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 300, 420, 600, 900, 1800)   # seconds before the start
 FILL_TIMES = ((0, "开场之后（不该有）"), (15, "开场前 0～15 秒"), (30, "15～30 秒"), (60, "30～60 秒"), (120, "1～2 分钟"),
               (300, "2～5 分钟"), (900, "5～15 分钟"), (float("inf"), "15 分钟以上"))
-RANGES = {"all": "全部", "today": "今天", "yesterday": "昨天", "7d": "近 7 天", "30d": "近 30 天"}   # the review's time filter
+RANGES = {"all": "全部", "today": "今天", "yesterday": "昨天", "7d": "近 7 天", "30d": "近 30 天", "update": "上次更新起"}   # the time filter
+UPDATE_WORDS = ("更新", "上次更新", "上次更新起", "更新起", "update")   # Telegram's word for the span since the last update
+COIN_RHO = 0.62           # the coins' results of one window go together: two of them agreed in 81% of 36,288 pairs
+                          # (11-20 to 11-25, seven coins), a correlation of 0.62. The luck of a start's fills counts it.
+MODEL_MIN = 30            # settled windows with a fill before the model's comparison is called anything but thin
+MODEL_STEPS = ((12 * 3600, 300), (7 * 86400, 3600))   # the curve's points: a window each up to 12 hours, an hour each up
+                          # to 7 days, a (Beijing) day each beyond
 MARKETS_SHOWN = 500       # windows listed on the page (all of them in the CSV)
 DETAIL_SHOWN = 200        # the fills listed one by one on the page (all of them in the CSV)
 DAYS_IN_TEXT = 7          # Telegram's review: this many days, and the markets that lost and won most, this many each
@@ -113,17 +119,37 @@ def span_label(span: tuple[float, float] | None) -> str:
     return f"{mk.hm(lo)} ～ {mk.hm(hi)}"
 
 
-def span_from(name: str, frm: str, to: str, now: float) -> tuple[tuple[float, float] | None, dict[str, str]]:
-    """The page's filter (range=today|yesterday|7d|30d|all, or custom with from/to): the span and how to show it, the
-    bounds as the picker writes them. ValueError when the custom bounds are not times."""
-    name = name if name in RANGES or name == "custom" else "all"
-    span = custom_span(frm, to, now) if name == "custom" else preset_span(name, now)
+def update_label(point: dict[str, Any]) -> str:
+    """上次更新（11-25 17:00 版本更新）以来: which update a span starts from."""
+    return f"上次更新（{mk.hm(float(point['at']))} {point.get('kind') or ''}）以来".replace(" ）", "）")
+
+
+def span_from(name: str, frm: str, to: str, now: float,
+              updates: list[dict[str, Any]] | None = None) -> tuple[tuple[float, float] | None, dict[str, Any]]:
+    """The page's filter (range=today|yesterday|7d|30d|all, custom with from/to, update: since the latest update, or
+    since with from: since that moment): the span and how to show it, the bounds as the picker writes them, and the
+    update points to choose from (`updates`: Engine.update_points(), the latest first). ValueError when the bounds are
+    not times. update with no update kept is everything."""
+    name = name if name in RANGES or name in ("custom", "since") else "all"
+    updates = updates or []
+    label = ""
+    if name == "custom":
+        span: tuple[float, float] | None = custom_span(frm, to, now)
+    elif name == "since":
+        span = (parse_when(frm, now)[0], float("inf"))
+    elif name == "update":
+        span = (float(updates[0]["at"]), float("inf")) if updates else None
+        label = update_label(updates[0]) if updates else "全部（还没有更新记录）"
+    else:
+        span = preset_span(name, now)
 
     def picker(ts: float) -> str:
         return dt.datetime.fromtimestamp(ts, mk.BEIJING).strftime("%Y-%m-%dT%H:%M")
-    presets = {k: dict(zip(("from", "to"), map(picker, preset_span(k, now) or (now, now)))) for k in RANGES if k != "all"}
-    return span, {"range": name, "label": RANGES.get(name) if name not in ("custom", "all") and span else span_label(span),
-                  "from": picker(span[0]) if span else "", "to": picker(span[1]) if span else "", "presets": presets}
+    presets = {k: dict(zip(("from", "to"), map(picker, preset_span(k, now) or (now, now)))) for k in RANGES if k not in ("all", "update")}
+    label = label or (RANGES.get(name) if name not in ("custom", "since", "all") and span else span_label(span))
+    return span, {"range": name, "label": label, "from": picker(span[0]) if span else "",
+                  "to": picker(span[1]) if span and span[1] != float("inf") else "", "presets": presets,
+                  "updates": [{**u, "from": picker(float(u["at"]))} for u in updates]}
 
 
 def within(records: Iterable[dict], span: tuple[float, float] | None) -> list[dict]:
@@ -134,15 +160,23 @@ def within(records: Iterable[dict], span: tuple[float, float] | None) -> list[di
     return [q for q in records if lo <= q["start"] < hi]
 
 
-def span_args(args: list[str], now: float) -> tuple[tuple[float, float] | None, str, list[str]]:
+def span_args(args: list[str], now: float,
+              updates: list[dict[str, Any]] | None = None) -> tuple[tuple[float, float] | None, str, list[str]]:
     """Telegram's time words: 今天, 昨天, a number of days back (rolling), a date (11-20) or two (11-18 11-20, or
-    11-18~11-20). Returns the span, its label ("" for all) and the words left (the coins). ValueError on a bad date."""
+    11-18~11-20), 更新 (since the latest update: a settings change or a new version, `updates` the latest first).
+    Returns the span, its label ("" for all) and the words left (the coins). ValueError on a bad date, or on 更新
+    with no update kept."""
     span: tuple[float, float] | None = None
     label, dates, rest = "", [], []
     for a in args:
         key = a.strip().lower()
         if key in ("全部", "all"):
             span, label = None, RANGES["all"]
+            continue
+        if key in UPDATE_WORDS:
+            if not updates:
+                raise ValueError("还没有更新记录（改过参数或更新过版本以后才有）")
+            span, label = (float(updates[0]["at"]), float("inf")), update_label(updates[0])
             continue
         if key in ("今天", "today", "昨天", "yesterday"):
             name = "today" if key in ("今天", "today") else "yesterday"
@@ -377,6 +411,99 @@ class Sides:
         return out
 
 
+class Model:
+    """The settled fills against what the plan expects of them (模型 EV 对实际盈亏). The plan: before a window starts
+    its price to beat is not set, so either side is a coin's toss, and a share bought at 47¢ is worth 50¢: a window that
+    bought U up and D down shares for C dollars expects 0.5 x (U + D) - C, whatever happens. What it gets is U or D,
+    so its luck (one standard deviation) is half of |U - D|: nothing for a pair, the whole stake for one side alone.
+    The coins of one start go the same way more often than not (COIN_RHO), and so do their fills: a start's variance is
+    0.25 x ((1 - rho) x the sum of the squares of its windows' U - D + rho x the square of their sum).
+    Actual far under the plan (z below -2) is not bad luck: the side bought wins less than half the time, which is
+    what being picked off by takers who know more looks like."""
+
+    def __init__(self) -> None:
+        self.starts: list[tuple[float, float, float, float]] = []   # (start, actual, expected, variance), in start order
+        self.coins: dict[str, list[float]] = {}                     # coin -> windows, shares, cost, expected, actual, variance
+        self.waiting = 0
+
+    def add(self, start: float, windows: Iterable[dict[str, Any]]) -> None:
+        """The windows of one start (every coin's), complete."""
+        nets, expected, actual = [], 0.0, 0.0
+        for w in windows:
+            if not w["inside"] or not w["sides"]:
+                continue
+            if not w["settled"]:
+                self.waiting += 1
+                continue
+            up, down, cost = float(w["shares"].get("up", 0)), float(w["shares"].get("down", 0)), float(w["cost"])
+            ev, pnl, net = 0.5 * (up + down) - cost, float(w["payout"]) - cost, up - down
+            c = self.coins.setdefault(mk.name_of(w["q"]["coin"]), [0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            c[0] += 1
+            for i, v in enumerate((up + down, cost, ev, pnl, 0.25 * net * net), 1):
+                c[i] += v
+            nets.append(net)
+            expected += ev
+            actual += pnl
+        if nets:
+            variance = 0.25 * ((1 - COIN_RHO) * sum(n * n for n in nets) + COIN_RHO * sum(nets) ** 2)
+            self.starts.append((start, actual, expected, variance))
+
+    @staticmethod
+    def row(name: str, n: float, shares: float, cost: float, ev: float, pnl: float, variance: float) -> dict[str, Any]:
+        sd = variance ** 0.5
+        return {"name": name, "windows": int(n), "shares": round(shares, 2), "cost": round(cost, 4), "ev": round(ev, 4),
+                "pnl": round(pnl, 4), "diff": round(pnl - ev, 4), "sd": round(sd, 4),
+                "z": round((pnl - ev) / sd, 2) if sd > 0 else None}
+
+    def points(self) -> tuple[list[dict[str, Any]], int]:
+        """The curve: the running totals at the end of each step (a window, an hour or a day, by how long it spans)."""
+        if not self.starts:
+            return [], 0
+        length = self.starts[-1][0] - self.starts[0][0]
+        step = next((s for limit, s in MODEL_STEPS if length <= limit), 86400)
+
+        def key(t: float) -> float:
+            return day_start(t) if step == 86400 else t // step * step
+        out: list[dict[str, Any]] = []
+        actual = expected = variance = 0.0
+        for t, a, e, v in self.starts:
+            actual, expected, variance = actual + a, expected + e, variance + v
+            k = key(t)
+            point = {"t": k, "label": day_of(k)[5:] if step == 86400 else mk.hm(k), "pnl": round(actual, 2), "ev": round(expected, 2),
+                     "sd": round(variance ** 0.5, 2)}
+            if out and out[-1]["t"] == k:
+                out[-1] = point
+            else:
+                out.append(point)
+        return out, step
+
+    def finish(self) -> dict[str, Any]:
+        rows = [self.row(name, *c) for name, c in sorted(self.coins.items())]
+        n = sum(r["windows"] for r in rows)
+        total = self.row("合计", n, sum(c[1] for c in self.coins.values()), sum(c[2] for c in self.coins.values()),
+                         sum(e for _, _, e, _ in self.starts), sum(a for _, a, _, _ in self.starts), sum(v for *_, v in self.starts))
+        points, step = self.points()
+        return {"total": total, "by_coin": rows, "points": points, "step": step, "waiting": self.waiting,
+                "verdict": model_verdict(total), "rho": COIN_RHO}
+
+
+def model_verdict(total: dict[str, Any]) -> str:
+    """One sentence: is the gap between the plan and what happened more than luck explains?"""
+    n, z, diff = total["windows"], total["z"], total["diff"]
+    if not n:
+        return "还没有已结算的成交"
+    if z is None:
+        return f"实际 {total['pnl']:+.2f}，模型 {total['ev']:+.2f}：成交都配成了对，没有运气成分"
+    said = f"实际比模型{'多' if diff >= 0 else '少'} {abs(diff):.2f} 美元（{z:+.1f}σ）"
+    if n < MODEL_MIN:
+        return f"{said}；只有 {n} 场有成交并已结算，样本太少，先别下结论"
+    if z <= -2:
+        return f"{said}，超出了运气能解释的范围：买到的那一边赢得明显比五五开少，说明吃单的人比我们知道得多"
+    if z >= 2:
+        return f"{said}，超出了运气能解释的范围：买到的那一边赢得比五五开多"
+    return f"{said}，在运气能解释的范围内（±2σ）：还看不出比五五开好或差"
+
+
 def card_totals(records: Iterable[dict], now: float) -> dict[str, dict[str, Any]]:
     """The cards' raw totals (today, the 7 days to today, all; Beijing days by the windows' start), counted as journal()
     counts them, before _finish: additive, so the days before today can be cached and today's added afresh (a window's
@@ -453,7 +580,7 @@ def journal(records: Iterable[dict], now: float, current: int | None = None, spa
     by_lead: dict[str, dict] = {name: {"bucket": name, "fills": 0, "shares": D(0), "cost": D(0), "won": D(0)} for _, name in LEAD_BUCKETS}
     by_speed = {name: _speed_blank(name) for name in [n for _, n in SPEED] + [SPEED_LATE]}
     by_price: dict[D, dict[str, Any]] = {}
-    sides, replay = Sides(), Replay(now, current)
+    sides, replay, model = Sides(), Replay(now, current), Model()
     markets: list[tuple] = []   # compact (market_tuple): months of windows are many
     detail: collections.deque = collections.deque(maxlen=DETAIL_SHOWN)
     detail_n = 0
@@ -465,6 +592,8 @@ def journal(records: Iterable[dict], now: float, current: int | None = None, spa
 
     def close() -> None:
         """The windows of a start, complete: counted, listed, split by side, replayed; then let go."""
+        if at is not None:
+            model.add(at, windows.values())
         for w in windows.values():
             for b in w["buckets"]:
                 _count(b, w)
@@ -588,6 +717,7 @@ def journal(records: Iterable[dict], now: float, current: int | None = None, spa
         "by_price": [price_row(p, b) for p, b in sorted(by_price.items(), reverse=True)],
         "detail": list(reversed(detail)),
         "cancel": replay.finish(),
+        "model": model.finish(),
         "detail_more": max(0, detail_n - DETAIL_SHOWN),
     }
 
@@ -1065,6 +1195,38 @@ def speed_table(review: dict) -> list[list[Any]]:
         for r in review["by_speed"]]
 
 
+MODEL_HEAD = ["币种", "已结算的成交场次", "份数", "成本$", "模型 EV$（每边按 50% 胜率）", "实际盈亏$", "实际 - 模型$", "运气的一个标准差$", "z 值（σ）"]
+
+
+def model_table(review: dict) -> tuple[list[list[Any]], set[int]]:
+    """The model's comparison for the workbook: how to read it, by coin with the total, then the curve's points (the
+    running totals and the range luck explains around the plan). Returns the rows and those that title a part."""
+    m = review.get("model") or {"total": {}, "by_coin": [], "points": [], "verdict": "", "waiting": 0, "rho": COIN_RHO}
+    rows: list[list[Any]] = [["结论", m.get("verdict") or ""],
+                             ["怎么算的", "模型：开场前价格基准还没定，每一边都按 50% 胜率，一份 47¢ 买到的预期值 50¢，所以 "
+                                         "模型 EV = 0.5 ×（涨的份数 + 跌的份数）− 成本。实际 = 赢的那一边的份数 − 成本。"],
+                             ["z 值", "（实际 − 模型）÷ 运气的一个标准差。在 ±2 以内：差距是运气能解释的；低于 −2："
+                                      "买到的那一边赢得明显比五五开少（被知道方向的人吃单）；高于 +2：比五五开好。"],
+                             ["运气怎么算", f"一场只买到一边时，要么全赢要么全输，标准差 = 份数的一半；配成对的没有运气。同一场各个币的结果"
+                                           f"往往同方向（相关系数 {m.get('rho', COIN_RHO)}），合计时算进去了，所以合计的标准差比各币平方和开根号大。"],
+                             []]
+    bold = {len(rows)}
+
+    def line(r: dict) -> list[Any]:
+        return [r["name"], r["windows"], r["shares"], r["cost"], r["ev"], r["pnl"], r["diff"], r["sd"], r["z"] if r["z"] is not None else ""]
+    rows.append(MODEL_HEAD)
+    rows += [line(r) for r in m["by_coin"]]
+    if m.get("total", {}).get("windows"):
+        rows.append(line(m["total"]))
+    if m.get("waiting"):
+        rows.append([f"另有 {m['waiting']} 场有成交还没结算，没算在内"])
+    rows.append([])
+    bold.add(len(rows))
+    rows.append(["曲线（按开场时间累计）", "累计实际盈亏$", "累计模型 EV$", "运气范围下沿$（模型 − 2σ）", "运气范围上沿$（模型 + 2σ）"])
+    rows += [[p["label"], p["pnl"], p["ev"], round(p["ev"] - 2 * p["sd"], 2), round(p["ev"] + 2 * p["sd"], 2)] for p in m["points"]]
+    return rows, bold
+
+
 def changes_table(changes: list[dict]) -> list[list[Any]]:
     """Each settings change with as long a time before and after it."""
     rows: list[list[Any]] = [["改参时间（北京时间）", "怎么改的", "改了什么", "前/后", "时长（小时）", "报价场次", "成交率%", "双边率%",
@@ -1194,6 +1356,10 @@ def review_text(records: list[dict], now: float, current: int | None = None, sco
         worst = "；".join(f"{t['bucket']} {t['pnl']:+.2f}（买到的一边赢 {t['win_rate'] * 100:.0f}%，保本 {t['breakeven'] * 100:.0f}%）"
                          for t in c["losses"])
         lines.append(f"亏在哪：{worst}")
+    m = j.get("model") or {}
+    if (m.get("total") or {}).get("windows"):
+        t = m["total"]
+        lines.append(f"模型对实际：模型 EV {t['ev']:+.2f}（每边按 50% 胜率），实际 {t['pnl']:+.2f}。{m['verdict']}")
     late = "、".join(x for x in (f"{c['after_start']} 笔在开场后成交" if c["after_start"] else "",
                                  f"{c['after_cancel']} 笔在撤单确认后成交" if c["after_cancel"] else "") if x)
     if late:

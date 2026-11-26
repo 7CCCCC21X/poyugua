@@ -15,6 +15,8 @@ FILLS_KEPT = 50_000       # the 成交明细 sheet: the latest this many filled 
 
 GUIDE: tuple[tuple[str, str], ...] = (
     ("每日", "每天的成交量（份数、成交额）和盈亏：变好还是变坏；改参数前后对比（改的时间在「参数」表）"),
+    ("模型EV", "实际盈亏和模型预期（每边按 50% 胜率）的差，够不够得上「不是运气」：z 值低于 −2 说明买到的那一边赢得比五五开少；"
+               "下面是曲线的每个点（累计实际、累计模型、运气范围）"),
     ("市场盈亏", "每一场（一个币的一个 5 分钟）几档合起来的盈亏：亏得多的场次有什么共同点（币种、时段、成交时刻）"),
     ("档位", "每个价格报价多少次、成交率、买到的那一边赢的比例。赢的比例低于保本比例（=价格）的价格在亏钱：降价或去掉这一档"),
     ("成交时刻", "成交离开场多久：越靠近开场越可能是知道方向的人在吃单。哪一行赢的比例低于保本，就把撤单提前到它之前"),
@@ -27,7 +29,7 @@ GUIDE: tuple[tuple[str, str], ...] = (
     ("成交明细", "每一档的成交，含每笔成交的时刻（开场前几秒:份数），可以自己再筛选、透视"),
     ("全部报价", "每一次报价，成交没成交都有：上架后几秒、开放下单后几秒挂上（越快排队越靠前），怎么结束的"),
     ("拒单", "交易所拒单的原话和当时的情况（最近几百条）：429 多是下单太快，invalid token id 是市场刚开放"),
-    ("参数", "现在的参数，和每次改参数的时间、改了什么：对照「每日」看改完有没有变好"),
+    ("参数", "现在的参数，每次改参数的时间、改了什么，以及交易逻辑每次更新的时间：对照「每日」看改完有没有变好"),
 )
 
 
@@ -48,6 +50,10 @@ def overview(review: dict[str, Any], label: str, now: float, mode: str, quotes: 
         ["撤单时间", c["advice"]],
         ["可信度", f"{(c.get('confidence') or {}).get('level', '低')}：{'；'.join((c.get('confidence') or {}).get('notes') or [])}"],
     ]
+    model = review.get("model") or {}
+    if (model.get("total") or {}).get("windows"):
+        t = model["total"]
+        rows.append(["模型对实际", f"模型 EV {t['ev']:+.2f}（每边按 50% 胜率），实际 {t['pnl']:+.2f}。{model['verdict']}（见「模型EV」表）"])
     if c.get("losses"):
         rows.append(["亏在哪（成交时刻）", "；".join(f"{t['bucket']} {t['pnl']:+.2f}（买到的一边赢 {t['win_rate'] * 100:.0f}%，"
                                                   f"保本 {t['breakeven'] * 100:.0f}%）" for t in c["losses"])])
@@ -73,8 +79,8 @@ def changes_for(records: Any, now: float, log: list[dict], coins: list[str] | No
     return journal.change_effects(read, now, log, coins)
 
 
-def settings_sheet(values: dict[str, str], log: list[dict]) -> Sheet:
-    """The settings now, then every change kept, the latest first."""
+def settings_sheet(values: dict[str, str], log: list[dict], versions: list[dict] | None = None) -> Sheet:
+    """The settings now, then every change kept, the latest first, then the versions of the trading code."""
     labels = {k: label for k, label, _ in config.CONTROL_KEYS}
     rows: list[list[Any]] = [["参数", "现在的值", "变量名"]] + [[labels.get(k, k), v or "（空）", k] for k, v in values.items()]
     rows.append([])
@@ -85,12 +91,18 @@ def settings_sheet(values: dict[str, str], log: list[dict]) -> Sheet:
             rows.append([mk.hm(float(entry["at"])), entry.get("via") or "", labels.get(name, name), old or "（空）", new or "（空）"])
     if not log:
         rows.append(["（还没有改过：从这个版本起每次改参数都会记下来）"])
-    return Sheet("参数", rows, bold={title})
+    bold = {title}
+    if versions:
+        rows.append([])
+        bold.add(len(rows))
+        rows.append(["交易逻辑什么时候更新的（北京时间）", "改了什么"])
+        rows += [[mk.hm(float(v["at"])), v.get("note") or ""] for v in sorted(versions, key=lambda v: -float(v.get("at") or 0))]
+    return Sheet("参数", rows, bold=bold)
 
 
 def build(records: Any, now: float, current: int | None, span: tuple[float, float] | None, label: str, *,
           refusal_log: list[dict], settings: dict[str, str], settings_log: list[dict], mode: str,
-          coins: list[str] | None = None) -> tuple[bytes, dict[str, Any]]:
+          coins: list[str] | None = None, versions: list[dict] | None = None) -> tuple[bytes, dict[str, Any]]:
     """The workbook of the windows starting within `span` (all of them for None) of the coins named, and their totals.
     `records`: a list, or the engine's reader read(lo, hi, newest_first) (each part reads what it needs: the review in
     start order, the latest quotes and fills the newest first; the ledger never sits in memory whole)."""
@@ -107,9 +119,11 @@ def build(records: Any, now: float, current: int | None, span: tuple[float, floa
         changes = changes_for(records, now, settings_log, coins)
         quotes, quotes_all = journal.quotes_rows(stream(True), QUOTES_KEPT)
         fills = journal.detail_table(stream(True), FILLS_KEPT)
+        model_rows, model_bold = journal.model_table(review)
     return workbook([
         overview(review, label, now, mode, len(quotes) - 1, quotes_all, len(fills) - 1),
         Sheet("每日", journal.daily_table(review)),
+        Sheet("模型EV", model_rows, header=False, bold=model_bold),
         Sheet("市场盈亏", journal.markets_table(review)),
         Sheet("档位", journal.price_table(review)),
         Sheet("成交时刻", journal.fill_time_table(cancel)),
@@ -122,7 +136,7 @@ def build(records: Any, now: float, current: int | None, span: tuple[float, floa
         Sheet("成交明细", fills),
         Sheet("全部报价", quotes),
         Sheet("拒单", refusals.table(refusal_log, span)),
-        settings_sheet(settings, settings_log),
+        settings_sheet(settings, settings_log, versions),
     ]), review["totals"]["range"]
 
 
@@ -133,5 +147,5 @@ def from_engine(engine: Any, span: tuple[float, float] | None, label: str, read:
     now = engine.now()
     data, totals = build(read, now, engine.s.cancel_s, span, label, refusal_log=list(engine.refusal_log),
                          settings=config.current_values(engine.s), settings_log=list(engine.settings_log), mode=engine.s.mode(),
-                         coins=coins)
+                         coins=coins, versions=list(getattr(engine, "version_log", [])))
     return file_name(label, now), data, totals

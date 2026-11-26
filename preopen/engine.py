@@ -258,6 +258,7 @@ class Engine:
         except ValueError:
             pass
         self.note_settings(settings, "重启后（Railway 变量或网页设置）")
+        self.version_log: list[dict[str, Any]] = self.read_versions()
         for q in ledger.rows.values():
             self._index(q)
 
@@ -1816,6 +1817,42 @@ class Engine:
                 self.ledger.put("settings_log", json.dumps(list(self.settings_log), ensure_ascii=False))
         if before != values:
             self.ledger.put("settings_now", json.dumps(values, ensure_ascii=False))
+
+    def read_versions(self) -> list[dict[str, Any]]:
+        """The versions of the trading code (config.TRADING_VERSIONS) this ledger has run under, each with when it began
+        here, kept the first time it is seen: that moment for a new one; for the ones already out when the log began,
+        the time the list names (when they went out: nobody wrote down when they first ran here)."""
+        try:
+            log = json.loads(self.ledger.get("version_log") or "[]")
+        except ValueError:
+            log = []
+        log = [e for e in log if isinstance(e, dict) and e.get("id") and e.get("at")] if isinstance(log, list) else []
+        known = {e["id"] for e in log}
+        fresh = [(when, note) for when, note in config.TRADING_VERSIONS if when not in known]
+        if not fresh:
+            return log
+        newest, begun = config.TRADING_VERSIONS[-1][0], bool(log)
+        for when, note in fresh:
+            went_out = mk.dt.datetime.strptime(when, "%Y-%m-%d %H:%M").replace(tzinfo=mk.BEIJING).timestamp()
+            first_seen = self.now() if begun and when == newest else went_out   # a new one, seen starting right now
+            log.append({"id": when, "at": float(int(max(first_seen, went_out))), "note": note})
+        log.sort(key=lambda e: float(e["at"]))
+        self.ledger.put("version_log", json.dumps(log, ensure_ascii=False))
+        return log
+
+    def update_points(self, limit: int = 12) -> list[dict[str, Any]]:
+        """The moments the bot was changed, the latest first: a settings change (how, and which settings) or a new version
+        of the trading code (what changed). The review's 上次更新起 starts at the first one; the page lists the others to
+        start from instead."""
+        labels = {k: label for k, label, _ in config.CONTROL_KEYS}
+        points = [{"at": float(e["at"]), "kind": "版本更新", "text": str(e.get("note") or "")} for e in self.version_log]
+        for e in self.settings_log:
+            if e.get("changes"):
+                names = "、".join(dict.fromkeys(labels.get(c[0], c[0]) for c in e["changes"]))
+                points.append({"at": float(e["at"]), "kind": "改参数", "text": f"{e.get('via') or ''}：{names}".lstrip("：")})
+        now = self.now()
+        points = sorted((p for p in points if p["at"] <= now), key=lambda p: -p["at"])[:limit]
+        return [{**p, "when": mk.hm(p["at"])} for p in points]
 
     def apply_settings(self, new: Settings, via: str = "网页") -> int:
         """New settings in force at once (the web console): a resting record that no longer fits them is withdrawn and

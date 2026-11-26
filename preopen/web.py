@@ -236,8 +236,8 @@ PAGE = r"""<!doctype html>
 <title>预挂控制台</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
-:root { --bg:#f6f7f9; --card:#fff; --text:#16181d; --muted:#6b7280; --line:#e5e7eb; --accent:#2563eb; --good:#15803d; --bad:#b91c1c; --warn:#b45309; --chip:#eef2ff; }
-@media (prefers-color-scheme: dark) { :root { --bg:#0f1115; --card:#181b21; --text:#e8eaee; --muted:#9aa1ad; --line:#2a2f38; --accent:#5b8cff; --good:#4ade80; --bad:#f87171; --warn:#fbbf24; --chip:#1f2a44; } }
+:root { --bg:#f6f7f9; --card:#fff; --text:#16181d; --muted:#6b7280; --line:#e5e7eb; --accent:#2563eb; --good:#15803d; --bad:#b91c1c; --warn:#b45309; --chip:#eef2ff; --series2:#f47230; }
+@media (prefers-color-scheme: dark) { :root { --bg:#0f1115; --card:#181b21; --text:#e8eaee; --muted:#9aa1ad; --line:#2a2f38; --accent:#5b8cff; --good:#4ade80; --bad:#f87171; --warn:#fbbf24; --chip:#1f2a44; --series2:#e76624; } }
 * { box-sizing:border-box; }
 [hidden] { display:none !important; }
 body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif; }
@@ -287,6 +287,7 @@ select { font:inherit; padding:5px 8px; border-radius:8px; border:1px solid var(
 .frow .chips { margin-bottom:0; }
 .frow input { padding:5px 8px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--text); font:inherit; min-width:0; }
 #jCustom { margin-top:8px; }
+#jUpdateRow { flex-wrap:nowrap; } #jUpdates { flex:1 1 0; min-width:0; max-width:100%; text-overflow:ellipsis; }
 .tall { max-height:480px; overflow:auto; } .tall th { position:sticky; top:0; background:var(--card); }
 #jBody.busy { opacity:.55; transition:opacity .2s; }
 .chart { position:relative; outline:none; } .chart:focus-visible { box-shadow:0 0 0 2px var(--accent); border-radius:8px; }
@@ -296,6 +297,12 @@ select { font:inherit; padding:5px 8px; border-radius:8px; border:1px solid var(
 .chart .pdot { fill:var(--accent); stroke:var(--card); stroke-width:2; } .chart .cross { stroke:var(--muted); stroke-width:1; }
 .ctip { position:absolute; top:4px; min-width:170px; padding:6px 9px; border-radius:8px; background:var(--card); border:1px solid var(--line); box-shadow:0 2px 10px rgba(0,0,0,.12); pointer-events:none; }
 .ctip .tv { font-weight:600; } .ctip .tl { color:var(--muted); font-size:12px; }
+.chart .mline { fill:none; stroke:var(--series2); stroke-width:2; stroke-linejoin:round; stroke-linecap:round; }
+.chart .mband { fill:var(--series2); opacity:.12; } .chart .mdot { fill:var(--series2); stroke:var(--card); stroke-width:2; }
+.legend { display:flex; flex-wrap:wrap; gap:4px 16px; font-size:12px; color:var(--muted); margin:4px 0 6px; }
+.key { display:inline-block; width:16px; border-top:2px solid var(--accent); vertical-align:middle; margin-right:6px; }
+.key.m { border-top-color:var(--series2); } .key.band { height:10px; border:0; border-radius:2px; background:var(--series2); opacity:.25; }
+.ctip .tr { display:flex; align-items:center; gap:0; } .ctip .tr b { margin-right:6px; }
 .change { padding:8px 0; border-bottom:1px solid var(--line); } .change table { margin-top:4px; }
 tr.cur td { background:var(--chip); } h3.small { font-size:13px; margin:12px 0 6px; display:flex; gap:10px; align-items:baseline; }
 a.mlink { color:inherit; text-decoration:none; border-bottom:1px dotted var(--muted); }
@@ -355,13 +362,20 @@ a.mlink { color:inherit; text-decoration:none; border-bottom:1px dotted var(--mu
       <section>
         <div class="frow"><b>时间</b><span class="chips" id="jRanges"></span></div>
         <div class="frow" id="jCustom" hidden><input type="datetime-local" id="jFrom" aria-label="开始"><span>～</span><input type="datetime-local" id="jTo" aria-label="结束"><button class="small" id="jApply">筛选</button></div>
+        <div class="frow" id="jUpdateRow" style="margin-top:6px" hidden><b>更新</b><select id="jUpdates" aria-label="从哪一次更新开始看"></select></div>
         <div class="frow" style="margin-top:6px"><b>币种</b><span class="chips" id="jCoins"></span></div>
-        <p class="muted small" style="margin:6px 0 0">按开场时间（北京时间）和币种筛选：下面所有内容和导出的文件都只算这些场次；上面三张卡片是全部记录，不受影响。<span id="jBusy"></span></p>
+        <p class="muted small" style="margin:6px 0 0">按开场时间（北京时间）和币种筛选：下面所有内容和导出的文件都只算这些场次；上面三张卡片是全部记录，不受影响。「上次更新起」= 最近一次改参数或交易逻辑更新到现在，想从更早的某一次看起就在「更新」里选。<span id="jBusy"></span></p>
       </section>
       <div id="jBody">
       <div class="cards" id="jRange"></div>
       <section id="jChartBox" hidden><h2>累计盈亏（已结算，按开场日）</h2><div id="jChart" class="chart" tabindex="0" aria-label="累计盈亏图，左右方向键看每一天"></div>
         <p class="muted small">每一天的数字在下面「按日期」表里。</p></section>
+      <section id="jModelBox" hidden><h2>模型 EV 对实际盈亏（已结算，按开场时间累计）</h2><p id="jModelVerdict"></p>
+        <div class="legend" id="jModelLegend"></div>
+        <div id="jModel" class="chart" tabindex="0" aria-label="模型 EV 对实际盈亏图，左右方向键看每个点"></div>
+        <div class="scroll"><table id="jModelCoin"></table></div>
+        <details><summary>曲线每个点的数字</summary><div class="scroll tall"><table id="jModelPoints"></table></div></details>
+        <p class="muted small" id="jModelNote"></p></section>
       <div class="ops"><button id="xlsxAll">导出 Excel（全部表）</button><button class="secondary" id="csvMarkets">导出市场盈亏 CSV</button><button class="secondary" id="csvDaily">导出每日汇总 CSV</button><button class="secondary" id="csvDetail">导出成交明细 CSV</button><button class="secondary" id="csvQuotes">导出全部报价 CSV</button><button class="secondary" id="csvCancel">导出撤单时间复盘 CSV</button></div>
       <section><h2>撤单时间回放：开场前几秒撤单最好</h2><p id="cAdvice"></p><p class="small" id="cConf"></p><div class="scroll"><table id="cRows"></table></div>
         <p class="muted small" id="cNote"></p></section>
@@ -607,7 +621,7 @@ async function loadOrders() {
 $("coinFilter").onchange = () => { state.coin = $("coinFilter").value; store.set("coin", state.coin); loadOrders(); };
 
 // ---- 复盘
-const RANGES = [["all", "全部"], ["today", "今天"], ["yesterday", "昨天"], ["7d", "近 7 天"], ["30d", "近 30 天"], ["custom", "自定义"]];
+const RANGES = [["all", "全部"], ["today", "今天"], ["yesterday", "昨天"], ["7d", "近 7 天"], ["30d", "近 30 天"], ["update", "上次更新起"], ["custom", "自定义"]];
 const MSORT = [["time", "按时间"], ["loss", "亏最多"], ["gain", "赚最多"]];
 const shares = (v) => v == null ? "—" : String(Math.round(Number(v) * 100) / 100);
 const plus = (v) => v == null ? "—" : `<span class="${v >= 0 ? "good" : "bad"}">${v >= 0 ? "+" : "-"}${Math.abs(Number(v)).toFixed(2)}</span>`;
@@ -620,6 +634,7 @@ function jQuery(f) {
   f = f || jWant();
   const p = new URLSearchParams({range: f.range});
   if (f.range === "custom") { p.set("from", f.from || ""); p.set("to", f.to || ""); }
+  if (f.range === "since") p.set("from", f.from || "");   // from that moment on (an earlier update chosen)
   if (f.coins && f.coins.length) p.set("coins", f.coins.join(","));
   if (f.sort && f.sort !== "time") p.set("sort", f.sort);
   return p.toString();
@@ -639,6 +654,21 @@ function renderFilters(info) {
       $("jCustom").dataset.open = "1"; $("jCustom").hidden = false; return;
     }
     $("jCustom").dataset.open = ""; loadJournal({range: k});
+  };
+  // the update points (a settings change, a new version of the trading), the latest first: 上次更新起 is the first one
+  const ups = (info && info.updates) || [], sel = $("jUpdates");
+  $("jUpdateRow").hidden = !ups.length;
+  sel.replaceChildren();
+  const opt = (value, text) => { const o = document.createElement("option"); o.value = value; o.textContent = text; sel.appendChild(o); return o; };
+  opt("", "从某一次更新开始看…");
+  ups.forEach((u, i) => opt(String(i), `${u.when} ${u.kind}${u.text ? "：" + u.text : ""}`));
+  const chosen = state.jRange === "update" ? 0 : state.jRange === "since" ? ups.findIndex((u) => u.from === state.jFrom) : -1;
+  sel.value = chosen >= 0 ? String(chosen) : "";
+  sel.onchange = () => {
+    if (sel.value === "") return;
+    const i = Number(sel.value);
+    $("jCustom").dataset.open = "";
+    loadJournal(i === 0 ? {range: "update"} : {range: "since", from: ups[i].from});
   };
   const coins = ((state.report && state.report.coins) || []).map((c) => c.toLowerCase());
   for (const c of state.jCoins) if (!coins.includes(c)) coins.push(c);
@@ -721,8 +751,95 @@ function renderChart() {
   box.onblur = hide;
   box.onkeydown = (ev) => { if (ev.key === "ArrowLeft" || ev.key === "ArrowRight") { ev.preventDefault(); show((at < 0 ? data.length - 1 : at) + (ev.key === "ArrowLeft" ? -1 : 1)); } };
 }
+// the plan against what happened: two lines on one axis (dollars), the range luck explains around the plan as a wash.
+// Identity is never the colour alone: a legend, the lines' ends labelled, every number in the tables under it.
+const usd = (v) => (v >= 0 ? "+$" : "-$") + Math.abs(v).toFixed(2);
+function renderModel() {
+  const M = state.journal && state.journal.model, box = $("jModel");
+  const has = !!(M && M.total && M.total.windows);
+  $("jModelBox").hidden = !has;
+  if (!has) return;
+  const T = M.total, sigma = (z) => z == null ? "—" : `<span class="${z <= -2 ? "bad" : z >= 2 ? "good" : ""}">${z >= 0 ? "+" : "-"}${Math.abs(z).toFixed(1)}σ</span>`;
+  $("jModelVerdict").innerHTML = "<b>结论：" + esc(M.verdict) + "</b>";
+  table("jModelCoin", ["币种", "实际盈亏", "模型 EV", "实际 − 模型", "z 值", "成交场次", "份数", "成本"], M.by_coin.concat(M.by_coin.length > 1 ? [T] : []).map((r) =>
+    `<tr${r === T ? ' class="cur"' : ""}><td>${esc(r.name)}</td><td>${signed(r.pnl)}</td><td>${signed(r.ev)}</td><td>${signed(r.diff)}</td><td>${sigma(r.z)}</td><td>${r.windows}</td><td>${shares(r.shares)}</td><td>${money(r.cost)}</td></tr>`));
+  $("jModelNote").textContent = "模型：开场前这一场的价格基准还没定，每一边按 50% 胜率，47¢ 买到的一份预期值 50¢，所以模型 EV = 0.5 ×（涨的份数 + 跌的份数）− 成本。" +
+    "阴影是运气能解释的范围（模型 ±2σ；一场只买到一边时要么全赢要么全输，同一场各个币的结果又往往同方向，都算进去了）。" +
+    "实际曲线在阴影里：和五五开分不出差别；掉到阴影下面（z 值低于 −2）：买到的那一边赢得比五五开少，是被知道方向的人吃了单。" +
+    (M.waiting ? `另有 ${M.waiting} 场有成交还没结算，没算在内。` : "");
+  const step = M.step === 300 ? "每场一个点" : M.step === 3600 ? "每小时一个点" : "每天一个点";
+  table("jModelPoints", ["开场时间（" + step + "）", "累计实际", "累计模型 EV", "运气范围（模型 ±2σ）"], M.points.map((p) =>
+    `<tr><td>${esc(p.label)}</td><td>${signed(p.pnl)}</td><td>${signed(p.ev)}</td><td>${money(p.ev - 2 * p.sd)} ～ ${money(p.ev + 2 * p.sd)}</td></tr>`));
+  const legend = $("jModelLegend"); legend.replaceChildren();
+  for (const [cls, text] of [["key", "实际盈亏"], ["key m", "模型 EV（每边按 50% 胜率）"], ["key band", "运气范围（模型 ±2σ）"]]) {
+    const item = document.createElement("span"), k = document.createElement("i"); k.className = cls;
+    item.appendChild(k); item.appendChild(document.createTextNode(text)); legend.appendChild(item);
+  }
+  const data = [{label: "开始", pnl: 0, ev: 0, sd: 0}].concat(M.points);
+  const last = data[data.length - 1], endA = usd(last.pnl), endE = usd(last.ev);
+  const W = Math.max(280, box.clientWidth || 600), H = 220, L = 52, R = 16 + Math.max(endA.length, endE.length) * 7.5, Tp = 12, B = 26;
+  const ys = data.flatMap((p) => [p.pnl, p.ev - 2 * p.sd, p.ev + 2 * p.sd]).concat([0]);
+  let lo = Math.min(...ys), hi = Math.max(...ys);
+  const tick = niceStep((hi - lo) / 4 || 1);
+  lo = Math.floor(lo / tick) * tick; hi = Math.ceil(hi / tick) * tick; if (hi === lo) hi = lo + tick;
+  const x = (i) => L + (W - L - R) * (i / (data.length - 1)), y = (v) => Tp + (H - Tp - B) * (1 - (v - lo) / (hi - lo));
+  const ns = "http://www.w3.org/2000/svg", svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.setAttribute("width", "100%"); svg.setAttribute("height", H); svg.setAttribute("role", "img");
+  const el = (tag, attrs, text) => { const e = document.createElementNS(ns, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); if (text != null) e.textContent = text; svg.appendChild(e); return e; };
+  for (let v = lo; v <= hi + tick / 2; v += tick) {
+    el("line", {x1: L, x2: W - R, y1: y(v), y2: y(v), class: Math.abs(v) < tick / 2 ? "axis0" : "grid"});
+    el("text", {x: L - 6, y: y(v) + 4, "text-anchor": "end", class: "tick"}, tickText(Math.abs(v) < tick / 2 ? 0 : v));
+  }
+  const ticks = data.length > 3 ? [1, Math.floor(data.length / 2), data.length - 1] : [data.length - 1];
+  for (const i of ticks) el("text", {x: x(i), y: H - 6, "text-anchor": i === data.length - 1 ? "end" : i === 1 ? "start" : "middle", class: "tick"}, data[i].label);
+  const path = (f) => data.map((p, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(f(p)).toFixed(1)}`).join("");
+  el("path", {d: path((p) => p.ev + 2 * p.sd) + data.slice().reverse().map((p, i) => `L${x(data.length - 1 - i).toFixed(1)},${y(p.ev - 2 * p.sd).toFixed(1)}`).join("") + "Z", class: "mband"});
+  el("path", {d: path((p) => p.ev), class: "mline"});
+  el("path", {d: path((p) => p.pnl), class: "pline"});
+  const xe = x(data.length - 1), apart = Math.abs(y(last.pnl) - y(last.ev)) >= 14;   // ends too close: the legend and the table name the plan's
+  el("circle", {cx: xe, cy: y(last.ev), r: 4, class: "mdot"});
+  el("circle", {cx: xe, cy: y(last.pnl), r: 4, class: "pdot"});
+  if (apart) el("text", {x: xe + 8, y: y(last.ev) + 4, class: "plabel"}, endE);
+  el("text", {x: xe + 8, y: y(last.pnl) + 4, class: "plabel"}, endA);
+  const cross = el("line", {x1: 0, x2: 0, y1: Tp, y2: H - B, class: "cross", visibility: "hidden"});
+  const markE = el("circle", {cx: 0, cy: 0, r: 4, class: "mdot", visibility: "hidden"});
+  const markA = el("circle", {cx: 0, cy: 0, r: 4, class: "pdot", visibility: "hidden"});
+  const hit = el("rect", {x: L, y: Tp, width: W - L - R, height: H - Tp - B, fill: "transparent"});
+  box.replaceChildren(svg);
+  const tip = document.createElement("div"); tip.className = "ctip"; tip.hidden = true; box.appendChild(tip);
+  let at = -1;
+  const show = (i) => {
+    at = Math.max(0, Math.min(data.length - 1, i)); const p = data[at];
+    cross.setAttribute("x1", x(at)); cross.setAttribute("x2", x(at)); cross.setAttribute("visibility", "visible");
+    markA.setAttribute("cx", x(at)); markA.setAttribute("cy", y(p.pnl)); markA.setAttribute("visibility", "visible");
+    markE.setAttribute("cx", x(at)); markE.setAttribute("cy", y(p.ev)); markE.setAttribute("visibility", "visible");
+    tip.replaceChildren();
+    const row = (cls, value, name) => {
+      const d = document.createElement("div"); d.className = "tr";
+      if (cls) { const k = document.createElement("i"); k.className = cls; d.appendChild(k); }
+      const b = document.createElement("b"); b.textContent = value; d.appendChild(b);
+      const n = document.createElement("span"); n.className = "tl"; n.textContent = name; d.appendChild(n); tip.appendChild(d);
+    };
+    row("key", usd(p.pnl), "实际");
+    row("key m", usd(p.ev), "模型 EV");
+    row("", usd(p.pnl - p.ev), "实际 − 模型" + (p.sd > 0 ? `（${((p.pnl - p.ev) / p.sd).toFixed(1)}σ）` : ""));
+    const foot = document.createElement("div"); foot.className = "tl";
+    foot.textContent = `到 ${p.label}；运气范围 ${money(p.ev - 2 * p.sd)} ～ ${money(p.ev + 2 * p.sd)}`; tip.appendChild(foot);
+    tip.hidden = false;
+    tip.style.left = Math.min(Math.max(0, x(at) / W * box.clientWidth - 100), Math.max(0, box.clientWidth - 230)) + "px";
+  };
+  const hide = () => { for (const m of [cross, markA, markE]) m.setAttribute("visibility", "hidden"); tip.hidden = true; };
+  hit.addEventListener("pointermove", (ev) => {
+    const r = svg.getBoundingClientRect(), px = (ev.clientX - r.left) / r.width * W;
+    show(Math.round((px - L) / ((W - L - R) / (data.length - 1))));
+  });
+  hit.addEventListener("pointerleave", hide);
+  box.onfocus = () => show(at < 0 ? data.length - 1 : at);
+  box.onblur = hide;
+  box.onkeydown = (ev) => { if (ev.key === "ArrowLeft" || ev.key === "ArrowRight") { ev.preventDefault(); show((at < 0 ? data.length - 1 : at) + (ev.key === "ArrowLeft" ? -1 : 1)); } };
+}
 let chartTimer = null;
-window.addEventListener("resize", () => { clearTimeout(chartTimer); chartTimer = setTimeout(renderChart, 200); });
+window.addEventListener("resize", () => { clearTimeout(chartTimer); chartTimer = setTimeout(() => { renderChart(); if (state.journal) renderModel(); }, 200); });
 
 function renderMarkets() {
   const d = state.journal; if (!d) return;
@@ -758,9 +875,9 @@ function renderChanges(list) {
     stat("改之前", c.before_hours, c.before) + stat("改之后", c.after_hours, c.after) + "</table></div></div>").join("") +
     '<p class="muted">按开场时间分前后，两段一样长（改之前不早于上一次改参）；改之后的时间短、场次少时先别下结论。</p>';
   for (const el of box.querySelectorAll("[data-since]")) el.onclick = () => {
-    const c = list[Number(el.dataset.since)], P = (state.journal.span && state.journal.span.presets) || {};
+    const c = list[Number(el.dataset.since)];
     const from = new Date((c.at + 8 * 3600) * 1000).toISOString().slice(0, 16);   // Beijing, as the picker writes it
-    loadJournal({range: "custom", from, to: (P.today && P.today.to) || from});
+    loadJournal({range: "since", from});   // from this change on, with no end: tomorrow's windows are in it too
   };
 }
 function renderReplay(C) {
@@ -797,6 +914,7 @@ function renderJournal() {
     card("待结算场次", String(R.open), `双边 ${R.both} 场，双边率 ${pct(R.both_rate)}`) +
     card("成交量", `${shares(R.shares)} 份`, `成交额 ${money(R.volume)}`);
   renderChart();
+  renderModel();
   renderReplay(d.cancel || {});
   table("jPrice", ["挂价", "盈亏", "赢的比例 / 保本", "成交率", "报价次数", "双边", "成交份数", "第几档"], d.by_price.map((x) =>
     `<tr><td>${x.filled ? `<a class="link" data-price="${x.price}">${x.price}¢ 看场次</a>` : x.price + "¢"}</td><td>${signed(x.pnl)}</td>` +
@@ -844,6 +962,7 @@ async function loadJournal(next, force) {
     state.jAt = Date.now();
     state.jRange = want.range; store.set("jRange", want.range);
     if (want.range === "custom") { state.jFrom = want.from; state.jTo = want.to; store.set("jFrom", want.from); store.set("jTo", want.to); }
+    if (want.range === "since") { state.jFrom = want.from; store.set("jFrom", want.from); }
     state.jCoins = want.coins; store.set("jCoins", want.coins.join(","));
     state.mSort = want.sort; store.set("mSort", want.sort);
     const text = JSON.stringify(r.data);

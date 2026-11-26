@@ -66,11 +66,13 @@ class Console:
                 return journal.orders(read(), tab, coin.lower().strip(), now, limit)
         return await asyncio.to_thread(work)
 
-    def span(self, query: dict[str, str] | None) -> tuple[tuple[float, float] | None, dict[str, str]]:
-        """The review's time filter from the page: range=today|yesterday|7d|30d|all, or custom with from/to (Beijing
-        time, by the windows' start). ValueError for custom bounds that are not times."""
+    def span(self, query: dict[str, str] | None) -> tuple[tuple[float, float] | None, dict[str, Any]]:
+        """The review's time filter from the page: range=today|yesterday|7d|30d|all, custom with from/to, update (since
+        the latest settings change or new version) or since with from (Beijing time, by the windows' start). ValueError
+        for bounds that are not times."""
         q = query or {}
-        return journal.span_from(str(q.get("range") or "all"), str(q.get("from") or ""), str(q.get("to") or ""), self.engine.now())
+        return journal.span_from(str(q.get("range") or "all"), str(q.get("from") or ""), str(q.get("to") or ""), self.engine.now(),
+                                 self.engine.update_points())
 
     @staticmethod
     def coins(query: dict[str, str] | None) -> list[str]:
@@ -121,7 +123,7 @@ class Console:
         coins = self.coins(query)
         how = str((query or {}).get("sort") or "time")
         how = how if how in ("time", "loss", "gain") else "time"
-        key = ("review", info["range"], info["from"], info["to"], tuple(coins), how)
+        key = ("review", info["range"], info["from"], info["to"], tuple(coins), how)   # 上次更新起 moves: its start is in the key
         hit = self._reviews.get(key)
         if hit and time.monotonic() - hit[0] < REVIEW_CACHE_S:
             return hit[1]

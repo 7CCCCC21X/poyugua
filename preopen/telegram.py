@@ -33,8 +33,8 @@ BUTTONS = {  # keyboard button text -> command
     "🧾 拒单": "/rejects",
 }
 COMMANDS = [("status", "状态"), ("check", "体检"), ("probe", "只读探测接下来的场次"), ("web", "打开网页控制台"),
-            ("pause", "暂停并撤掉全部挂单"), ("resume", "恢复挂单"), ("review", "复盘：/review 今天、/review 昨天、/review 7（最近 7 天）、/review 11-18 11-20、/review btc"),
-            ("export", "导出复盘 Excel（点按钮选时间）：/export 昨天、/export 7、/export 11-18 11-20；/export csv = CSV 文件"),
+            ("pause", "暂停并撤掉全部挂单"), ("resume", "恢复挂单"), ("review", "复盘：/review 今天、/review 昨天、/review 7（最近 7 天）、/review 11-18 11-20、/review 更新（上次更新起）、/review btc"),
+            ("export", "导出复盘 Excel（点按钮选时间）：/export 昨天、/export 7、/export 11-18 11-20、/export 更新（上次更新起）；/export csv = CSV 文件"),
             ("rejects", "拒单：真实原因、证据和现场检测（/rejects 1 = 最近 1 小时）"), ("help", "说明和按钮")]
 CONFIRM_PAUSE = "pause!"  # callback data of the inline 确认 button: the handler is asked "/pause!"
 REPORT_BUTTONS = ("set_", "chk_", "exp_", "rev_")   # buttons under a report: the report stays, the answer comes after it
