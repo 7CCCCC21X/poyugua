@@ -115,6 +115,11 @@ class Telegram:
         if not result.get("ok"):
             raise RuntimeError(f"Telegram sendDocument: {result.get('description')}")
 
+    def scrub(self, error: Any) -> str:
+        """An error's words without the bot token (it is in every request's URL, which an error may quote)."""
+        text = str(error)
+        return text.replace(self.token, "<TELEGRAM_BOT_TOKEN>") if self.token else text
+
     async def _post(self, method: str, **payload: Any) -> Any:
         r = await self.http.post(f"{API}/bot{self.token}/{method}", json=payload)
         data = r.json()
@@ -133,7 +138,7 @@ class Telegram:
                       if self.web_url.startswith("https://") else {"type": "commands"})
             await self._post("setChatMenuButton", chat_id=self.chat(), menu_button=button)
         except Exception as error:  # the buttons are a convenience: the bot runs without them
-            LOG.warning("Telegram 菜单设置失败：%s", error)
+            LOG.warning("Telegram 菜单设置失败：%s", self.scrub(error))
 
     async def sender(self) -> None:
         while True:
@@ -149,7 +154,7 @@ class Telegram:
                         await self._post("sendMessage", **payload)
                     break
                 except Exception as error:
-                    LOG.warning("Telegram 发送失败（第 %d 次）：%s", attempt + 1, error)
+                    LOG.warning("Telegram 发送失败（第 %d 次）：%s", attempt + 1, self.scrub(error))
                     await asyncio.sleep(3 * (attempt + 1))
             await asyncio.sleep(1.0)
 
@@ -210,7 +215,7 @@ class Telegram:
             elif mine and msg.get("message_id"):
                 await self._post("editMessageText", chat_id=self.chat(), message_id=msg["message_id"], text=result[:MAX_LEN])
         except Exception as error:
-            LOG.warning("Telegram 按钮应答失败：%s", error)
+            LOG.warning("Telegram 按钮应答失败：%s", self.scrub(error))
 
     async def commands(self, handle: Handler) -> None:
         while True:
@@ -218,7 +223,7 @@ class Telegram:
                 updates = await self._post("getUpdates", offset=self.offset, timeout=30,
                                            allowed_updates=["message", "callback_query"])
             except Exception as error:
-                LOG.warning("Telegram 收消息失败：%s", error)
+                LOG.warning("Telegram 收消息失败：%s", self.scrub(error))
                 await asyncio.sleep(10)
                 continue
             for u in updates or []:

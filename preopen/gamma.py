@@ -127,7 +127,15 @@ class PublicApi:
         async def gated(chunk: list[str], version: str) -> None:
             async with gate:
                 await one(chunk, version)
-        await asyncio.gather(*(gated(c, v) for c in chunks for v in VERSIONS))
+        answers = await asyncio.gather(*(gated(c, v) for c in chunks for v in VERSIONS), return_exceptions=True)
+        failed = [a for a in answers if isinstance(a, BaseException)]
+        if failed:  # one request of many failing no longer throws away what the others read (audit 11-27): the slugs
+            # of a failed request are simply not found this time, and asked again at the next poll. A throttle, a
+            # cancellation, or every request failing is still raised.
+            stop = next((a for a in failed if isinstance(a, (PublicThrottled, asyncio.CancelledError))), None)
+            if stop is not None or len(failed) == len(answers):
+                raise stop or failed[0]
+            LOG.info("市场列表：%d/%d 个请求失败（%s），这次只用读到的", len(failed), len(answers), failed[0])
         return out
 
     async def market(self, slug: str) -> dict | None:

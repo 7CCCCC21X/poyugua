@@ -107,7 +107,7 @@ def review(engine: Engine, args: list[str], read: Any = None) -> Reply | str:
     coins, bad = set(), []
     for a in rest:
         key = a.lower().strip()
-        if key in config.COINS:
+        if key in config.COINS or key in engine.s.coins:
             coins.add(key)
         else:
             bad.append(a)
@@ -212,7 +212,7 @@ def commander(settings: config.Settings, engine: Engine, pub: PublicApi, console
                 hours = float(args[0]) if args else 1.0
             except ValueError:
                 hours = 1.0
-            return await probe(settings, pub, hours=max(0.1, min(hours, 24.0)))
+            return await probe(engine.s, pub, hours=max(0.1, min(hours, 24.0)))   # the settings in force (the page's too)
         if cmd == "/web":
             if settings.web_url.startswith("https://") and settings.web_port:
                 return Reply("点下面的按钮在 Telegram 里打开控制台（也可以用左下角的菜单按钮）。"
@@ -304,9 +304,11 @@ def offline_status(settings: config.Settings) -> str:
         pnl = 0.0
         for q in ledger.rows.values():
             phases[q["phase"]] = phases.get(q["phase"], 0) + 1
-            pnl += float(q.get("pnl") or 0)
+            pnl += 0.0 if q.get("foreign") else float(q.get("pnl") or 0)
+        archived = sum((0.0 if q.get("foreign") else float(q.get("pnl") or 0) for q in ledger.archived_between(float("-inf"), float("inf"))), 0.0)
         return (f"数据库 {settings.ledger_path}：{len(ledger.rows)} 条记录 {phases}，已归档 {ledger.archive_count()} 条；"
-                f"已结算盈亏合计 {pnl:+.2f} 美元；暂停={ledger.get('paused') == '1'}")
+                f"已结算盈亏合计 {pnl + archived:+.2f} 美元（近两天 {pnl:+.2f}，归档的 {archived:+.2f}；改绑前旧账户的不算）；"
+                f"暂停={ledger.get('paused') == '1'}")
     finally:
         ledger.close()
 

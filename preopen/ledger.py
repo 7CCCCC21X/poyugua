@@ -15,6 +15,7 @@ redeemed), so the working set the loops walk stays a couple of days long.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from pathlib import Path
@@ -28,6 +29,11 @@ ARCHIVE_AFTER_S = 2 * 86400
 
 def quote_key(slug: str, level: int, attempt: int) -> str:
     return f"{slug}#{level}@{attempt}"
+
+
+def unclaimed(q: dict) -> bool:
+    """Winnings this bot could not claim and means to (six failures; no Relayer key, which a restart may bring)."""
+    return not q.get("foreign") and (q.get("redeem") == "failed" or (q.get("redeem") == "manual" and bool(q.get("redeem_error"))))
 
 
 def archivable(q: dict, before: float) -> bool:
@@ -50,6 +56,8 @@ class Ledger:
         self.conn.execute("CREATE TABLE IF NOT EXISTS quotes (key TEXT PRIMARY KEY, slug TEXT, start INTEGER, phase TEXT, data TEXT NOT NULL)")
         self.conn.execute("CREATE TABLE IF NOT EXISTS archive (key TEXT PRIMARY KEY, start INTEGER, data TEXT NOT NULL)")
         self.conn.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+        # archived records whose winnings are still to be claimed by this bot (restored when it can claim them)
+        self.conn.execute("CREATE TABLE IF NOT EXISTS unclaimed (key TEXT PRIMARY KEY)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS archive_start ON archive(start, key)")   # the review reads by time
         self.conn.commit()
         self.rows: dict[str, dict] = {}
@@ -62,31 +70,32 @@ class Ledger:
     def save_many(self, quotes: list[dict]) -> None:
         if not quotes:
             return
-        with self.lock:
+        with self.lock, self.conn:   # one transaction: committed whole, or rolled back (audit 11-27)
             self.conn.executemany(
                 "INSERT INTO quotes(key, slug, start, phase, data) VALUES (?, ?, ?, ?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET slug=excluded.slug, start=excluded.start, phase=excluded.phase, data=excluded.data",
                 [(q["key"], q["slug"], int(q["start"]), q["phase"], json.dumps(q, separators=(",", ":"))) for q in quotes])
-            self.conn.commit()
         for q in quotes:
             self.rows[q["key"]] = q
 
     def delete(self, key: str) -> None:
-        with self.lock:
+        with self.lock, self.conn:
             self.conn.execute("DELETE FROM quotes WHERE key = ?", (key,))
-            self.conn.commit()
         self.rows.pop(key, None)
 
     def archive_old(self, now: float) -> int:
-        """Move the finished records that filled nothing to the archive, two days after their window."""
+        """Move the finished records to the archive, two days after their window. Winnings this bot still means to
+        claim go too (the working set stays a couple of days long) and are listed in `unclaimed`: restored when the bot
+        can claim them (restore_unclaimed; audit 11-27: they were archived and forgotten). One transaction: moved whole,
+        or not at all (a failure half way left a record in both tables)."""
         old = [q for q in self.rows.values() if archivable(q, now - ARCHIVE_AFTER_S)]
         if not old:
             return 0
-        with self.lock:
+        with self.lock, self.conn:
             self.conn.executemany("INSERT OR REPLACE INTO archive(key, start, data) VALUES (?, ?, ?)",
                                   [(q["key"], int(q["start"]), json.dumps(q, separators=(",", ":"))) for q in old])
+            self.conn.executemany("INSERT OR IGNORE INTO unclaimed(key) VALUES (?)", [(q["key"],) for q in old if unclaimed(q)])
             self.conn.executemany("DELETE FROM quotes WHERE key = ?", [(q["key"],) for q in old])
-            self.conn.commit()
         for q in old:
             self.rows.pop(q["key"], None)
         return len(old)
@@ -117,6 +126,36 @@ class Ledger:
                 return
             key, at = rows[-1][0], rows[-1][1]
 
+    def unclaimed_count(self) -> int:
+        with self.lock:
+            return int(self.conn.execute("SELECT COUNT(*) FROM unclaimed").fetchone()[0])
+
+    def restore_unclaimed(self) -> list[dict]:
+        """The archived records with winnings still to claim, back in the working set (the bot can claim them now)."""
+        with self.lock, self.conn:
+            rows = self.conn.execute("SELECT a.key, a.data FROM unclaimed u JOIN archive a ON a.key = u.key").fetchall()
+            back = [json.loads(data) for _, data in rows]
+            self.conn.executemany(
+                "INSERT INTO quotes(key, slug, start, phase, data) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET slug=excluded.slug, start=excluded.start, phase=excluded.phase, data=excluded.data",
+                [(q["key"], q["slug"], int(q["start"]), q["phase"], json.dumps(q, separators=(",", ":"))) for q in back])
+            self.conn.executemany("DELETE FROM archive WHERE key = ?", [(q["key"],) for q in back])
+            self.conn.execute("DELETE FROM unclaimed")
+        for q in back:
+            self.rows[q["key"]] = q
+        return back
+
+    def size(self) -> tuple[int, int] | None:
+        """The ledger's bytes on disk (with its write-ahead log) and the free bytes of its disk; None in memory."""
+        if self.path == ":memory:":
+            return None
+        try:
+            used = sum(os.path.getsize(self.path + ext) for ext in ("", "-wal") if os.path.exists(self.path + ext))
+            st = os.statvfs(os.path.dirname(os.path.abspath(self.path)))
+            return used, st.f_bavail * st.f_frsize
+        except OSError:
+            return None
+
     def archive_count(self) -> int:
         with self.lock:
             return int(self.conn.execute("SELECT COUNT(*) FROM archive").fetchone()[0])
@@ -127,9 +166,8 @@ class Ledger:
         return row[0] if row else default
 
     def put(self, k: str, v: str) -> None:
-        with self.lock:
+        with self.lock, self.conn:
             self.conn.execute("INSERT INTO kv(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
-            self.conn.commit()
 
     def close(self) -> None:
         with self.lock:

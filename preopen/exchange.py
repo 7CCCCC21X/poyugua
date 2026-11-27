@@ -550,6 +550,19 @@ class LiveExchange:
         self._wake.set()
         return await future
 
+    def drop_unsent(self, reason: str) -> int:
+        """Orders signed and waiting for the sender (not one byte of them sent): answered not sent at once, so a pause,
+        an emergency stop or a switch to paper trading is not followed by new orders reaching the book. Returns how
+        many orders. A request already in flight is left to finish: its answer says what rests."""
+        waiting, self._outbox = self._outbox, []
+        n = 0
+        for signed, future in waiting:
+            if not future.done():
+                future.set_result({spec.ref: Placed(spec.ref, "not_sent", code="stopped", message=reason, hash=h, salt=int(o.salt))
+                                   for spec, o, h in signed})
+                n += len(signed)
+        return n
+
     async def _sender(self) -> None:
         while True:
             if not self._outbox:
@@ -677,7 +690,7 @@ class LiveExchange:
             for (spec, o, h), r in zip(batch, responses):
                 if getattr(r, "ok", False):
                     out[spec.ref] = Placed(spec.ref, "open", order_id=str(r.order_id), hash=h, salt=int(o.salt),
-                                           matched=D(str(getattr(r, "taking_amount", 0) or 0)) if r.status == "matched" else D(0))
+                                           matched=D(str(getattr(r, "taking_amount", 0) or 0)) if str(r.status or "").lower() == "matched" else D(0))
                 else:
                     message = str(getattr(r, "message", ""))
                     code = str(getattr(r, "code", "unknown"))
@@ -781,10 +794,16 @@ class LiveExchange:
         """Each fill of this account's orders on a market with the moment it matched (order id -> [(epoch s, shares)]):
         the bot's orders are post-only, so they are the maker orders of the trades. A trade without a time has 0."""
         out: dict[str, list[tuple[float, D]]] = {}
+        seen: set[str] = set()
         async for page in self.client.list_account_trades(market=condition_id):
             for t in page.items:
                 if str(getattr(t, "status", "")).upper() == "FAILED":
                     continue  # never settled on chain: no shares came of it
+                tid = str(getattr(t, "id", "") or "")
+                if tid:  # a trade listed twice (pages that shifted while new trades came in) counts once
+                    if tid in seen:
+                        continue
+                    seen.add(tid)
                 at = getattr(t, "matched_at", None)
                 ts = at.timestamp() if hasattr(at, "timestamp") else 0.0
                 for m in t.maker_orders:

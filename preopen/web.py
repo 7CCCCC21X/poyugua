@@ -27,11 +27,22 @@ LOG = logging.getLogger(__name__)
 COOKIE = "preopen_session"
 SESSION_DAYS = 30
 INIT_DATA_MAX_AGE_S = 7 * 86400
-LOGIN_FAILS_MAX = 20                # failed logins in LOGIN_WINDOW_S before /api/login refuses everything for a while
-LOGIN_WINDOW_S = 600
+LOGIN_FAILS_MAX = 20                # wrong keys (a login or a Bearer header) from one source in LOGIN_WINDOW_S: that
+LOGIN_WINDOW_S = 600                # source is refused for a while
+LOGIN_FAILS_ALL = 200               # ...and from all sources together: nobody is (a guess spread over many addresses)
 MAX_BODY = 16 * 1024
+HEADERS_MAX = 64                    # a request's header lines, and their bytes (a line longer than that is refused too)
+HEADER_BYTES_MAX = 16 * 1024
+REQUEST_READ_S = 15                 # the whole request (line, headers, body) read within this, not each line
+CONNECTIONS_MAX = 32                # connections served at once; more are answered 503 at once (the console shares the
+                                    # trading process: a flood of slow connections must not tie it up)
 REASONS = {200: "OK", 204: "No Content", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found",
-           405: "Method Not Allowed", 413: "Payload Too Large", 429: "Too Many Requests", 500: "Internal Server Error"}
+           405: "Method Not Allowed", 413: "Payload Too Large", 429: "Too Many Requests", 431: "Request Header Fields Too Large",
+           500: "Internal Server Error", 503: "Service Unavailable"}
+
+
+class TooLarge(ValueError):
+    pass
 
 
 def session_token(web_key: str) -> str:
@@ -77,14 +88,16 @@ class WebServer:
         self.app = app
         self.web_key, self.bot_token, self.admin_id = web_key, bot_token, admin_id
         self.server: asyncio.base_events.Server | None = None
-        self.fails: list[float] = []
+        self.fails: dict[str, list[float]] = {}   # source -> when its keys were wrong (a login, a Bearer header)
+        self.fails_all: list[float] = []
+        self.busy = 0                               # connections being served
 
     @property
     def sign_in_ready(self) -> bool:
         return bool(self.web_key) or bool(self.bot_token and self.admin_id)
 
     async def start(self) -> None:
-        self.server = await asyncio.start_server(self._serve, self.host, self.port)
+        self.server = await asyncio.start_server(self._serve, self.host, self.port, limit=HEADER_BYTES_MAX)
         LOG.info("网页控制台在端口 %d%s", self.port, "" if self.sign_in_ready else "（没设 WEB_KEY 也没设 Telegram：只能看到登录页）")
 
     async def close(self) -> None:
@@ -105,6 +118,27 @@ class WebServer:
         return bearer.startswith("Bearer ") and hmac.compare_digest(bearer[7:].strip(), self.web_key)
 
     @staticmethod
+    def source(headers: dict[str, str]) -> str:
+        """Who is asking: the address the proxy in front (Railway's) put last in X-Forwarded-For (an address the
+        client wrote there itself comes before it), else the connection's own."""
+        forwarded = [part.strip() for part in headers.get("x-forwarded-for", "").split(",") if part.strip()]
+        return forwarded[-1] if forwarded else headers.get("_peer", "") or "?"
+
+    def locked(self, source: str, now: float) -> bool:
+        """Too many wrong keys lately, from this source or from all of them: refused without a look at the key."""
+        self.fails_all = [t for t in self.fails_all if now - t < LOGIN_WINDOW_S]
+        mine = self.fails[source] = [t for t in self.fails.get(source, []) if now - t < LOGIN_WINDOW_S]
+        for s in [s for s, ts in self.fails.items() if not ts]:
+            del self.fails[s]
+        return len(mine) >= LOGIN_FAILS_MAX or len(self.fails_all) >= LOGIN_FAILS_ALL
+
+    def failed(self, source: str, now: float) -> None:
+        self.fails.setdefault(source, []).append(now)
+        self.fails_all.append(now)
+        if len(self.fails_all) in (LOGIN_FAILS_MAX, LOGIN_FAILS_ALL):
+            LOG.warning("网页控制台：%d 分钟内 %d 次密码错误（最近一次来自 %s）", LOGIN_WINDOW_S // 60, len(self.fails_all), source)
+
+    @staticmethod
     def _json(status: int, data: Any, extra: list[tuple[str, str]] | None = None) -> tuple[int, str, bytes, list[tuple[str, str]]]:
         return status, "application/json; charset=utf-8", json.dumps(data, ensure_ascii=False, default=str).encode(), extra or []
 
@@ -117,19 +151,18 @@ class WebServer:
             if method != "GET":
                 return 405, "text/plain", b"", []
             return 200, "text/html; charset=utf-8", PAGE_HTML, []
+        source, now = self.source(headers), time.time()
         if path == "/api/login":
             if method != "POST":
                 return 405, "text/plain", b"", []
-            now = time.time()
-            self.fails = [t for t in self.fails if now - t < LOGIN_WINDOW_S]
-            if len(self.fails) >= LOGIN_FAILS_MAX:
+            if self.locked(source, now):
                 return self._json(429, {"error": "too many attempts"})
             try:
                 key = str(json.loads(body or b"{}").get("key", ""))
             except (ValueError, AttributeError):
                 key = ""
             if not self.web_key or not hmac.compare_digest(key, self.web_key):
-                self.fails.append(now)
+                self.failed(source, now)
                 await asyncio.sleep(1.0)
                 return self._json(401, {"error": "wrong key"})
             cookie = (f"{COOKIE}={session_token(self.web_key)}; Path=/; Max-Age={SESSION_DAYS * 86400}; HttpOnly; Secure; "
@@ -137,6 +170,14 @@ class WebServer:
             return self._json(200, {"ok": True}, [("Set-Cookie", cookie)])
         if not path.startswith("/api/"):
             return 404, "text/plain", b"not found", []
+        bearer = headers.get("authorization", "")
+        if bearer.startswith("Bearer "):  # the key in a header: held to the login's limits (audit 11-27: it was not,
+            if self.locked(source, now):   # so it could be guessed at full speed)
+                return self._json(429, {"error": "too many attempts"})
+            if not (self.web_key and hmac.compare_digest(bearer[7:].strip(), self.web_key)):
+                self.failed(source, now)
+                await asyncio.sleep(1.0)
+                return self._json(401, {"error": "sign in", "web_key": bool(self.web_key)})
         if not self.authorized(headers):
             return self._json(401, {"error": "sign in", "web_key": bool(self.web_key)})
         if method == "GET":
@@ -190,28 +231,59 @@ class WebServer:
                 return self._json(400, {"error": str(error)})
         return 404, "text/plain", b"not found", []
 
+    async def _read(self, reader: asyncio.StreamReader) -> tuple[str, str, dict[str, str], bytes]:
+        """One request: its line, at most HEADERS_MAX header lines of HEADER_BYTES_MAX bytes in all, its body."""
+        line = await reader.readline()
+        parts = line.decode("latin-1").split()
+        if len(parts) < 2:
+            raise ValueError("bad request line")
+        headers: dict[str, str] = {}
+        size = 0
+        while True:
+            raw = await reader.readline()
+            if raw in (b"\r\n", b"\n", b""):
+                break
+            size += len(raw)
+            if len(headers) >= HEADERS_MAX or size > HEADER_BYTES_MAX:
+                raise TooLarge("headers")
+            name, _, value = raw.decode("latin-1").partition(":")
+            headers[name.strip().lower()] = value.strip()
+        length = int(headers.get("content-length") or 0)
+        if length > MAX_BODY or length < 0:
+            raise TooLarge("body")
+        body = await reader.readexactly(length) if length else b""
+        return parts[0].upper(), parts[1], headers, body
+
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if self.busy >= CONNECTIONS_MAX:  # too many at once: refused at once (what came already is read off the line, a
+            try:                          # tenth of a second at most: a socket closed on unread bytes resets, and the
+                await asyncio.wait_for(reader.read(MAX_BODY), 0.1)   # client would see that instead of the 503)
+            except (asyncio.TimeoutError, ConnectionError, ValueError):
+                pass
+            try:
+                writer.write(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                await writer.drain()
+            except (ConnectionError, RuntimeError):
+                pass
+            finally:
+                writer.close()
+            return
+        self.busy += 1
+        try:
+            await self._answer(reader, writer)
+        finally:
+            self.busy -= 1
+
+    async def _answer(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         status, ctype, payload, extra = 500, "text/plain", b"", []
         try:
-            line = await asyncio.wait_for(reader.readline(), 15)
-            parts = line.decode("latin-1").split()
-            if len(parts) < 2:
-                raise ValueError("bad request line")
-            method, target = parts[0].upper(), parts[1]
-            headers: dict[str, str] = {}
-            while True:
-                raw = await asyncio.wait_for(reader.readline(), 15)
-                if raw in (b"\r\n", b"\n", b""):
-                    break
-                name, _, value = raw.decode("latin-1").partition(":")
-                headers[name.strip().lower()] = value.strip()
-            length = int(headers.get("content-length") or 0)
-            if length > MAX_BODY:
-                status, ctype, payload = 413, "text/plain", b"too large"
-            else:
-                body = await asyncio.wait_for(reader.readexactly(length), 15) if length else b""
-                status, ctype, payload, extra = await self.respond(method, target, headers, body)
-        except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError, ValueError):
+            method, target, headers, body = await asyncio.wait_for(self._read(reader), REQUEST_READ_S)
+            peer = writer.get_extra_info("peername")
+            headers["_peer"] = str(peer[0]) if isinstance(peer, tuple) and peer else ""   # set here, never by the client
+            status, ctype, payload, extra = await self.respond(method, target, headers, body)
+        except TooLarge as error:
+            status, ctype, payload = (413 if str(error) == "body" else 431), "text/plain", b"too large"
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, ConnectionError, ValueError):
             status, ctype, payload = 400, "text/plain", b"bad request"
         except Exception:
             LOG.exception("网页请求出错")

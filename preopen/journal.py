@@ -11,6 +11,7 @@ import csv
 import datetime as dt
 import gc
 import io
+import math
 import re
 import threading
 from bisect import bisect_right
@@ -33,6 +34,8 @@ RANGES = {"all": "全部", "today": "今天", "yesterday": "昨天", "7d": "近 
 UPDATE_WORDS = ("更新", "上次更新", "上次更新起", "更新起", "update")   # Telegram's word for the span since the last update
 COIN_RHO = 0.62           # the coins' results of one window go together: two of them agreed in 81% of 36,288 pairs
                           # (11-20 to 11-25, seven coins), a correlation of 0.62. The luck of a start's fills counts it.
+RESULTS = (*mk.SIDES, mk.SPLIT)   # a settled record's result: a side won, or the market paid 50/50
+MAX_DAYS = 3650           # /review 7, /export 30: a number of days back, at most this many
 MODEL_MIN = 30            # settled windows with a fill before the model's comparison is called anything but thin
 MODEL_STEPS = ((12 * 3600, 300), (7 * 86400, 3600))   # the curve's points: a window each up to 12 hours, an hour each up
                           # to 7 days, a (Beijing) day each beyond
@@ -186,9 +189,10 @@ def span_args(args: list[str], now: float,
             days = float(key)
         except ValueError:
             pass
-        else:
-            if days > 0:
-                span, label = (now - days * 86400, float("inf")), f"最近 {mk.fmt(D(str(days)))} 天"
+        else:  # audit 11-27: 0 or less was ignored without a word, a huge number crashed the time's formatting
+            if not (math.isfinite(days) and 0 < days <= MAX_DAYS):
+                raise ValueError(f"天数要在 0～{MAX_DAYS} 之间（不含 0）：{a}")
+            span, label = (now - days * 86400, float("inf")), f"最近 {mk.fmt(D(str(days)))} 天"
             continue
         parts = re.split(r"[~～至到]", key)
         if all(WHEN.match(x.strip().replace("/", "-")) for x in parts if x.strip()) and any(x.strip() for x in parts):
@@ -219,7 +223,7 @@ def row_of(q: dict, now: float) -> dict[str, Any]:
         "up": STATES.get(q["orders"]["up"]["state"], q["orders"]["up"]["state"]), "down": STATES.get(q["orders"]["down"]["state"], q["orders"]["down"]["state"]),
         "up_filled": float(f.get("up", 0)), "down_filled": float(f.get("down", 0)),
         "placed_lead": mk.span(q["start"] - float(placed)) if placed else "",
-        "result": mk.SIDES_CN.get(str(q.get("result") or ""), ""), "pnl": q.get("pnl"), "redeem": q.get("redeem") or "",
+        "result": mk.RESULT_CN.get(str(q.get("result") or ""), ""), "pnl": q.get("pnl"), "redeem": q.get("redeem") or "",
         "can_withdraw": q["phase"] == "active",
     }
 
@@ -342,9 +346,9 @@ def _count(b: dict[str, Any], w: dict[str, Any]) -> None:
 def _add(w: dict[str, Any], q: dict, f: dict[str, D], price: D) -> tuple[D, D, bool, str]:
     """A record's fills into its window; returns (its cost, its payout, settled, the result)."""
     result = q.get("result")
-    settled = q.get("phase") == "settled" and result in mk.SIDES
+    settled = q.get("phase") == "settled" and result in RESULTS
     cost = sum((v * price for v in f.values()), D(0))
-    payout = f.get(result, D(0)) if settled else D(0)
+    payout = sum((v * mk.paid(result, side) for side, v in f.items()), D(0)) if settled else D(0)
     w["sides"] |= {side for side, v in f.items() if v > 0}
     w["levels"].add(int(q["level"]))
     w["volume"] += cost
@@ -397,7 +401,7 @@ class Sides:
             if net > 0:
                 self.one[side]["shares"] += net
                 self.one[side]["cost"] += net * avg[side]
-                self.one[side]["payout"] += net if side == w["result"] else D(0)
+                self.one[side]["payout"] += net * mk.paid(w["result"], side)
 
     def rows(self) -> list[dict[str, Any]]:
         out = []
@@ -663,7 +667,7 @@ def journal(records: Iterable[dict], now: float, current: int | None = None, spa
         if settled:
             pb["cost"] += cost
             pb["payout"] += payout
-            pb["won"] += f.get(result, D(0))
+            pb["won"] += sum((v * mk.paid(result, s) for s, v in f.items()), D(0))
             pb["settled"] += shares
         if sb is not None:
             sb["filled"] += 1
@@ -682,7 +686,7 @@ def journal(records: Iterable[dict], now: float, current: int | None = None, spa
                 lead["shares"] += sh
                 if settled:
                     lead["cost"] += sh * price
-                    lead["won"] += sh if side == result else D(0)
+                    lead["won"] += sh * mk.paid(result, side)
         detail.append(detail_row(q))
         detail_n += 1
     close()
@@ -746,7 +750,7 @@ def market_tuple(w: dict[str, Any]) -> tuple:
     q = w["q"]
     return (q["start"], mk.name_of(q["coin"]), q["slug"], "、".join(str(i + 1) for i in sorted(w["levels"])),
             float(w["shares"].get("up", D(0))), float(w["shares"].get("down", D(0))), len(w["sides"]) == len(mk.SIDES),
-            float(round(w["volume"], 4)), mk.SIDES_CN.get(w["result"], "") if w["settled"] else "",
+            float(round(w["volume"], 4)), mk.RESULT_CN.get(w["result"], "") if w["settled"] else "",
             float(round(w["payout"] - w["cost"], 4)) if w["settled"] else None)
 
 
@@ -786,12 +790,12 @@ def price_markets(records: Iterable[dict], now: float, price_cents: float, span:
         if not any(f.values()):
             continue
         result = q.get("result")
-        settled = q.get("phase") == "settled" and result in mk.SIDES
+        settled = q.get("phase") == "settled" and result in RESULTS
         cost = sum((v * target for v in f.values()), D(0))
         rows.append({"slug": q["slug"], "coin": mk.name_of(q["coin"]), "when": mk.hm(q["start"]), "start": q["start"],
                      "level": int(q["level"]) + 1, "up": float(f.get("up", 0)), "down": float(f.get("down", 0)),
-                     "cost": float(round(cost, 4)), "result": mk.SIDES_CN.get(str(result or ""), "") if settled else "",
-                     "pnl": float(round(f.get(result, D(0)) - cost, 4)) if settled else None,
+                     "cost": float(round(cost, 4)), "result": mk.RESULT_CN.get(str(result or ""), "") if settled else "",
+                     "pnl": float(round(sum((v * mk.paid(result, side) for side, v in f.items()), D(0)) - cost, 4)) if settled else None,
                      "first_fill_lead_s": detail_row(q)["first_fill_lead_s"]})
     rows = sort_markets(rows, "loss")
     settled_rows = [r for r in rows if r["pnl"] is not None]
@@ -906,7 +910,7 @@ class Replay:
 
     def add(self, recs: list[tuple[dict, dict[str, D], tuple[dict, bool]]]) -> None:
         """One window whose story is over: its records (rested or filled), their fills and fill_events."""
-        if any(any(f.values()) and not (q.get("phase") == "settled" and q.get("result") in mk.SIDES) for q, f, _ in recs):
+        if any(any(f.values()) and not (q.get("phase") == "settled" and q.get("result") in RESULTS) for q, f, _ in recs):
             self.waiting += 1  # a fill without its result yet: the window waits, whole
             return
         ends = [ended_by_cancel(q) for q, _, _ in recs]
@@ -922,15 +926,15 @@ class Replay:
             price, result = num(q["price"]), q.get("result")
             for side, ev in timed.items():
                 for lead, sh in ev:
-                    won = side == result
+                    won = mk.paid(result, side)   # what a share paid: 1, 0, or 0.5 on a 50/50 market
                     events.append((lead, side, sh, price, won))
                     approx_events += 0 if exact else 1
                     t = self.times[next(n for limit, n in FILL_TIMES if lead < limit)]
                     t["shares"] += sh
                     t["cost"] += sh * price
-                    t["won"] += sh if won else D(0)
+                    t["won"] += sh * won
                     coin["cost"] += sh * price
-                    coin["won"] += sh if won else D(0)
+                    coin["won"] += sh * won
                     self.after_start += 1 if lead < 0 else 0
                     self.after_cancel += 1 if end is not None and lead < end - END_SLACK_S else 0
         coin["filled"] += 1 if events else 0
@@ -964,7 +968,7 @@ class Replay:
             latest: dict[str, float] = {}
             for lead, side, sh, price, won in events:
                 events_all += 1
-                cost, pay = sh * price, (sh if won else D(0))
+                cost, pay = sh * price, sh * won
                 actual["shares"] += sh
                 actual["cost"] += cost
                 actual["payout"] += pay
@@ -1090,7 +1094,7 @@ def detail_row(q: dict) -> dict[str, Any]:
         "when": mk.hm(q["start"]), "day": day_of(q["start"]), "coin": mk.name_of(q["coin"]), "level": int(q["level"]) + 1,
         "price": float(price * 100), "shares": float(num(q["shares"])), "attempt": int(q.get("attempt") or 0) + 1,
         "up": float(f.get("up", 0)), "down": float(f.get("down", 0)), "cost": float(sum((v * price for v in f.values()), D(0))),
-        "result": mk.SIDES_CN.get(str(q.get("result") or ""), "待结算"), "pnl": q.get("pnl"),
+        "result": mk.RESULT_CN.get(str(q.get("result") or ""), "待结算"), "pnl": q.get("pnl"),
         "placed_lead_s": round(q["start"] - float(q["placed"])) if q.get("placed") else None,
         "cancel_lead_s": q.get("cancel_lead"),
         "first_fill_lead_s": round(q["start"] - min(firsts)) if firsts else None,
@@ -1266,7 +1270,7 @@ def quotes_rows(records: Iterable[dict], limit: int | None = None) -> tuple[list
                      round(placed - float(q["listed"]), 1) if placed and q.get("listed") else None,
                      round(placed - float(q["opened"]), 2) if placed and q.get("opened") else None,
                      q.get("cancel_lead"), float(f.get("up", 0)), float(f.get("down", 0)),
-                     fill_times_text(q, "up"), fill_times_text(q, "down"), mk.SIDES_CN.get(str(q.get("result") or ""), ""),
+                     fill_times_text(q, "up"), fill_times_text(q, "down"), mk.RESULT_CN.get(str(q.get("result") or ""), ""),
                      None if q.get("pnl") is None else round(float(q["pnl"]), 4)])
     return rows, total
 

@@ -390,6 +390,27 @@ class OrderHashTest(unittest.TestCase):
         self.assertEqual(order_hash(s, neg_risk=False), sdk)
         self.assertNotEqual(order_hash(s, neg_risk=True), sdk)  # another exchange, another domain
 
+    def test_a_v2_order_matches_the_sdk_too(self):
+        """A Protocol V2 position (SOL 11-25 16:35's Down, a real one): ExchangeV3 and domain version 3, as the SDK
+        signs it (orders.py: protocol_version "3" for a V2 position id; context.py: exchange_v3)."""
+        from eth_utils.crypto import keccak
+        from polymarket._internal.actions.orders.typed_data import _app_domain_separator, _order_contents_hash
+        from polymarket._internal.actions.orders.types import UnsignedOrder
+        from polymarket._internal.protocol import is_v2_position_id
+        from polymarket.environments import _EnvironmentConfig as EnvironmentConfig
+        token = "534832555679122465444422984911187128341910424652983297425707029706882154497"
+        self.assertTrue(is_v2_position_id(token))
+        s = signed(token, salt=987654321)
+        exchange = EnvironmentConfig.__dataclass_fields__["exchange_v3"].default
+        self.assertEqual(exchange.lower(), V2_EXCHANGE.lower())
+        u = UnsignedOrder(chain_id=137, builder=s.builder, exchange_address=exchange, expiration=s.expiration, maker=s.maker,
+                          maker_amount=s.maker_amount, metadata=s.metadata, order_type="GTD", salt=s.salt, side="BUY",
+                          signature_type=3, signer=s.signer, taker_amount=s.taker_amount, timestamp=s.timestamp, token_id=s.token_id)
+        sdk = "0x" + keccak(b"\x19\x01" + bytes.fromhex(_app_domain_separator(u, protocol_version="3")[2:])
+                            + _order_contents_hash(u)).hex()
+        self.assertEqual(order_hash(s, neg_risk=False), sdk)
+        self.assertEqual(order_hash(s, neg_risk=True), sdk)   # a V2 position has one exchange, negRisk or not
+
     def test_garbage_gives_empty(self):
         self.assertEqual(order_hash(object(), neg_risk=False), "")
 

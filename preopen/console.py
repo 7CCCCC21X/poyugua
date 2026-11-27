@@ -74,10 +74,10 @@ class Console:
         return journal.span_from(str(q.get("range") or "all"), str(q.get("from") or ""), str(q.get("to") or ""), self.engine.now(),
                                  self.engine.update_points())
 
-    @staticmethod
-    def coins(query: dict[str, str] | None) -> list[str]:
-        """The coin filter: coins=btc,eth (none or unknown ones: every coin)."""
-        return sorted({c for c in str((query or {}).get("coins") or "").lower().replace("，", ",").split(",") if c in config.COINS})
+    def coins(self, query: dict[str, str] | None) -> list[str]:
+        """The coin filter: coins=btc,eth (none or unknown ones: every coin). The seven, and any other coin traded."""
+        known = set(config.COINS) | set(self.engine.s.coins)
+        return sorted({c for c in str((query or {}).get("coins") or "").lower().replace("，", ",").split(",") if c in known})
 
     async def cards(self, read: Callable[..., Any]) -> dict[str, dict[str, Any]]:
         """The cards' raw totals: the days before today kept (CARDS_CACHE_S, a new day, a grown archive), today's added
@@ -208,6 +208,8 @@ class Console:
         notes = [f"距开场不足 {journal.secs_label(entry)}不再新挂"] if entry != s.entry_s else []
         if expiry != s.expiry_s:
             notes.append(f"订单自己在开场前 {journal.secs_label(expiry)}到期（撤单万一失败也会失效），挂着的单按新到期时间重挂一遍，约 1 分钟")
+        if self.engine.hedges_kept:
+            notes.append(f"{self.engine.hedges_kept} 场有成交，另一边留着配对（到撤单时间照常撤）")
         self._reviews.clear()
         return True, f"✅ 已改成开场前 {journal.secs_label(seconds)}撤单" + (f"；{'；'.join(notes)}" if notes else "") + "。立即生效"
 
@@ -248,14 +250,21 @@ class Console:
         before = config.current_values(old)
         after = config.current_values(new)
         diff = [f"{k} {before[k] or '（空）'} → {after[k] or '（空）'}" for k in after if before.get(k) != after.get(k)]
+        previous = self.overrides
         config.save_overrides(self.path, trial)
         self.overrides = trial
         if new.live != old.live:
-            return True, await self.switch_live(new)
+            ok, text = await self.switch_live(new)
+            if not ok:  # the switch did not happen: LIVE stays what it was, saved so (a restart must not go to paper
+                config.save_overrides(self.path, previous)   # trading with live orders left behind)
+                self.overrides = previous
+            return ok, text
         withdrawn = self.engine.apply_settings(new)
         text = f"已保存：{what}" + (f"（{'；'.join(diff)}）" if diff else "（数值没变）")
         if withdrawn:
             text += f"；{withdrawn} 场和新设置不符，撤掉后按新设置重挂"
+        if self.engine.hedges_kept:
+            text += f"；{self.engine.hedges_kept} 场有成交，另一边留着配对（不按新设置重挂，到撤单时间照常撤）"
         self.notify("🛠 网页改了设置：" + text)
         return True, text
 
@@ -277,15 +286,23 @@ class Console:
         text = f"已保存：{what}" + (f"（{'；'.join(diff)}）" if diff else "（数值没变）")
         if withdrawn:
             text += f"；{withdrawn} 场的挂单按新的到期时间撤掉重挂"
+        if self.engine.hedges_kept:
+            text += f"；{self.engine.hedges_kept} 场有成交，另一边留着配对（到撤单时间照常撤）"
         self.notify("🛠 改了设置：" + text)
         return True, text
 
-    async def switch_live(self, new: config.Settings) -> str:
-        """LIVE switched on the page: saved; leaving live trading, the bot's orders are cancelled (by id, an unknown one
-        by its hash; with PREOPEN_KEY_EXCLUSIVE=on every open order of the API key at once) and the records withdrawn
-        first; then the process starts again in the new mode."""
+    async def switch_live(self, new: config.Settings) -> tuple[bool, str]:
+        """LIVE switched on the page; the process starts again in the new mode. Leaving live trading: nothing new is
+        placed from the first moment (the stop is set before anything else, signed orders not sent yet are dropped,
+        a request in flight is waited for), then the bot's orders are cancelled (by id, an unknown one by its hash; with
+        PREOPEN_KEY_EXCLUSIVE=on every open order of the API key at once). The paper ledger knows nothing of live
+        orders, so the switch is made only once none may rest: otherwise the bot stays live and paused, the cancels go
+        on, and it says so (audit 11-27: it switched all the same, and orders up to a day ahead rested unwatched)."""
         e = self.engine
         if e.s.live and not new.live:
+            e.stopping = "切换到模拟盘"
+            e.drop_unsent("切换到模拟盘")
+            await e.let_placements_finish(15)
             if e.s.key_exclusive:
                 try:
                     r = await e.x.cancel_all()
@@ -293,13 +310,19 @@ class Console:
                 except Exception as error:
                     LOG.warning("切换到模拟盘：一次撤光失败：%s", error)
             left = await e.withdraw_all("切换到模拟盘", deadline_s=30)
-            text = "已切到模拟盘：真实挂单已撤" + (f"（还可能挂着 {left} 张，到期自动失效）" if left else "") + "，程序正在重启"
+            if left:
+                e.stopping = ""
+                e.pause("切换到模拟盘没完成", f"还有 {left} 张真实挂单没确认撤掉")
+                text = (f"没切换：还有 {left} 张真实挂单没确认撤掉。已暂停新挂，撤单继续；过一两分钟在 🩺 体检里看挂单清零了再切")
+                self.notify("⚠️ " + text)
+                return False, text
+            text = "已切到模拟盘：真实挂单都已撤掉，程序正在重启"
         else:
             text = "已切到真实交易，程序正在重启（约半分钟后开始挂单）"
         self.notify("🛠 网页切换了交易模式：" + text)
         e.restart = True
         e.stop.set()
-        return text
+        return True, text
 
     async def action(self, body: dict[str, Any]) -> str:
         e = self.engine

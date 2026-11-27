@@ -25,6 +25,8 @@ TRADING_VERSIONS: tuple[tuple[str, str], ...] = (
     ("2026-11-25 15:08", "新市场开放后更快下单（0.2 秒问一次、签名提速）"),
     ("2026-11-25 16:17", "开放后等一下再发第一张单（旧市场 0.6 秒、V2 3 秒），被限流后按交易所给的秒数重试"),
     ("2026-11-25 16:59", "吃满的单（MATCHED）按成交算，另一边照常挂着，不再误暂停"),
+    ("2026-11-27 12:00", "按审计修复：改参数时有成交的场次另一边留着配对；撤单没成功继续撤；只有 CANCELED 算被别处撤单；"
+                         "一次拒单只算一次；手续费没写清楚的市场先不挂；50/50 结算；账本写不进去时暂停新挂"),
 )
 GTD_MIN_AHEAD_S = 180    # the CLOB rejects a GTD expiration less than 3 minutes away
 GTD_THRESHOLD_S = 60     # ...and expires an order one minute before its stated expiration
@@ -77,17 +79,17 @@ class Settings:
     paper_balance: D = D("1000")
     db_path: str = "data/preopen.sqlite3"
     publish_lead_s: int = 86400 - 450  # a window is listed about this long before its start (learned from listings)
-    private_key: str = ""
+    private_key: str = field(default="", repr=False)
     wallet: str = ""
-    relayer_key: str = ""
+    relayer_key: str = field(default="", repr=False)
     relayer_address: str = ""
-    clob_key: str = ""
-    clob_secret: str = ""
-    clob_passphrase: str = ""
-    telegram_token: str = ""
+    clob_key: str = field(default="", repr=False)
+    clob_secret: str = field(default="", repr=False)
+    clob_passphrase: str = field(default="", repr=False)
+    telegram_token: str = field(default="", repr=False)
     telegram_chat: str = ""
     telegram_admins: tuple[str, ...] = ()   # the Telegram user ids whose commands and buttons are obeyed
-    web_key: str = ""                  # the web console's password (WEB_KEY); Telegram's Mini App signs in without it
+    web_key: str = field(default="", repr=False)                  # the web console's password (WEB_KEY); Telegram's Mini App signs in without it
     web_port: int = 0                  # the console listens here (Railway's PORT); 0 = no console
     web_url: str = ""                  # the console's public https address (WEB_URL, else Railway's RAILWAY_PUBLIC_DOMAIN)
     log_level: str = "INFO"
@@ -231,10 +233,10 @@ def load_dotenv(path: str = ".env") -> None:
             continue
         key, value = line.split("=", 1)
         key, value = key.strip(), value.strip()
-        if " #" in value:
+        if value[:1] in ("'", '"') and value.find(value[0], 1) > 0:  # quoted: the quotes' inside, whole (a " #" in it
+            value = value[1:value.find(value[0], 1)]                   # is part of the value; audit 11-27)
+        elif " #" in value:
             value = value.split(" #", 1)[0].rstrip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
-            value = value[1:-1]
         os.environ.setdefault(key, value)
 
 

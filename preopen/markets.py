@@ -24,6 +24,13 @@ BEIJING = dt.timezone(dt.timedelta(hours=8))
 NAMES = {"btc": "BTC", "eth": "ETH", "sol": "SOL", "xrp": "XRP", "doge": "DOGE", "hype": "HYPE", "bnb": "BNB"}
 SIDES = ("up", "down")
 SIDES_CN = {"up": "涨", "down": "跌"}
+SPLIT = "split"           # a market resolved 50/50 (cancelled: no result to be had): each share of either side pays 50¢
+RESULT_CN = {**SIDES_CN, SPLIT: "五五"}
+
+
+def paid(result: str | None, side: str) -> D:
+    """What a share of `side` paid on a market resolved to `result`: $1 on the winning side, 50¢ on a 50/50 market."""
+    return D(1) if side == result else D("0.5") if result == SPLIT else D(0)
 
 
 def slug_of(coin: str, start: int) -> str:
@@ -127,6 +134,7 @@ class Listing:
     fee_rate: D = D(0)       # the taker fee schedule (feeSchedule.rate / exponent), handed to the SDK's metadata cache
     fee_exponent: D = D(0)
     opened: float = 0.0      # when this process first saw the CLOB accept orders on it (0: accepting when read, or not yet)
+    fee_unknown: bool = False   # fees on, and the schedule does not say whether makers pay: not quoted until it does
 
     @property
     def end(self) -> int:
@@ -183,13 +191,20 @@ def parse_listing(m: dict, coin: str, start: int, now: float = 0.0) -> tuple[Lis
     if tick is None or tick <= 0 or min_size is None or min_size <= 0:
         return None, "缺最小价位/最小份数"
     schedule = m.get("feeSchedule") if isinstance(m.get("feeSchedule"), dict) else {}
-    maker_fee = bool(m.get("feesEnabled")) and schedule.get("takerOnly") is False
+    # Makers pay only where the schedule says so (takerOnly false); a schedule that does not say (the field missing,
+    # not a true/false) is not quoted either: fail closed (audit 11-27). makerBaseFee is no sign: every market carries
+    # makerBaseFee 1000 while its schedule is taker-only (11-25: BTC, SOL), and reading it would stop every market.
+    taker_only = schedule.get("takerOnly")
+    fees = bool(m.get("feesEnabled"))
+    maker_fee = fees and taker_only is False
+    fee_unknown = fees and not isinstance(taker_only, bool)
     return Listing(
         slug=slug, coin=coin, start=start, condition_id=condition, market_id=str(m.get("id") or ""),
         question=str(m.get("question") or ""), up=up, down=down, tick=tick, min_size=min_size,
         neg_risk=bool(m.get("negRisk")), version=version, created=iso_ts(m.get("createdAt")),
         accepting=bool(m.get("acceptingOrders")), maker_fee=maker_fee, rewards_min=dec(m.get("rewardsMinSize")),
         seen=now, fee_rate=dec(schedule.get("rate")) or D(0), fee_exponent=dec(schedule.get("exponent")) or D(0),
+        fee_unknown=fee_unknown,
     ), ""
 
 
@@ -200,6 +215,15 @@ def level_problem(listing: Listing, price: D, shares: D) -> str:
     if shares < listing.min_size:
         return f"份数 {shares} 少于市场最小 {listing.min_size}"
     return ""
+
+
+def split(m: dict) -> bool:
+    """A resolved market that paid each side half (outcomePrices 0.5 / 0.5): resolved 50/50, no winner. 11-27 audit:
+    such a market was never settled, its fills counted as unsettled risk for good."""
+    if not m.get("closed"):
+        return False
+    prices = json_list(m.get("outcomePrices")) or []
+    return len(prices) == 2 and all(dec(x) == D("0.5") for x in prices)
 
 
 def winner(m: dict) -> str | None:

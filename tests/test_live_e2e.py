@@ -528,7 +528,7 @@ class CancelAnswerTest(unittest.IsolatedAsyncioTestCase):
         e = make_engine(s, clock=clock, exchange=x, public=pub)[0]
         hashes = ["0x" + f"{i:064x}" for i in range(1, 6)]   # five sends judged refused before processing
         for h in hashes:
-            e.ghosts[h] = T0 + 1800
+            e.ghosts[h] = {"start": T0 + 1800, "slug": "btc-updown-5m-1", "side": "up"}
         fake.cancel_script = ["ok", "error"]
         await e.ghost_pass(clock.t)
         self.assertEqual(set(e.ghosts), set(hashes[2:]))    # answered: off the list; not answered: kept
