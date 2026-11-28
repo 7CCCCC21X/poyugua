@@ -108,8 +108,8 @@ class WorkbookTest(unittest.TestCase):
 
     def test_every_sheet_and_the_guide(self):
         sheets, totals = self.build()
-        self.assertEqual(list(sheets), ["总览", "每日", "模型EV", "市场盈亏", "档位", "成交时刻", "撤单时间", "方向", "速度", "改参对比", "币种",
-                                        "时段", "成交明细", "全部报价", "拒单", "参数"])
+        self.assertEqual(list(sheets), ["总览", "每日", "模型EV", "周末", "市场盈亏", "档位", "成交时刻", "撤单时间", "方向", "速度", "改参对比",
+                                        "币种", "时段", "成交明细", "全部报价", "拒单", "参数"])
         overview = {r[0]: r[1:] for r in sheets["总览"] if r}
         self.assertEqual(overview["时间范围（按开场，北京时间）"], ["全部"])
         self.assertEqual(overview["成交场次"], ["2"])

@@ -436,7 +436,8 @@ a.mlink { color:inherit; text-decoration:none; border-bottom:1px dotted var(--mu
         <div class="frow" id="jCustom" hidden><input type="datetime-local" id="jFrom" aria-label="开始"><span>～</span><input type="datetime-local" id="jTo" aria-label="结束"><button class="small" id="jApply">筛选</button></div>
         <div class="frow" id="jUpdateRow" style="margin-top:6px" hidden><b>更新</b><select id="jUpdates" aria-label="从哪一次更新开始看"></select></div>
         <div class="frow" style="margin-top:6px"><b>币种</b><span class="chips" id="jCoins"></span></div>
-        <p class="muted small" style="margin:6px 0 0">按开场时间（北京时间）和币种筛选：下面所有内容和导出的文件都只算这些场次；上面三张卡片是全部记录，不受影响。「上次更新起」= 最近一次改参数或交易逻辑更新到现在，想从更早的某一次看起就在「更新」里选。<span id="jBusy"></span></p>
+        <div class="frow" style="margin-top:6px"><b>时段</b><span class="chips" id="jDays"></span></div>
+        <p class="muted small" style="margin:6px 0 0">按开场时间（北京时间）、币种和时段筛选：下面所有内容和导出的文件都只算这些场次；上面三张卡片是全部记录，不受影响。「上次更新起」= 最近一次改参数或交易逻辑更新到现在，想从更早的某一次看起就在「更新」里选。<span id="jBusy"></span></p>
       </section>
       <div id="jBody">
       <div class="cards" id="jRange"></div>
@@ -448,6 +449,11 @@ a.mlink { color:inherit; text-decoration:none; border-bottom:1px dotted var(--mu
         <div class="scroll"><table id="jModelCoin"></table></div>
         <details><summary>曲线每个点的数字</summary><div class="scroll tall"><table id="jModelPoints"></table></div></details>
         <p class="muted small" id="jModelNote"></p></section>
+      <section id="jWeekendBox" hidden><h2>周末 vs 工作日</h2><p id="jWeekendVerdict"></p>
+        <div class="scroll"><table id="jWeekendSplit"></table></div>
+        <h3 class="small">周末的四段</h3><div class="scroll"><table id="jWeekendParts"></table></div>
+        <h3 class="small">逐个周末（点一行只看那个周末）</h3><div class="scroll tall"><table id="jWeekendEach"></table></div>
+        <p class="muted small" id="jWeekendNote"></p></section>
       <div class="ops"><button id="xlsxAll">导出 Excel（全部表）</button><button class="secondary" id="csvMarkets">导出市场盈亏 CSV</button><button class="secondary" id="csvDaily">导出每日汇总 CSV</button><button class="secondary" id="csvDetail">导出成交明细 CSV</button><button class="secondary" id="csvQuotes">导出全部报价 CSV</button><button class="secondary" id="csvCancel">导出撤单时间复盘 CSV</button></div>
       <section><h2>撤单时间回放：开场前几秒撤单最好</h2><p id="cAdvice"></p><p class="small" id="cConf"></p><div class="scroll"><table id="cRows"></table></div>
         <p class="muted small" id="cNote"></p></section>
@@ -468,7 +474,7 @@ a.mlink { color:inherit; text-decoration:none; border-bottom:1px dotted var(--mu
       </div>
       <div class="grid2">
         <section><h2>按币种</h2><div class="scroll"><table id="jCoin"></table></div></section>
-        <section><h2>按开场时段（北京时间几点）</h2><div class="scroll tall"><table id="jHour"></table></div></section>
+        <section><h2>按开场时段（北京时间几点）</h2><div class="scroll tall"><table id="jHour"></table></div><p class="muted small" id="jHourNote"></p></section>
       </div>
       <section><h2>成交明细（每一档，最近 200 条）</h2><div class="scroll"><table id="jDetail"></table></div><p class="muted small" id="jMore"></p></section>
       </div>
@@ -517,7 +523,8 @@ $("loginBtn").onclick = async () => {
 $("key").addEventListener("keydown", (e) => { if (e.key === "Enter") $("loginBtn").click(); });
 
 const state = { tab: (location.hash || "").slice(1) || store.get("tab", "overview"), ordersTab: store.get("ordersTab", "open"), coin: store.get("coin", ""), report: null,
-  jRange: store.get("jRange", "all"), jFrom: store.get("jFrom", ""), jTo: store.get("jTo", ""), mSort: store.get("mSort", "time"), journal: null };
+  jRange: store.get("jRange", "all"), jFrom: store.get("jFrom", ""), jTo: store.get("jTo", ""), mSort: store.get("mSort", "time"),
+  jDay: store.get("jDay", "all"), journal: null };
 const TABS = ["overview", "settings", "orders", "journal"];
 let timer = null;
 function go(tab) {
@@ -694,13 +701,14 @@ $("coinFilter").onchange = () => { state.coin = $("coinFilter").value; store.set
 
 // ---- 复盘
 const RANGES = [["all", "全部"], ["today", "今天"], ["yesterday", "昨天"], ["7d", "近 7 天"], ["30d", "近 30 天"], ["update", "上次更新起"], ["custom", "自定义"]];
+const DAYS = [["all", "全部"], ["weekend", "仅周末（周六0点～周一8点）"], ["weekday", "仅工作日"]];
 const MSORT = [["time", "按时间"], ["loss", "亏最多"], ["gain", "赚最多"]];
 const shares = (v) => v == null ? "—" : String(Math.round(Number(v) * 100) / 100);
 const plus = (v) => v == null ? "—" : `<span class="${v >= 0 ? "good" : "bad"}">${v >= 0 ? "+" : "-"}${Math.abs(Number(v)).toFixed(2)}</span>`;
 state.jCoins = String(store.get("jCoins", "") || "").split(",").filter(Boolean);
 state.mSort = state.mSort || "time";
 function jWant(next) {
-  return Object.assign({range: state.jRange, from: state.jFrom, to: state.jTo, coins: state.jCoins.slice(), sort: state.mSort}, next || {});
+  return Object.assign({range: state.jRange, from: state.jFrom, to: state.jTo, coins: state.jCoins.slice(), sort: state.mSort, day: state.jDay}, next || {});
 }
 function jQuery(f) {
   f = f || jWant();
@@ -709,6 +717,7 @@ function jQuery(f) {
   if (f.range === "since") p.set("from", f.from || "");   // from that moment on (an earlier update chosen)
   if (f.coins && f.coins.length) p.set("coins", f.coins.join(","));
   if (f.sort && f.sort !== "time") p.set("sort", f.sort);
+  if (f.day && f.day !== "all") p.set("day", f.day);
   return p.toString();
 }
 function table(id, head, rows, empty) {
@@ -742,6 +751,8 @@ function renderFilters(info) {
     $("jCustom").dataset.open = "";
     loadJournal(i === 0 ? {range: "update"} : {range: "since", from: ups[i].from});
   };
+  $("jDays").innerHTML = DAYS.map(([k, label]) => `<span class="chip ${k === state.jDay ? "on" : ""}" data-jd="${k}">${label}</span>`).join("");
+  for (const el of document.querySelectorAll("[data-jd]")) el.onclick = () => loadJournal({day: el.dataset.jd});
   const coins = ((state.report && state.report.coins) || []).map((c) => c.toLowerCase());
   for (const c of state.jCoins) if (!coins.includes(c)) coins.push(c);
   $("jCoins").innerHTML = `<span class="chip ${state.jCoins.length ? "" : "on"}" data-jc="">全部</span>` +
@@ -910,6 +921,33 @@ function renderModel() {
   box.onblur = hide;
   box.onkeydown = (ev) => { if (ev.key === "ArrowLeft" || ev.key === "ArrowRight") { ev.preventDefault(); show((at < 0 ? data.length - 1 : at) + (ev.key === "ArrowLeft" ? -1 : 1)); } };
 }
+// 周末 vs 工作日: the windows in the time and coins chosen, whatever the 时段 chip, side by side; the weekend's stretches;
+// each weekend, a click away from being the time filter
+function renderWeekend() {
+  const W = state.journal && state.journal.weekend;
+  const has = !!(W && W.split && W.split.some((r) => r.filled || r.quoted));
+  $("jWeekendBox").hidden = !has;
+  if (!has) return;
+  $("jWeekendVerdict").innerHTML = "<b>结论：" + esc(W.verdict) + "</b>";
+  const head = ["", "已结算盈亏", "模型 EV", "实际 − 模型", "z 值", "单边：赢 / 保本", "成交率", "双边率", "成交 / 报价场次", "成交额", "单场均", "收益率"];
+  const z = (v) => v == null ? "—" : `<span class="${v <= -2 ? "bad" : v >= 2 ? "good" : ""}">${v >= 0 ? "+" : "-"}${Math.abs(v).toFixed(1)}σ</span>`;
+  const one = (r) => r.one_win_rate == null ? "—" : `<span class="${r.one_win_rate >= r.one_breakeven ? "good" : "bad"}">${r.one_win_rate}%</span> / ${r.one_breakeven}%`;
+  const cells = (r) => `<td>${signed(r.pnl)}</td><td>${signed(r.ev)}</td><td>${signed(r.diff)}</td><td>${z(r.z)}</td><td>${one(r)}</td>` +
+    `<td>${pct(r.fill_rate)}</td><td>${pct(r.both_rate)}</td><td>${r.filled} / ${r.quoted}${r.upcoming ? `<span class="muted">+${r.upcoming}</span>` : ""}</td>` +
+    `<td>${money(r.volume)}</td><td>${r.avg_pnl == null ? "—" : signed(r.avg_pnl)}</td><td>${pct(r.roi)}</td>`;
+  table("jWeekendSplit", head, W.split.map((r) => `<tr${(state.jDay === r.key) ? ' class="cur"' : ""}><td>${esc(r.name)}</td>${cells(r)}</tr>`));
+  const named = (name) => { const m = /^(.*?)（(.*)）$/.exec(name);   // the stretch, its hint under it: a narrower column
+    return m ? `${esc(m[1])}<br><span class="muted small">${esc(m[2])}</span>` : esc(name); };
+  table("jWeekendParts", head, W.parts.map((r) => `<tr><td>${named(r.name)}</td>${cells(r)}</tr>`), "这段时间没有周末的场次");
+  table("jWeekendEach", head, W.each.map((r, i) => `<tr data-we="${i}" style="cursor:pointer"><td><a class="link">${esc(r.name.replace("（进行中）", ""))}</a>` +
+    `${r.ongoing ? '<br><span class="muted small">进行中</span>' : ""}</td>${cells(r)}</tr>`), "这段时间没有周末的场次");
+  for (const el of document.querySelectorAll("[data-we]")) el.onclick = () => {
+    const r = W.each[Number(el.dataset.we)];
+    loadJournal({range: "custom", from: r.from, to: r.to, day: "all"});   // that weekend whole (under 仅工作日 it would be empty)
+  };
+  $("jWeekendNote").textContent = "周末 = " + W.definition + "。这三张表总是把周末和工作日放在一起比（上面「时段」选的是什么都一样），时间和币种按上面的筛选。" +
+    "周末一轮 56 小时、工作日 112 小时，总盈亏不能直接比，看「单场均」「收益率」和 z 值；z 值低于 −2 说明那段时间买到的一边赢得明显比五五开少。";
+}
 let chartTimer = null;
 window.addEventListener("resize", () => { clearTimeout(chartTimer); chartTimer = setTimeout(() => { renderChart(); if (state.journal) renderModel(); }, 200); });
 
@@ -953,9 +991,11 @@ function renderChanges(list) {
   };
 }
 function renderReplay(C) {
-  const rec = C.recommend;
+  const part = state.jDay !== "all" || state.jCoins.length;   // a part of the windows: no reason to change them all
+  const rec = part ? null : C.recommend;
   $("cAdvice").innerHTML = "<b>结论：" + esc(C.advice || "—") + "</b>" +
     (rec ? ` <button class="small" id="cApply">改成开场前 ${esc(String(rec))} 秒撤单</button>` : "") +
+    (part && C.recommend ? '<br><span class="muted">只筛了一部分场次（币种或周末/工作日），不在这里改全局的撤单时间；要改请回到「全部」再看</span>' : "") +
     ((C.losses || []).length ? `<br>亏在哪：${esc(C.losses.map((t) => `${t.bucket} ${t.pnl >= 0 ? "+" : ""}${t.pnl.toFixed(2)}（赢 ${(t.win_rate * 100).toFixed(0)}%，保本 ${(t.breakeven * 100).toFixed(0)}%）`).join("；"))}` : "") +
     (C.after_start || C.after_cancel ? `<br><span class="warn">⚠️ ${C.after_start} 笔开场后成交、${C.after_cancel} 笔撤单确认后成交：撤单或到期没及时生效</span>` : "");
   if (rec) $("cApply").onclick = () => act("set_cancel", `把撤单改成开场前 ${rec} 秒？距开场不足的时间和订单自己的到期时间会一起调整（和 Telegram 复盘的按钮一样），立即生效。`, {seconds: rec}).then(() => loadJournal({}, true));
@@ -979,7 +1019,8 @@ function renderJournal() {
     `成交 ${T[k].filled} 场 / 报价 ${T[k].quoted}（${pct(T[k].fill_rate)}）` + (T[k].upcoming ? `，还没开场 ${T[k].upcoming}` : "") + `；双边率 ${pct(T[k].both_rate)}；赢 ${T[k].wins} 输 ${T[k].losses}` + (T[k].open ? `，待结算 ${T[k].open}` : "") + `；成交额 ${money(T[k].volume)}，收益率 ${pct(T[k].roi)}`)).join("");
   const info = d.span || {range: "all", label: "全部"};
   renderFilters(info);
-  const scope = info.label + (d.coins && d.coins.length ? " · " + d.coins.join("、") : "");
+  const scope = info.label + (d.coins && d.coins.length ? " · " + d.coins.join("、") : "") +
+    (d.day_type === "weekend" ? " · 仅周末" : d.day_type === "weekday" ? " · 仅工作日" : "");
   $("jRange").innerHTML = card(`已结算盈亏（${scope}）`, signed(R.pnl), `收益率 ${pct(R.roi)}；单场均 ${R.avg_pnl == null ? "—" : signed(R.avg_pnl)}`) +
     card("已结算成本", money(R.cost), `回款 ${money(R.payout)}`) +
     card("成交场次", String(R.filled), `报价 ${R.quoted} 场，成交率 ${pct(R.fill_rate)}` + (R.upcoming ? `；还没开场 ${R.upcoming} 场（不算成交率）` : "")) +
@@ -987,6 +1028,7 @@ function renderJournal() {
     card("成交量", `${shares(R.shares)} 份`, `成交额 ${money(R.volume)}`);
   renderChart();
   renderModel();
+  renderWeekend();
   renderReplay(d.cancel || {});
   table("jPrice", ["挂价", "盈亏", "赢的比例 / 保本", "成交率", "报价次数", "双边", "成交份数", "第几档"], d.by_price.map((x) =>
     `<tr><td>${x.filled ? `<a class="link" data-price="${x.price}">${x.price}¢ 看场次</a>` : x.price + "¢"}</td><td>${signed(x.pnl)}</td>` +
@@ -998,11 +1040,12 @@ function renderJournal() {
     `<td>${pct(x.fill_rate)}</td><td>${x.both}</td><td>${pct(x.both_rate)}</td><td>${x.wins}/${x.losses}</td><td>${x.avg_pnl == null ? "—" : signed(x.avg_pnl)}</td><td>${pct(x.roi)}</td></tr>`;
   const head = ["盈亏", "成交额", "成交份数", "成交场次", "报价场次", "成交率", "双边", "双边率", "赢/输", "单场均", "收益率"];
   const days = d.by_day.slice(0, 120);
-  table("jDay", ["日期"].concat(head), days.map((x) => row(x.day, x)));
+  table("jDay", ["日期"].concat(head), days.map((x) => row(x.day + (x.weekday ? `（${x.weekday}）` : ""), x)));
   $("jDayNote").textContent = "成交额 = 买到的份数 × 买价（还没结算的也算）；盈亏、收益率、单场均盈亏只算已经结算的场次；成交率只算已经开场的场次（报价场次后面的 +N 是还没开场的）。" +
     (d.by_day.length > days.length ? `页面列最近 ${days.length} 天，共 ${d.by_day.length} 天，全部在「导出每日汇总 CSV」。` : "");
   table("jCoin", ["币种"].concat(head), d.by_coin.map((x) => row(x.coin, x)));
   table("jHour", ["开场"].concat(head), d.by_hour.map((x) => row(String(x.hour).padStart(2, "0") + ":00", x)));
+  $("jHourNote").textContent = d.day_type === "weekend" ? "周末包括周一 00–08 点，所以每个周末 00–07 点有 3 天、08–23 点只有 2 天：比较哪个钟点好坏看「单场均」和「收益率」，别看总盈亏。" : "";
   table("jSide", ["", "份数", "成本", "回款", "盈亏", "赢的比例 / 保本"], d.by_side.map((x) =>
     `<tr><td>${esc(x.name)}</td><td>${shares(x.shares)}</td><td>${money(x.cost)}</td><td>${x.payout == null ? "—" : money(x.payout)}</td><td>${x.pnl == null ? "—" : signed(x.pnl)}</td>` +
     `<td>${x.win_rate == null ? (x.breakeven == null ? "" : "— / " + x.breakeven + "%") : `<span class="${x.win_rate >= x.breakeven ? "good" : "bad"}">${x.win_rate}%</span> / ${x.breakeven}%`}</td></tr>`));
@@ -1036,6 +1079,7 @@ async function loadJournal(next, force) {
     if (want.range === "custom") { state.jFrom = want.from; state.jTo = want.to; store.set("jFrom", want.from); store.set("jTo", want.to); }
     if (want.range === "since") { state.jFrom = want.from; store.set("jFrom", want.from); }
     state.jCoins = want.coins; store.set("jCoins", want.coins.join(","));
+    state.jDay = want.day; store.set("jDay", want.day);
     state.mSort = want.sort; store.set("mSort", want.sort);
     const text = JSON.stringify(r.data);
     if (text === state.jText && !force) return;   // nothing changed: the tables (and where they are scrolled) stay

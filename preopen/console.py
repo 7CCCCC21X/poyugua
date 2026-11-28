@@ -74,6 +74,12 @@ class Console:
         return journal.span_from(str(q.get("range") or "all"), str(q.get("from") or ""), str(q.get("to") or ""), self.engine.now(),
                                  self.engine.update_points())
 
+    @staticmethod
+    def day_type(query: dict[str, str] | None) -> str:
+        """The day filter: day=weekend (北京时间周六 0 点～周一 8 点, as PREOPEN_WEEKEND) or weekday; else all."""
+        day = str((query or {}).get("day") or "all")
+        return day if day in journal.DAY_TYPES else "all"
+
     def coins(self, query: dict[str, str] | None) -> list[str]:
         """The coin filter: coins=btc,eth (none or unknown ones: every coin). The seven, and any other coin traded."""
         known = set(config.COINS) | set(self.engine.s.coins)
@@ -121,9 +127,10 @@ class Console:
         except ValueError as error:
             return {"error": str(error)}
         coins = self.coins(query)
+        day = self.day_type(query)
         how = str((query or {}).get("sort") or "time")
         how = how if how in ("time", "loss", "gain") else "time"
-        key = ("review", info["range"], info["from"], info["to"], tuple(coins), how)   # 上次更新起 moves: its start is in the key
+        key = ("review", info["range"], info["from"], info["to"], tuple(coins), how, day)   # 上次更新起 moves: its start is in the key
         hit = self._reviews.get(key)
         if hit and time.monotonic() - hit[0] < REVIEW_CACHE_S:
             return hit[1]
@@ -134,9 +141,9 @@ class Console:
 
         def work(read: Callable[..., Any]) -> dict[str, Any]:
             out = journal.journal(read(lo, hi), now, cancel_s, span, coins or None, cards=cards,
-                                  market_limit=journal.MARKETS_SHOWN, market_sort=how)
+                                  market_limit=journal.MARKETS_SHOWN, market_sort=how, day_type=day)
             out.update(span=info, sort=how, market_more=max(0, out["market_count"] - journal.MARKETS_SHOWN),
-                       changes=journal.change_effects(read, now, log, coins or None))
+                       changes=journal.change_effects(read, now, log, coins or None, day_type=day))
             return out
         return await self.computed(key, work)
 
@@ -148,42 +155,48 @@ class Console:
         except ValueError as error:
             return {"error": str(error) or "价格不对"}
         coins = self.coins(query)
+        day = self.day_type(query)
         now = self.engine.now()
         lo, hi = span or (float("-inf"), float("inf"))
-        return await self.computed(("price", info["range"], info["from"], info["to"], tuple(coins), price),
-                                   lambda read: journal.price_markets(read(lo, hi), now, price, span, coins or None))
+        return await self.computed(("price", info["range"], info["from"], info["to"], tuple(coins), price, day),
+                                   lambda read: journal.price_markets(read(lo, hi), now, price, span, coins or None, day_type=day))
 
     def label(self, query: dict[str, str] | None) -> tuple[tuple[float, float] | None, str, list[str]]:
         """The filter for an export: its span, a label for the file name, the coins. ValueError on a bad custom filter
         (11-21 review: it fell back to everything without a word)."""
         span, info = self.span(query)
         coins = self.coins(query)
-        return span, (info.get("label") or "全部") + ("_" + "".join(mk.name_of(c) for c in coins) if coins else ""), coins
+        day = self.day_type(query)
+        return span, ((info.get("label") or "全部") + ("_" + "".join(mk.name_of(c) for c in coins) if coins else "")
+                      + ("_" + journal.DAY_TYPES[day].removeprefix("仅") if day != "all" else "")), coins
 
     async def xlsx(self, query: dict[str, str] | None = None) -> tuple[str, bytes]:
         """The review as one Excel file, for the windows in the filter."""
         span, label, coins = self.label(query)
+        day = self.day_type(query)
 
         def work(read: Callable[..., Any]) -> tuple[str, bytes]:
-            name, data, _ = export.from_engine(self.engine, span, label, read, coins or None)
+            name, data, _ = export.from_engine(self.engine, span, label, read, coins or None, day_type=day)
             return name, data
         return await self.computed(("xlsx", label, span, tuple(coins)), work)
 
     async def csv(self, kind: str, query: dict[str, str] | None = None) -> tuple[str, str]:
         """A CSV of the windows in the filter, named after it (the quotes and the fills: all of them, the latest first)."""
         span, label, coins = self.label(query)
+        day = self.day_type(query)
         now, cancel_s = self.engine.now(), self.engine.s.cancel_s
         tag = "".join(ch for ch in label if ch.isalnum() or ch in "-_")
         lo, hi = span or (float("-inf"), float("inf"))
 
         def work(read: Callable[..., Any]) -> tuple[str, str]:
-            def stream(newest: bool = False) -> Any:
-                return (q for q in read(lo, hi, newest) if not coins or q["coin"] in coins)
+            def stream(newest: bool = False, days: bool = True) -> Any:
+                return (q for q in read(lo, hi, newest) if (not coins or q["coin"] in coins)
+                        and (not days or journal.day_ok(q["start"], day)))
             if kind == "quotes":
                 return f"preopen-quotes-{tag}.csv", journal.quotes_csv(stream(True))
             if kind == "detail":
                 return f"preopen-fills-{tag}.csv", journal.detail_csv(stream(True))
-            review = journal.journal(stream(), now, cancel_s, span)
+            review = journal.journal(stream(days=False), now, cancel_s, span, day_type=day)
             if kind == "daily":
                 return f"preopen-daily-{tag}.csv", journal.daily_csv(review)
             if kind == "markets":

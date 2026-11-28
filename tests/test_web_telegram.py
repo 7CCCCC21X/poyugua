@@ -275,7 +275,7 @@ class TelegramTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("【如果提前撤单】", review.text)
         self.assertIn("什么时候成交的", review.text)
         buttons = [b["callback_data"] for row in review.markup["inline_keyboard"] for b in row]
-        self.assertEqual(buttons[-5:], ["rev_today", "rev_yesterday", "rev_7", "rev_30", "rev_all"])   # another time, a tap away
+        self.assertEqual(buttons[-7:], ["rev_today", "rev_yesterday", "rev_7", "rev_30", "rev_all", "rev_weekend", "rev_weekday"])   # a tap away
         self.assertIn("（BTC、最近 7 天）", await say("/review", ["btc", "7"]))
         self.assertIn("报价 0 场", await say("/review", ["eth"]))  # only ETH: nothing quoted
         self.assertIn("看不懂：abc", await say("/review", ["abc"]))
@@ -292,7 +292,7 @@ class TelegramTest(unittest.IsolatedAsyncioTestCase):
         # /export alone: the time as buttons; a time: one Excel file
         choose = await handle("/export", [])
         self.assertEqual([b["callback_data"] for row in choose.markup["inline_keyboard"] for b in row],
-                         ["exp_today", "exp_yesterday", "exp_7", "exp_30", "exp_all"])
+                         ["exp_today", "exp_yesterday", "exp_7", "exp_30", "exp_all", "exp_weekend", "exp_weekday"])
         self.assertEqual(choose.files, [])
         book = await handle("/exp_all", [])
         (name, data), = book.files

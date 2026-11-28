@@ -35,6 +35,13 @@ UPDATE_WORDS = ("更新", "上次更新", "上次更新起", "更新起", "updat
 COIN_RHO = 0.62           # the coins' results of one window go together: two of them agreed in 81% of 36,288 pairs
                           # (11-20 to 11-25, seven coins), a correlation of 0.62. The luck of a start's fills counts it.
 RESULTS = (*mk.SIDES, mk.SPLIT)   # a settled record's result: a side won, or the market paid 50/50
+DAY_TYPES = {"all": "全部", "weekend": "仅周末", "weekday": "仅工作日"}   # the review's day filter
+DAY_WORDS = {"周末": "weekend", "weekend": "weekend", "工作日": "weekday", "平日": "weekday", "weekday": "weekday"}
+WEEKDAY_CN = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+WEEKEND_PARTS = (("sat_early", "周六 00–05 点（美股周五下午还开着）"), ("sat_main", "周六 05–24 点（美股收盘后）"),
+                 ("sun_all", "周日全天"), ("mon_early", "周一 00–08 点（期货周日晚开盘前后）"))
+WEEKEND_RULE = "北京时间周六 00:00 ～ 周一 08:00，按开场时间（和参数「周末也挂」用的同一条线）"
+EACH_WEEKEND_IN_TEXT = 4  # Telegram's weekend review: this many weekends, the latest first
 MAX_DAYS = 3650           # /review 7, /export 30: a number of days back, at most this many
 MODEL_MIN = 30            # settled windows with a fill before the model's comparison is called anything but thin
 MODEL_STEPS = ((12 * 3600, 300), (7 * 86400, 3600))   # the curve's points: a window each up to 12 hours, an hour each up
@@ -161,6 +168,56 @@ def within(records: Iterable[dict], span: tuple[float, float] | None) -> list[di
         return list(records)
     lo, hi = span
     return [q for q in records if lo <= q["start"] < hi]
+
+
+def day_ok(start: float, day_type: str) -> bool:
+    """Whether a window starting then is in the day filter: all, the weekend (markets.on_weekend, the rule
+    PREOPEN_WEEKEND=off skips by), or the rest of the week."""
+    if day_type == "weekend":
+        return mk.on_weekend(int(start))
+    if day_type == "weekday":
+        return not mk.on_weekend(int(start))
+    return True
+
+
+def weekend_part(start: float) -> str | None:
+    """Which stretch of the weekend a window starting then is in (WEEKEND_PARTS), None on a weekday."""
+    t = dt.datetime.fromtimestamp(start, mk.BEIJING)
+    if t.weekday() == 5:
+        return "sat_early" if t.hour < 5 else "sat_main"
+    if t.weekday() == 6:
+        return "sun_all"
+    if t.weekday() == 0 and t.hour < 8:
+        return "mon_early"
+    return None
+
+
+def weekend_of(start: float) -> str:
+    """The weekend a window starting then belongs to: its Saturday's date (Monday before 08:00 is the Saturday before)."""
+    t = dt.datetime.fromtimestamp(start, mk.BEIJING)
+    return (t.date() - dt.timedelta(days=(t.weekday() - 5) % 7)).isoformat()
+
+
+def day_args(args: list[str]) -> tuple[str, list[str]]:
+    """Telegram's words for the day filter (周末, 工作日): the filter and the words left."""
+    day_type, rest = "all", []
+    for a in args:
+        word = DAY_WORDS.get(a.strip().lower())
+        if word:
+            day_type = word
+        else:
+            rest.append(a)
+    return day_type, rest
+
+
+def weekday_label(day: str, day_type: str = "all") -> str:
+    """周六; a Monday under a day filter says which part of it is in: 周一 00–08 点 (weekend) or 周一 08 点后 (weekdays)."""
+    name = WEEKDAY_CN[dt.date.fromisoformat(day).weekday()]
+    if name == "周一" and day_type == "weekend":
+        return "周一 00–08 点"
+    if name == "周一" and day_type == "weekday":
+        return "周一 08 点后"
+    return name
 
 
 def span_args(args: list[str], now: float,
@@ -430,11 +487,12 @@ class Model:
         self.coins: dict[str, list[float]] = {}                     # coin -> windows, shares, cost, expected, actual, variance
         self.waiting = 0
 
-    def add(self, start: float, windows: Iterable[dict[str, Any]]) -> None:
-        """The windows of one start (every coin's), complete."""
+    def add(self, start: float, windows: Iterable[dict[str, Any]], key: str = "inside") -> None:
+        """The windows of one start (every coin's), complete; those with `key` set (inside the review's filter, or
+        "scoped": in its time and coins whatever the day, for the weekend's comparison)."""
         nets, expected, actual = [], 0.0, 0.0
         for w in windows:
-            if not w["inside"] or not w["sides"]:
+            if not w.get(key) or not w["sides"]:
                 continue
             if not w["settled"]:
                 self.waiting += 1
@@ -481,14 +539,102 @@ class Model:
                 out.append(point)
         return out, step
 
+    def total(self) -> dict[str, Any]:
+        n = sum(int(c[0]) for c in self.coins.values())
+        return self.row("合计", n, sum(c[1] for c in self.coins.values()), sum(c[2] for c in self.coins.values()),
+                        sum(e for _, _, e, _ in self.starts), sum(a for _, a, _, _ in self.starts), sum(v for *_, v in self.starts))
+
     def finish(self) -> dict[str, Any]:
         rows = [self.row(name, *c) for name, c in sorted(self.coins.items())]
-        n = sum(r["windows"] for r in rows)
-        total = self.row("合计", n, sum(c[1] for c in self.coins.values()), sum(c[2] for c in self.coins.values()),
-                         sum(e for _, _, e, _ in self.starts), sum(a for _, a, _, _ in self.starts), sum(v for *_, v in self.starts))
+        total = self.total()
         points, step = self.points()
         return {"total": total, "by_coin": rows, "points": points, "step": step, "waiting": self.waiting,
                 "verdict": model_verdict(total), "rho": COIN_RHO}
+
+
+class Weekend:
+    """周末专项: the windows in the time and coins asked, whatever the day filter, split into the weekend (WEEKEND_RULE)
+    and the rest of the week; the weekend also into its four stretches (WEEKEND_PARTS) and into each weekend. Each
+    row: the counts and money as journal() counts them, the plan's comparison (Model: EV, luck, z) and the one-sided
+    shares' win rate against their breakeven (Sides). Fed a start at a time, its windows complete. A weekend not over
+    at `now` is named so (进行中): its numbers are part of one."""
+
+    def __init__(self, now: float = float("inf")) -> None:
+        self.now = now
+        self.rows: dict[str, dict[str, Any]] = {}
+        self.models: dict[str, Model] = {}
+        self.sides: dict[str, Sides] = {}
+        self.at: float | None = None                 # the start whose keys and buckets are at hand (a start's windows
+        self.at_keys: list[str] = []                 # come together: worked out once a start, not once a window)
+        self.at_buckets: list[dict[str, Any]] = []
+
+    @staticmethod
+    def keys(start: float) -> list[str]:
+        part = weekend_part(start)
+        return ["weekday"] if part is None else ["weekend", part, "each:" + weekend_of(start)]
+
+    def _at(self, start: float) -> None:
+        if start != self.at:
+            self.at, self.at_keys = start, self.keys(start)
+            self.at_buckets = [self.rows[k] if k in self.rows else self.rows.setdefault(k, _blank()) for k in self.at_keys]
+
+    def buckets(self, start: float) -> list[dict[str, Any]]:
+        self._at(start)
+        return self.at_buckets
+
+    def add(self, start: float, windows: Iterable[dict[str, Any]]) -> None:
+        scoped = [w for w in windows if w.get("scoped")]
+        if not scoped:
+            return
+        self._at(start)
+        for k in self.at_keys:
+            self.models.setdefault(k, Model()).add(start, scoped, key="scoped")
+            sides = self.sides.setdefault(k, Sides())
+            for w in scoped:
+                sides.add(w)
+
+    def row(self, key: str, name: str, **extra: Any) -> dict[str, Any]:
+        out = {"key": key, "name": name, **_finish(self.rows.get(key) or _blank()), **extra}
+        t = (self.models.get(key) or Model()).total()
+        out.update(ev=t["ev"], diff=t["diff"], sd=t["sd"], z=t["z"], settled_filled=t["windows"])
+        one = [r for r in (self.sides.get(key) or Sides()).rows()[1:3] if r["shares"]]
+        sh = sum(r["shares"] for r in one)
+        out["one_win_rate"] = round(sum(r["payout"] or 0 for r in one) / sh * 100, 1) if sh else None
+        out["one_breakeven"] = round(sum(r["cost"] for r in one) / sh * 100, 1) if sh else None
+        return out
+
+    def finish(self) -> dict[str, Any]:
+        split = [self.row("weekday", "工作日"), self.row("weekend", "周末")]
+        parts = [self.row(k, name) for k, name in WEEKEND_PARTS]
+        each = []
+        for key in sorted((k for k in self.rows if k.startswith("each:")), reverse=True):
+            sat = dt.date.fromisoformat(key[5:])
+            mon = sat + dt.timedelta(days=2)
+            ongoing = dt.datetime.combine(mon, dt.time(8), tzinfo=mk.BEIJING).timestamp() > self.now
+            each.append(self.row(key, f"{sat:%m-%d}～{mon:%m-%d}" + ("（进行中）" if ongoing else ""), sat=sat.isoformat(),
+                                 ongoing=ongoing, **{"from": f"{sat.isoformat()}T00:00", "to": f"{mon.isoformat()}T08:00"}))
+        return {"definition": WEEKEND_RULE, "verdict": weekend_verdict(split[0], split[1]), "split": split, "parts": parts,
+                "each": each}
+
+
+def weekend_verdict(weekday: dict[str, Any], weekend: dict[str, Any]) -> str:
+    """One sentence: the weekend against the plan, beside the weekdays; whether its gap is more than luck."""
+    if not weekend["filled"]:
+        return "这段时间没有周末的成交"
+    n = weekend["settled_filled"]
+    if n < MODEL_MIN:
+        return f"周末已结算的成交只有 {n} 场，样本太少，先别下结论（攒够 {MODEL_MIN} 场、两三个周末再看）"
+
+    def said(r: dict[str, Any]) -> str:
+        z = f"{r['z']:+.1f}σ" if r["z"] is not None else "没有运气成分"
+        return f"实际 {r['pnl']:+.2f}，模型 {r['ev']:+.2f}（{z}），单场均 {r['avg_pnl'] or 0:+.2f}"
+    text = f"周末 {n} 场：{said(weekend)}" + (f"；工作日 {weekday['settled_filled']} 场：{said(weekday)}" if weekday["settled_filled"] else "")
+    z = weekend["z"]
+    if z is not None and z <= -2:
+        return text + "。周末买到的那一边赢得明显比五五开少（被知道方向的人吃单）：可以考虑周末不挂（参数「周末也挂」关掉）"
+    if z is not None and z >= 2:
+        return text + "。周末比五五开好，超出了运气能解释的范围"
+    return text + "。周末的差距还在运气能解释的范围内（±2σ）"
 
 
 def model_verdict(total: dict[str, Any]) -> str:
@@ -560,7 +706,7 @@ def add_cards(*parts: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
 
 def journal(records: Iterable[dict], now: float, current: int | None = None, span: tuple[float, float] | None = None,
             coins: Iterable[str] | None = None, cards: dict[str, dict[str, Any]] | None = None,
-            market_limit: int | None = None, market_sort: str = "time") -> dict[str, Any]:
+            market_limit: int | None = None, market_sort: str = "time", day_type: str = "all") -> dict[str, Any]:
     """The review: totals (today, 7 days, all: always the whole of `records`, unless `cards` brings them made
     elsewhere), and for the windows starting within `span` (all of them for None) of the coins named (all for None):
     their totals ("range"), by day, coin, starting hour, price, side (pairs and one-sided), how fast the first level
@@ -569,8 +715,11 @@ def journal(records: Iterable[dict], now: float, current: int | None = None, spa
     together); the money adds up record by record; each fill goes to the time it came. Another account's records (an
     old one, after the ledger was bound anew) are left out. Records in start order (by_start): each window is closed
     as the starts move past it, so the work's memory is the summaries', not the ledger's. The markets are sorted
-    (market_sort: time, loss, gain) over all of them and the first `market_limit` listed (market_count: how many)."""
+    (market_sort: time, loss, gain) over all of them and the first `market_limit` listed (market_count: how many).
+    `day_type` (DAY_TYPES) narrows everything to the weekend or the weekdays, except the weekend's comparison
+    ("weekend"), which always sets the two side by side over the time and coins asked."""
     lo, hi = span or (float("-inf"), float("inf"))
+    day_type = day_type if day_type in DAY_TYPES else "all"
     wanted = {c.lower() for c in coins} if coins else None
     stream = by_start(records)
     if cards is not None:  # the cards come ready: the filter's records alone
@@ -584,7 +733,7 @@ def journal(records: Iterable[dict], now: float, current: int | None = None, spa
     by_lead: dict[str, dict] = {name: {"bucket": name, "fills": 0, "shares": D(0), "cost": D(0), "won": D(0)} for _, name in LEAD_BUCKETS}
     by_speed = {name: _speed_blank(name) for name in [n for _, n in SPEED] + [SPEED_LATE]}
     by_price: dict[D, dict[str, Any]] = {}
-    sides, replay, model = Sides(), Replay(now, current), Model()
+    sides, replay, model, weekend = Sides(), Replay(now, current), Model(), Weekend(now)
     markets: list[tuple] = []   # compact (market_tuple): months of windows are many
     detail: collections.deque = collections.deque(maxlen=DETAIL_SHOWN)
     detail_n = 0
@@ -598,6 +747,7 @@ def journal(records: Iterable[dict], now: float, current: int | None = None, spa
         """The windows of a start, complete: counted, listed, split by side, replayed; then let go."""
         if at is not None:
             model.add(at, windows.values())
+            weekend.add(at, windows.values())
         for w in windows.values():
             for b in w["buckets"]:
                 _count(b, w)
@@ -619,7 +769,8 @@ def journal(records: Iterable[dict], now: float, current: int | None = None, spa
             close()
             at = start
             day, hour = day_of(start), hour_of(start)
-        inside = lo <= start < hi and (wanted is None or q["coin"] in wanted)
+        scoped = lo <= start < hi and (wanted is None or q["coin"] in wanted)   # the time and coins asked
+        inside = scoped and day_ok(start, day_type)                             # ...and the days
         started = start <= now
         w = windows.get(q["slug"])
         if w is None:
@@ -630,9 +781,12 @@ def journal(records: Iterable[dict], now: float, current: int | None = None, spa
                     buckets.append(totals["today"])
                 if day in week:
                     buckets.append(totals["7d"])
+            if scoped:
+                buckets += weekend.buckets(start)
             if inside:
                 buckets += [totals["range"], by_day[day], by_coin[mk.name_of(q["coin"])], by_hour[hour]]
             w = windows[q["slug"]] = _window(q, started, inside, buckets)
+            w["scoped"] = scoped
         raw = str(q["price"])
         price = prices.get(raw)
         if price is None:
@@ -707,7 +861,7 @@ def journal(records: Iterable[dict], now: float, current: int | None = None, spa
         "totals": {k: _finish(v) for k, v in totals.items()},
         "span": span_label(span),
         "coins": sorted(mk.name_of(c) for c in wanted) if wanted else [],
-        "by_day": [{"day": d, **_finish(v)} for d, v in sorted(by_day.items(), reverse=True)],
+        "by_day": [{"day": d, "weekday": weekday_label(d, day_type), **_finish(v)} for d, v in sorted(by_day.items(), reverse=True)],
         "by_coin": [{"coin": c, **_finish(v)} for c, v in sorted(by_coin.items())],
         "by_hour": [{"hour": h, **_finish(by_hour[h])} for h in range(24) if h in by_hour],
         "by_side": sides.rows(),
@@ -722,6 +876,8 @@ def journal(records: Iterable[dict], now: float, current: int | None = None, spa
         "detail": list(reversed(detail)),
         "cancel": replay.finish(),
         "model": model.finish(),
+        "day_type": day_type,
+        "weekend": weekend.finish(),
         "detail_more": max(0, detail_n - DETAIL_SHOWN),
     }
 
@@ -774,7 +930,7 @@ def sort_markets(markets: list, how: str) -> list:
 
 
 def price_markets(records: Iterable[dict], now: float, price_cents: float, span: tuple[float, float] | None = None,
-                  coins: Iterable[str] | None = None, limit: int = 100) -> dict[str, Any]:
+                  coins: Iterable[str] | None = None, limit: int = 100, day_type: str = "all") -> dict[str, Any]:
     """One price opened up: every quote there that filled, in the filter, the biggest loss first: where the money at
     that price went (which coins, which hours, which side)."""
     lo, hi = span or (float("-inf"), float("inf"))
@@ -784,7 +940,7 @@ def price_markets(records: Iterable[dict], now: float, price_cents: float, span:
     for q in records:
         if q.get("foreign") or not (lo <= q["start"] < hi) or (wanted is not None and q["coin"] not in wanted):
             continue
-        if num(q["price"]) != target:
+        if num(q["price"]) != target or not day_ok(q["start"], day_type):
             continue
         f = filled(q)
         if not any(f.values()):
@@ -803,13 +959,15 @@ def price_markets(records: Iterable[dict], now: float, price_cents: float, span:
             "losing": sum(1 for r in settled_rows if r["pnl"] < 0), "rows": rows[:limit], "more": max(0, len(rows) - limit)}
 
 
-def span_stats(records: Iterable[dict], now: float, lo: float, hi: float, coins: Iterable[str] | None = None) -> dict[str, Any]:
+def span_stats(records: Iterable[dict], now: float, lo: float, hi: float, coins: Iterable[str] | None = None,
+               day_type: str = "all") -> dict[str, Any]:
     """The totals of the windows starting from `lo` to `hi`, counted as journal() counts them."""
     wanted = {c.lower() for c in coins} if coins else None
     total = _blank()
     windows: dict[str, dict[str, Any]] = {}
     for q in records:
-        if q.get("foreign") or not (lo <= q["start"] < hi) or (wanted is not None and q["coin"] not in wanted):
+        if q.get("foreign") or not (lo <= q["start"] < hi) or (wanted is not None and q["coin"] not in wanted) \
+                or not day_ok(q["start"], day_type):
             continue
         f = filled(q)
         if not q.get("placed") and not any(f.values()):
@@ -825,7 +983,7 @@ def span_stats(records: Iterable[dict], now: float, lo: float, hi: float, coins:
 
 
 def change_effects(read: Callable[[float, float], Iterable[dict]], now: float, log: Iterable[dict],
-                   coins: Iterable[str] | None = None, limit: int = 8) -> list[dict[str, Any]]:
+                   coins: Iterable[str] | None = None, limit: int = 8, day_type: str = "all") -> list[dict[str, Any]]:
     """Each settings change (the latest first) with the windows after it (until the next change, or now) beside as long
     a time before it (from the change before, at most): what the change did to the fill rate, both sides, the volume
     and the P&L. Windows are placed by their start; a window quoted before a change and starting after it counts after.
@@ -839,8 +997,8 @@ def change_effects(read: Callable[[float, float], Iterable[dict]], now: float, l
         since = max(at - length, float(changes[i - 1]["at"]) if i > 0 else float("-inf"))
         out.append({"at": at, "when": mk.hm(at), "via": changes[i].get("via") or "", "changes": changes[i]["changes"],
                     "after_hours": round(length / 3600, 1), "before_hours": round((at - since) / 3600, 1),
-                    "after": span_stats(read(at, at + length), now, at, at + length, coins),
-                    "before": span_stats(read(since, at), now, since, at, coins)})
+                    "after": span_stats(read(at, at + length), now, at, at + length, coins, day_type),
+                    "before": span_stats(read(since, at), now, since, at, coins, day_type)})
     return out
 
 
@@ -1199,6 +1357,34 @@ def speed_table(review: dict) -> list[list[Any]]:
         for r in review["by_speed"]]
 
 
+WEEKEND_HEAD = ["已结算盈亏$", "模型 EV$", "实际 - 模型$", "z 值（σ）", "单边：买到的一边赢%", "单边保本%", "成交率%", "双边率%",
+                "成交场次", "报价场次（已开场）", "成交额$", "单场均盈亏$", "收益率%", "已结算的成交场次"]
+
+
+def weekend_rows(rows: list[dict[str, Any]]) -> list[list[Any]]:
+    def cell(v: Any) -> Any:
+        return "" if v is None else v
+    return [[r["name"]] + [cell(r[k]) for k in ("pnl", "ev", "diff", "z", "one_win_rate", "one_breakeven", "fill_rate",
+                                                 "both_rate", "filled", "quoted", "volume", "avg_pnl", "roi", "settled_filled")]
+            for r in rows]
+
+
+def weekend_table(review: dict) -> tuple[list[list[Any]], set[int]]:
+    """The weekend's comparison for the workbook: how to read it, the weekdays beside the weekend, the weekend's four
+    stretches, and each weekend (the latest first). Returns the rows and those that title a part."""
+    w = review.get("weekend") or {"verdict": "", "definition": WEEKEND_RULE, "split": [], "parts": [], "each": []}
+    rows: list[list[Any]] = [["结论", w["verdict"]], ["周末是", w["definition"]],
+                             ["怎么读", "z 值低于 −2：那一段买到的一边赢得明显比五五开少（被知道方向的人吃单）。周末一轮 56 小时、工作日 112 小时，"
+                                       "总盈亏不能直接比，看「单场均盈亏」和「收益率」；四段的长短也不一样（5、19、24、8 小时）"], []]
+    bold = set()
+    for title, part in (("工作日 vs 周末", w["split"]), ("周末的四段", w["parts"]), ("逐个周末（周六 0 点～周一 8 点）", w["each"])):
+        bold.add(len(rows))
+        rows.append([title] + WEEKEND_HEAD)
+        rows += weekend_rows(part) or [["（这段时间没有）"]]
+        rows.append([])
+    return rows, bold
+
+
 MODEL_HEAD = ["币种", "已结算的成交场次", "份数", "成本$", "模型 EV$（每边按 50% 胜率）", "实际盈亏$", "实际 - 模型$", "运气的一个标准差$", "z 值（σ）"]
 
 
@@ -1349,6 +1535,28 @@ def cancel_csv(review: dict) -> str:
     return to_csv(cancel_table(review)[0])
 
 
+def weekend_text(j: dict[str, Any]) -> list[str]:
+    """Telegram's weekend part: the weekend beside the weekdays (when both traded and no day filter is set); under
+    the weekend filter, its four stretches and the latest weekends."""
+    w = j.get("weekend") or {}
+    if not w:
+        return []
+
+    def line(r: dict[str, Any]) -> str:
+        z = f"{r['z']:+.1f}σ" if r["z"] is not None else "—"
+        return (f"  {r['name']}：成交 {r['filled']}/{r['quoted']} 场，双边率 {r['both_rate'] if r['both_rate'] is not None else '—'}%，"
+                f"盈亏 {r['pnl']:+.2f}（单场均 {r['avg_pnl'] or 0:+.2f}），模型 {r['ev']:+.2f}（{z}）")
+    day_type = j.get("day_type") or "all"
+    out: list[str] = []
+    if day_type == "all" and all(r["filled"] for r in w["split"]):
+        out += ["", "【周末 vs 工作日】" + w["verdict"]] + [line(r) for r in w["split"]]
+    if day_type == "weekend":
+        out += ["", "【周末】" + w["verdict"], "【周末的四段】"] + [line(r) for r in w["parts"] if r["quoted"] or r["filled"]]
+        if w["each"]:
+            out += ["【逐个周末】最近的在前"] + [line(r) for r in w["each"][:EACH_WEEKEND_IN_TEXT]]
+    return out
+
+
 def review_text(records: list[dict], now: float, current: int | None = None, scope: str = "",
                 daily_limit: float = 0.0, j: dict[str, Any] | None = None) -> str:
     """The review for Telegram: the conclusion and where the money went first, then the replay, the fill times, the
@@ -1391,6 +1599,7 @@ def review_text(records: list[dict], now: float, current: int | None = None, sco
                          f"（保本 {t['breakeven'] * 100:.0f}%），盈亏 {t['pnl']:+.2f}")
     if c["by_coin"]:
         lines += ["", "【按币种】" + "，".join(f"{x['coin']} {x['pnl']:+.2f}（{x['filled']} 场成交）" for x in c["by_coin"])]
+    lines += weekend_text(j)
     if j["by_day"]:
         lines += ["", "【每日】成交额 = 买到的份数 × 买价；盈亏只算已结算的"]
         for d in j["by_day"][:DAYS_IN_TEXT]:
@@ -1413,8 +1622,8 @@ def review_text(records: list[dict], now: float, current: int | None = None, sco
                 lines.append(f"  {name}：" + "；".join(f"{m['coin']} {m['when']} {m['pnl']:+.2f}" for m in chosen))
         lines.append("  每一场的盈亏：网页「复盘」→ 按市场，或 /export 的市场盈亏 CSV")
     lines.append("")
-    if scope:  # the records were chosen by the caller: their whole is the selection
-        t = j["totals"]["all"]
+    if scope:  # the records were chosen by the caller: their whole is the selection, narrowed to the days asked
+        t = j["totals"]["range"]
         lines.append(f"合计（{scope}）：报价 {t['quoted']} 场，成交 {t['filled']} 场（双边 {t['both']}），成交额 ${t['volume']:.2f}，"
                      f"赢 {t['wins']} 输 {t['losses']}" + (f"，待结算 {t['open']}" if t["open"] else "") + f"，盈亏 {t['pnl']:+.2f} 美元")
         return "\n".join(lines)

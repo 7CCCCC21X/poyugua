@@ -17,6 +17,8 @@ GUIDE: tuple[tuple[str, str], ...] = (
     ("每日", "每天的成交量（份数、成交额）和盈亏：变好还是变坏；改参数前后对比（改的时间在「参数」表）"),
     ("模型EV", "实际盈亏和模型预期（每边按 50% 胜率）的差，够不够得上「不是运气」：z 值低于 −2 说明买到的那一边赢得比五五开少；"
                "下面是曲线的每个点（累计实际、累计模型、运气范围）"),
+    ("周末", "周末（北京时间周六 0 点～周一 8 点）和工作日并排比；周末再拆成四段、按每个周末列：周末是不是在亏、亏在哪一段、"
+             "是不是每个周末都这样。z 值低于 −2 的可以考虑周末不挂"),
     ("市场盈亏", "每一场（一个币的一个 5 分钟）几档合起来的盈亏：亏得多的场次有什么共同点（币种、时段、成交时刻）"),
     ("档位", "每个价格报价多少次、成交率、买到的那一边赢的比例。赢的比例低于保本比例（=价格）的价格在亏钱：降价或去掉这一档"),
     ("成交时刻", "成交离开场多久：越靠近开场越可能是知道方向的人在吃单。哪一行赢的比例低于保本，就把撤单提前到它之前"),
@@ -50,6 +52,11 @@ def overview(review: dict[str, Any], label: str, now: float, mode: str, quotes: 
         ["撤单时间", c["advice"]],
         ["可信度", f"{(c.get('confidence') or {}).get('level', '低')}：{'；'.join((c.get('confidence') or {}).get('notes') or [])}"],
     ]
+    for r in (review.get("weekend") or {}).get("split", []):
+        if r["filled"]:
+            z = f"{r['z']:+.1f}σ" if r["z"] is not None else "—"
+            rows.append([f"{r['name']}表现", f"盈亏 {r['pnl']:+.2f}（单场均 {r['avg_pnl'] or 0:+.2f}），模型 {r['ev']:+.2f}（{z}），"
+                                            f"成交 {r['filled']}/{r['quoted']} 场，双边率 {r['both_rate']}%（见「周末」表）"])
     model = review.get("model") or {}
     if (model.get("total") or {}).get("windows"):
         t = model["total"]
@@ -70,13 +77,13 @@ def overview(review: dict[str, Any], label: str, now: float, mode: str, quotes: 
     return Sheet("总览", rows, header=False, bold={0, 5, 20, title})
 
 
-def changes_for(records: Any, now: float, log: list[dict], coins: list[str] | None) -> list[dict]:
+def changes_for(records: Any, now: float, log: list[dict], coins: list[str] | None, day_type: str = "all") -> list[dict]:
     """The settings changes with the time before and after each, through the reader (or a list)."""
     def read(lo: float, hi: float, newest: bool = False) -> Any:
         if callable(records):
             return records(lo, hi, newest)
         return [q for q in records if lo <= q["start"] < hi]
-    return journal.change_effects(read, now, log, coins)
+    return journal.change_effects(read, now, log, coins, day_type=day_type)
 
 
 def settings_sheet(values: dict[str, str], log: list[dict], versions: list[dict] | None = None) -> Sheet:
@@ -102,28 +109,32 @@ def settings_sheet(values: dict[str, str], log: list[dict], versions: list[dict]
 
 def build(records: Any, now: float, current: int | None, span: tuple[float, float] | None, label: str, *,
           refusal_log: list[dict], settings: dict[str, str], settings_log: list[dict], mode: str,
-          coins: list[str] | None = None, versions: list[dict] | None = None) -> tuple[bytes, dict[str, Any]]:
+          coins: list[str] | None = None, versions: list[dict] | None = None, day_type: str = "all") -> tuple[bytes, dict[str, Any]]:
     """The workbook of the windows starting within `span` (all of them for None) of the coins named, and their totals.
     `records`: a list, or the engine's reader read(lo, hi, newest_first) (each part reads what it needs: the review in
     start order, the latest quotes and fills the newest first; the ledger never sits in memory whole)."""
     lo, hi = span or (float("-inf"), float("inf"))
     wanted = set(coins or [])
 
-    def stream(newest: bool = False) -> Any:
+    def stream(newest: bool = False, days: bool = False) -> Any:
+        """The records of the span and coins; with `days`, of the day filter too (the review applies it itself:
+        its weekend sheet sets the weekend beside the weekdays whatever the filter)."""
         source = journal.within(records, span) if isinstance(records, list) else records(lo, hi, newest)
-        return [q for q in source if not wanted or q["coin"] in wanted] if isinstance(source, list) else \
-            (q for q in source if not wanted or q["coin"] in wanted)
+        keep = (lambda q: (not wanted or q["coin"] in wanted) and (not days or journal.day_ok(q["start"], day_type)))
+        return [q for q in source if keep(q)] if isinstance(source, list) else (q for q in source if keep(q))
     with journal.quiet_gc():
-        review = journal.journal(stream(), now, current, span)
+        review = journal.journal(stream(), now, current, span, day_type=day_type)
         cancel = review["cancel"]
-        changes = changes_for(records, now, settings_log, coins)
-        quotes, quotes_all = journal.quotes_rows(stream(True), QUOTES_KEPT)
-        fills = journal.detail_table(stream(True), FILLS_KEPT)
+        changes = changes_for(records, now, settings_log, coins, day_type)
+        quotes, quotes_all = journal.quotes_rows(stream(True, days=True), QUOTES_KEPT)
+        fills = journal.detail_table(stream(True, days=True), FILLS_KEPT)
         model_rows, model_bold = journal.model_table(review)
+        weekend_rows, weekend_bold = journal.weekend_table(review)
     return workbook([
         overview(review, label, now, mode, len(quotes) - 1, quotes_all, len(fills) - 1),
         Sheet("每日", journal.daily_table(review)),
         Sheet("模型EV", model_rows, header=False, bold=model_bold),
+        Sheet("周末", weekend_rows, header=False, bold=weekend_bold),
         Sheet("市场盈亏", journal.markets_table(review)),
         Sheet("档位", journal.price_table(review)),
         Sheet("成交时刻", journal.fill_time_table(cancel)),
@@ -141,11 +152,11 @@ def build(records: Any, now: float, current: int | None, span: tuple[float, floa
 
 
 def from_engine(engine: Any, span: tuple[float, float] | None, label: str, read: Any,
-                coins: list[str] | None = None) -> tuple[str, bytes, dict[str, Any]]:
+                coins: list[str] | None = None, day_type: str = "all") -> tuple[str, bytes, dict[str, Any]]:
     """The file name, the workbook and the span's totals, from the engine's reader (engine.review_reader(), made on the
     event loop), refusal log and settings. Meant for a thread of its own."""
     now = engine.now()
     data, totals = build(read, now, engine.s.cancel_s, span, label, refusal_log=list(engine.refusal_log),
                          settings=config.current_values(engine.s), settings_log=list(engine.settings_log), mode=engine.s.mode(),
-                         coins=coins, versions=list(getattr(engine, "version_log", [])))
+                         coins=coins, versions=list(getattr(engine, "version_log", [])), day_type=day_type)
     return file_name(label, now), data, totals

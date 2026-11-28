@@ -340,7 +340,7 @@ class UpdateSpanTest(unittest.IsolatedAsyncioTestCase):
         reply = main.review(e, ["更新"])
         self.assertIn(f"（上次更新（{mk.hm(changed)} 改参数）以来）", reply.text.splitlines()[0])
         self.assertIn("模型对实际：模型 EV +3.00", reply.text)
-        self.assertEqual(reply.markup["inline_keyboard"][-1], [{"text": f"上次更新起（{mk.hm(changed)} 改参数）", "callback_data": "rev_update"}])
+        self.assertEqual(reply.markup["inline_keyboard"][-2], [{"text": f"上次更新起（{mk.hm(changed)} 改参数）", "callback_data": "rev_update"}])
         handle = main.commander(settings(**ENV), e, pub, c)
         book = await handle("/exp_update", [])               # 📤 导出 → 上次更新起
         self.assertTrue(book.files[0][0].startswith("复盘_上次更新"))

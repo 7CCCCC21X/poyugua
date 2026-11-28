@@ -77,11 +77,14 @@ def acquire_lock(ledger_path: str):
 
 
 REVIEW_USAGE = ("用法：/review（全部）、/review 今天、/review 昨天、/review 7（最近 7 天）、/review 11-20（那一天）、"
-                "/review 11-18 11-20（这几天）、/review 更新（上次改参数或更新版本以来）、/review btc、/review btc eth 3")
+                "/review 11-18 11-20（这几天）、/review 更新（上次改参数或更新版本以来）、/review btc、/review btc eth 3；"
+                "加「周末」或「工作日」只看那几天：/review 周末、/review 30 周末、/review 更新 工作日")
 EXPORT_USAGE = ("用法：/export（点按钮选时间）、/export 今天、/export 昨天、/export 7（最近 7 天）、/export 11-20、/export 11-18 11-20、"
-                "/export 更新（上次改参数或更新版本以来）、/export 全部；/export csv 7 = 旧的 CSV 文件")
+                "/export 更新（上次改参数或更新版本以来）、/export 全部、/export 30 周末、/export 工作日；/export csv 7 = 旧的 CSV 文件")
 RANGE_BUTTONS = (("今天", "today"), ("昨天", "yesterday"), ("近 7 天", "7"), ("近 30 天", "30"), ("全部", "all"), ("上次更新起", "update"))
-RANGE_WORDS = {"today": "今天", "yesterday": "昨天", "all": "全部", "update": "更新"}   # a button's callback -> the time word it stands for
+RANGE_WORDS = {"today": "今天", "yesterday": "昨天", "all": "全部", "update": "更新",   # a button's callback -> its words
+               "weekend": "周末", "weekday": "工作日"}
+DAY_NAMES = {"weekend": "周末", "weekday": "工作日"}
 
 
 def range_buttons(prefix: str, engine: Engine | None = None) -> list[list[dict]]:
@@ -92,6 +95,7 @@ def range_buttons(prefix: str, engine: Engine | None = None) -> list[list[dict]]
     latest = (engine.update_points(1) if engine is not None else [])[:1]
     if latest:
         rows.append([{"text": f"上次更新起（{latest[0]['when']} {latest[0]['kind']}）", "callback_data": f"{prefix}update"}])
+    rows.append([{"text": "仅看周末", "callback_data": f"{prefix}weekend"}, {"text": "仅看工作日", "callback_data": f"{prefix}weekday"}])
     return rows
 
 
@@ -100,6 +104,7 @@ def review(engine: Engine, args: list[str], read: Any = None) -> Reply | str:
     number of days back, a date or two) and the coins named (default: all). `read`: the engine's reader, made on the
     event loop (Engine.review_reader), so that this runs in a thread of its own."""
     now = engine.now()
+    day_type, args = journal.day_args(args)
     try:
         span, label, rest = journal.span_args(args, now, engine.update_points())
     except ValueError as error:
@@ -115,13 +120,14 @@ def review(engine: Engine, args: list[str], read: Any = None) -> Reply | str:
         return f"看不懂：{' '.join(bad)}。{REVIEW_USAGE}"
     read = read or engine.review_reader()
     lo, hi = span or (float("-inf"), float("inf"))
-    scope = "、".join(x for x in (" ".join(mk.name_of(c) for c in sorted(coins)), label) if x)
+    scope = "、".join(x for x in (" ".join(mk.name_of(c) for c in sorted(coins)), label, DAY_NAMES.get(day_type, "")) if x)
     with journal.quiet_gc():
-        j = journal.journal((q for q in read(lo, hi) if not coins or q["coin"] in coins), now, engine.s.cancel_s, market_limit=0)
+        j = journal.journal((q for q in read(lo, hi) if not coins or q["coin"] in coins), now, engine.s.cancel_s, market_limit=0,
+                            day_type=day_type)
     text = journal.review_text([], now, engine.s.cancel_s, scope, float(engine.s.max_daily_loss_usd), j)
     rec = j["cancel"]["recommend"]   # the same recommendation as the page's (none on a tie, a thin sample, a cent)
     rows = range_buttons("rev_", engine)   # the same review for another time, a tap away
-    if rec and not coins:  # one coin's sample is no reason to change them all
+    if rec and not coins and day_type == "all":  # one coin's sample, or the weekend's, is no reason to change them all
         rows = [[{"text": f"改成开场前 {journal.secs_label(rec)}撤单", "callback_data": f"set_cancel_{rec}"}]] + rows
     return Reply(text, {"inline_keyboard": rows})
 
@@ -144,25 +150,28 @@ def export(engine: Engine, args: list[str], read: Any = None) -> Reply:
                      {"inline_keyboard": range_buttons("exp_", engine)})
     now = engine.now()
     csv_files = args[0].lower() == "csv"
+    day_type, args = journal.day_args(args[1:] if csv_files else args)
     try:
-        span, label, rest = journal.span_args(args[1:] if csv_files else args, now, engine.update_points())
+        span, label, rest = journal.span_args(args, now, engine.update_points())
     except ValueError as error:
         return Reply(f"{error}。{EXPORT_USAGE}")
+    label = "_".join(x for x in (label or ("全部" if day_type == "all" else ""), DAY_NAMES.get(day_type, "")) if x)
     if rest:
         return Reply(f"看不懂：{' '.join(rest)}。{EXPORT_USAGE}")
     read = read or engine.review_reader()
     lo, hi = span or (float("-inf"), float("inf"))
     if not csv_files:
-        name, data, t = xls.from_engine(engine, span, label or "全部", read)
+        name, data, t = xls.from_engine(engine, span, label or "全部", read, day_type=day_type)
         return Reply(f"📤 {label or '全部'}的复盘数据：{t['filled']} 场有成交，成交额 ${t['volume']:.2f}，已结算盈亏 {t['pnl']:+.2f} 美元。"
                      "Excel 文件马上发过来，第一张「总览」写着每张表看什么。", files=[(name, data)])
     stamp = time.strftime("%Y%m%d-%H%M", time.gmtime(now + 8 * 3600))
     with journal.quiet_gc():
-        review = journal.journal(read(lo, hi), now, engine.s.cancel_s)
+        review = journal.journal(read(lo, hi), now, engine.s.cancel_s, day_type=day_type)
         files = [(f"市场盈亏_{stamp}.csv", journal.markets_csv(review)), (f"每日汇总_{stamp}.csv", journal.daily_csv(review)),
-                 (f"成交明细_{stamp}.csv", journal.detail_csv(read(lo, hi, True))), (f"全部报价_{stamp}.csv", journal.quotes_csv(read(lo, hi, True))),
+                 (f"成交明细_{stamp}.csv", journal.detail_csv(q for q in read(lo, hi, True) if journal.day_ok(q["start"], day_type))),
+                 (f"全部报价_{stamp}.csv", journal.quotes_csv(q for q in read(lo, hi, True) if journal.day_ok(q["start"], day_type))),
                  (f"撤单时间复盘_{stamp}.csv", journal.cancel_csv(review["cancel"]))]
-    t = review["totals"]["all"]
+    t = review["totals"]["range"]   # the records read, narrowed to the days asked
     quoted = t["quoted"] + t["upcoming"]
     return Reply(f"📤 导出{label or '全部'}的记录：{quoted} 条报价，{t['filled']} 场有成交，成交额 ${t['volume']:.2f}，"
                  f"已结算盈亏 {t['pnl']:+.2f} 美元。{len(files)} 个 CSV 文件马上发过来"
