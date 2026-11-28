@@ -41,7 +41,7 @@ REPORT_BUTTONS = ("set_", "chk_", "exp_", "rev_")   # buttons under a report: th
 CANCEL = "cancel"
 
 HELP = ("按钮：📊 状态、🩺 体检、🧾 拒单、📈 复盘、📤 导出、🔎 探测、🌐 网页、⏸ 暂停（会先确认）、▶️ 恢复；左下角菜单按钮打开网页控制台。\n"
-        "命令：/status 状态 /check 体检 /rejects [小时] 拒单原因 /probe [小时] 只读探测 /review [时间] [币种] 复盘 /export [时间] 导出复盘 Excel（/export csv = CSV 文件） /web 网页 "
+        "命令：/status 状态 /check 体检 /rejects [小时] 拒单原因 /probe [小时] 只读探测 /review [时间] [币种] 复盘 /export [时间] 导出复盘 Excel（/export csv = CSV 文件；对账用 /export 账本、/export 成交） /web 网页 "
         "/pause 暂停并撤单 /resume 恢复 /help 本说明\n"
         "时间可以写：今天、昨天、7（最近 7 天）、11-20（那一天）、11-18 11-20（这几天）")
 

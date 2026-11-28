@@ -19,6 +19,7 @@ import asyncio
 import collections
 import contextlib
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from decimal import ROUND_UP, Decimal as D
@@ -285,6 +286,26 @@ def signing_speed(rounds: int = 5) -> tuple[str, float]:
     except Exception as error:
         LOG.debug("signing speed: %s", error)
         return "", 0.0
+
+
+PRIVATE_FIELDS = {"owner", "maker_address"}   # who an order or trade belongs to: left out of what is exported
+
+
+def _plain(v: Any) -> Any:
+    """An SDK object as plain JSON values (Decimal and datetime as text), PRIVATE_FIELDS left out at every depth."""
+    if hasattr(v, "model_dump"):
+        v = v.model_dump(mode="json")
+    elif hasattr(v, "__dict__") and not isinstance(v, type):
+        v = dict(vars(v))
+    if isinstance(v, dict):
+        return {str(k): _plain(x) for k, x in v.items() if k not in PRIVATE_FIELDS}
+    if isinstance(v, (list, tuple)):
+        return [_plain(x) for x in v]
+    if isinstance(v, D):
+        return str(v)
+    if hasattr(v, "isoformat"):
+        return v.isoformat()
+    return v
 
 
 def v2_allowance_of(allowances: Any) -> D | None:
@@ -825,6 +846,31 @@ class LiveExchange:
     def failed_fills(self, condition_id: str) -> dict[str, D]:
         """The FAILED trades' shares by order id, as the last trade_log of this market saw them."""
         return self.failed_seen.pop(condition_id, {})
+
+    async def account_trades(self, after: float | None = None, before: float | None = None) -> list[dict]:
+        """This account's trades as the exchange lists them, every status (MATCHED, MINED, CONFIRMED, RETRYING, FAILED),
+        matched from `after` to `before` (epoch seconds; None: no bound), the oldest first, each a plain dict without the
+        accounts' identifiers (owner: an API key's id; maker_address: a wallet — the other makers' too). For /export 成交:
+        the exchange's side of an audit, to match against the ledger's records by order id."""
+        kw = {k: str(int(v)) for k, v in (("after", after), ("before", before)) if v is not None and math.isfinite(v)}
+        items: list[Any] = []
+        try:
+            async for page in self.client.list_account_trades(**kw):
+                items.extend(page.items)
+        except Exception:
+            if not kw:
+                raise
+            items = []   # the bounds refused: everything, bounded here
+            async for page in self.client.list_account_trades():
+                items.extend(page.items)
+        rows = []
+        for t in items:
+            at = getattr(t, "matched_at", None)
+            ts = at.timestamp() if hasattr(at, "timestamp") else None
+            if ts is not None and ((after is not None and ts < after) or (before is not None and ts >= before)):
+                continue
+            rows.append((ts or 0.0, _plain(t)))
+        return [r for _, r in sorted(rows, key=lambda r: r[0])]
 
     def identity(self) -> str:
         """The account the orders and records belong to: the wallet (the funds) and the signer (the API key's owner,

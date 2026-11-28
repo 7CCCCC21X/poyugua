@@ -11,7 +11,7 @@ from preopen import config
 
 ROOT = Path(__file__).resolve().parent.parent / "preopen"
 FILES = ("engine.py", "exchange.py", "markets.py", "config.py", "gamma.py", "ledger.py", "refusals.py")
-FINGERPRINT = "234ae269562788c1"   # of FILES as they are with the last line of config.TRADING_VERSIONS
+FINGERPRINT = "852d81652508e024"   # of FILES as they are with the last line of config.TRADING_VERSIONS
 
 
 def fingerprint() -> str:

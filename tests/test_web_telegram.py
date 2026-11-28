@@ -292,7 +292,7 @@ class TelegramTest(unittest.IsolatedAsyncioTestCase):
         # /export alone: the time as buttons; a time: one Excel file
         choose = await handle("/export", [])
         self.assertEqual([b["callback_data"] for row in choose.markup["inline_keyboard"] for b in row],
-                         ["exp_today", "exp_yesterday", "exp_7", "exp_30", "exp_all", "exp_weekend", "exp_weekday"])
+                         ["exp_today", "exp_yesterday", "exp_7", "exp_30", "exp_all", "exp_weekend", "exp_weekday", "exp_raw", "exp_trades"])
         self.assertEqual(choose.files, [])
         book = await handle("/exp_all", [])
         (name, data), = book.files

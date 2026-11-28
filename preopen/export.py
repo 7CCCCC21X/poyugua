@@ -3,6 +3,9 @@ starting in a time span, the refusals, the settings and their changes, and a fir
 for when tuning the settings."""
 from __future__ import annotations
 
+import gzip
+import io
+import json
 import re
 from typing import Any
 
@@ -11,6 +14,9 @@ from . import markets as mk
 from .xlsx import Sheet, workbook
 
 QUOTES_KEPT = 20_000      # the 全部报价 sheet: the latest this many quotes (all of them: /export csv)
+RAW_PART_BYTES = 40 * 2**20   # a raw export's file at most this (Telegram takes 50 MB a file)
+RAW_PARTS_MAX = 3             # files of it at most: a longer span is cut short, and said
+RAW_FLUSH_EVERY = 1000        # rows between flushes of the compressor: its output measured that often
 FILLS_KEPT = 50_000       # the 成交明细 sheet: the latest this many filled levels
 
 GUIDE: tuple[tuple[str, str], ...] = (
@@ -35,10 +41,58 @@ GUIDE: tuple[tuple[str, str], ...] = (
 )
 
 
-def file_name(label: str, now: float) -> str:
+def file_name(label: str, now: float, head: str = "复盘", ext: str = "xlsx") -> str:
     """复盘_近7天_20261121-0930.xlsx: a name every system accepts."""
     tag = re.sub(r"[\\/:*?\"<>|\s]+", "", label.replace("～", "至").replace(":", "")) or "全部"
-    return f"复盘_{tag}_{mk.dt.datetime.fromtimestamp(now, mk.BEIJING).strftime('%Y%m%d-%H%M')}.xlsx"
+    return f"{head}_{tag}_{mk.dt.datetime.fromtimestamp(now, mk.BEIJING).strftime('%Y%m%d-%H%M')}.{ext}"
+
+
+def jsonl_gz(rows: Any) -> tuple[list[bytes], int, bool]:
+    """Rows as JSON Lines, gzipped, in parts of RAW_PART_BYTES at most (RAW_PARTS_MAX of them): (parts, rows written,
+    cut short)."""
+    parts: list[bytes] = []
+    n, cut = 0, False
+    buf = io.BytesIO()
+    gz = gzip.GzipFile(fileobj=buf, mode="wb", mtime=0)
+    for row in rows:
+        gz.write((json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8"))
+        n += 1
+        if n % RAW_FLUSH_EVERY == 0:  # the compressor keeps its output until it is flushed: the size is known only then
+            gz.flush()
+        if buf.tell() >= RAW_PART_BYTES:
+            gz.close()
+            parts.append(buf.getvalue())
+            if len(parts) >= RAW_PARTS_MAX:
+                cut = True
+                break
+            buf = io.BytesIO()
+            gz = gzip.GzipFile(fileobj=buf, mode="wb", mtime=0)
+    else:
+        gz.close()
+        parts.append(buf.getvalue())
+    return parts, n, cut
+
+
+def named(parts: list[bytes], name: str) -> list[tuple[str, bytes]]:
+    """账本原始记录_全部_20261128-2200.jsonl.gz, or _1, _2, … before the extension when in parts."""
+    if len(parts) == 1:
+        return [(name, parts[0])]
+    head, dot, ext = name.partition(".")
+    return [(f"{head}_{i}{dot}{ext}", part) for i, part in enumerate(parts, 1)]
+
+
+def raw_ledger(read: Any, span: tuple[float, float] | None, label: str, now: float,
+               notes: dict[str, Any]) -> tuple[list[tuple[str, bytes]], int, bool]:
+    """The ledger's records of the windows starting within `span`, as they are stored: every field (the orders' ids and
+    hashes, each fill with its time, how each order ended and why, the result, the claim, the notes), one JSON a line,
+    gzipped (.jsonl.gz, in parts when long); and `notes` (the settings in force and their changes, the trading versions,
+    the refusals) as one JSON. No key, token or wallet is in either. For an audit: the exchange's trades (/export 成交)
+    match these records by order id. Returns (files, records, cut short)."""
+    lo, hi = span or (float("-inf"), float("inf"))
+    parts, n, cut = jsonl_gz(read(lo, hi))
+    files = named(parts, file_name(label, now, "账本原始记录", "jsonl.gz"))
+    files.append((file_name(label, now, "账本附加", "json"), json.dumps(notes, ensure_ascii=False, indent=1).encode("utf-8")))
+    return files, n, cut
 
 
 def overview(review: dict[str, Any], label: str, now: float, mode: str, quotes: int, quotes_all: int, fills: int) -> Sheet:

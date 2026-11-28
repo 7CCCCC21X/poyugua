@@ -10,6 +10,7 @@ Settings come from the environment (or a local .env); see .env.example and READM
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 import os
 import signal
@@ -80,10 +81,13 @@ REVIEW_USAGE = ("用法：/review（全部）、/review 今天、/review 昨天�
                 "/review 11-18 11-20（这几天）、/review 更新（上次改参数或更新版本以来）、/review btc、/review btc eth 3；"
                 "加「周末」或「工作日」只看那几天：/review 周末、/review 30 周末、/review 更新 工作日")
 EXPORT_USAGE = ("用法：/export（点按钮选时间）、/export 今天、/export 昨天、/export 7（最近 7 天）、/export 11-20、/export 11-18 11-20、"
-                "/export 更新（上次改参数或更新版本以来）、/export 全部、/export 30 周末、/export 工作日；/export csv 7 = 旧的 CSV 文件")
+                "/export 更新（上次改参数或更新版本以来）、/export 全部、/export 30 周末、/export 工作日；/export csv 7 = 旧的 CSV 文件；"
+                "对账用：/export 账本 [时间] = 账本原始记录，/export 成交 [时间] = 交易所的成交记录")
+RAW_WORDS = {"账本", "原始", "原始记录", "db", "raw"}           # /export 账本: the ledger's records as stored
+TRADE_WORDS = {"成交", "交易所成交", "成交记录", "trades"}      # /export 成交: the exchange's trades of the account
 RANGE_BUTTONS = (("今天", "today"), ("昨天", "yesterday"), ("近 7 天", "7"), ("近 30 天", "30"), ("全部", "all"), ("上次更新起", "update"))
 RANGE_WORDS = {"today": "今天", "yesterday": "昨天", "all": "全部", "update": "更新",   # a button's callback -> its words
-               "weekend": "周末", "weekday": "工作日"}
+               "weekend": "周末", "weekday": "工作日", "raw": "账本"}
 DAY_NAMES = {"weekend": "周末", "weekday": "工作日"}
 
 
@@ -96,6 +100,9 @@ def range_buttons(prefix: str, engine: Engine | None = None) -> list[list[dict]]
     if latest:
         rows.append([{"text": f"上次更新起（{latest[0]['when']} {latest[0]['kind']}）", "callback_data": f"{prefix}update"}])
     rows.append([{"text": "仅看周末", "callback_data": f"{prefix}weekend"}, {"text": "仅看工作日", "callback_data": f"{prefix}weekday"}])
+    if prefix == "exp_":  # an audit's files: the records as stored, and the exchange's side of them
+        rows.append([{"text": "账本原始记录（对账用）", "callback_data": "exp_raw"},
+                     {"text": "交易所成交记录（对账用）", "callback_data": "exp_trades"}])
     return rows
 
 
@@ -146,9 +153,12 @@ def export(engine: Engine, args: list[str], read: Any = None) -> Reply:
     if not args:
         names = ["总览"] + [name for name, _ in xls.GUIDE]
         return Reply(f"📤 导出哪段时间的复盘数据？一个 Excel 文件，里面 {len(names)} 张表：{'、'.join(names)}"
-                     "（第一张表说明每张表看什么）。要拿去复盘分析，把这个文件直接发过去就行。",
+                     "（第一张表说明每张表看什么）。要拿去复盘分析，把这个文件直接发过去就行。\n"
+                     "要找人对账（核对实盘到底赚了多少）：点最下面的「账本原始记录」和「交易所成交记录」，两个文件一起发过去。",
                      {"inline_keyboard": range_buttons("exp_", engine)})
     now = engine.now()
+    if args[0].strip().lower() in RAW_WORDS:
+        return export_raw(engine, args[1:], read)
     csv_files = args[0].lower() == "csv"
     day_type, args = journal.day_args(args[1:] if csv_files else args)
     try:
@@ -176,6 +186,57 @@ def export(engine: Engine, args: list[str], read: Any = None) -> Reply:
     return Reply(f"📤 导出{label or '全部'}的记录：{quoted} 条报价，{t['filled']} 场有成交，成交额 ${t['volume']:.2f}，"
                  f"已结算盈亏 {t['pnl']:+.2f} 美元。{len(files)} 个 CSV 文件马上发过来"
                  "（Excel 可以直接打开；成交时刻一栏是「开场前几秒:份数」）。", files=[(name, text.encode("utf-8")) for name, text in files])
+
+
+def export_raw(engine: Engine, args: list[str], read: Any = None) -> Reply:
+    """/export 账本 [time]: the ledger's records as stored, every field (order ids, fill times, notes), for an audit."""
+    now = engine.now()
+    try:
+        span, label, rest = journal.span_args(args, now, engine.update_points())
+    except ValueError as error:
+        return Reply(f"{error}。{EXPORT_USAGE}")
+    if rest:
+        return Reply(f"看不懂：{' '.join(rest)}。{EXPORT_USAGE}")
+    notes = {"settings": config.current_values(engine.s), "settings_log": list(engine.settings_log),
+             "trading_versions": list(getattr(engine, "version_log", [])), "refusals": list(engine.refusal_log)}
+    files, n, cut = xls.raw_ledger(read or engine.review_reader(), span, label or "全部", now, notes)
+    parts = len(files) - 1
+    return Reply(f"📤 {label or '全部'}的账本原始记录：{n} 条记录" + (f"，分 {parts} 个文件" if parts > 1 else "") + "，文件马上发过来。\n"
+                 "· .jsonl.gz：解压后一行一条记录（一个币一个 5 分钟的一档、一次报价），和数据库里存的一模一样：订单号（就是订单哈希）、"
+                 "每一笔成交的时刻和份数、怎么结束的、结果、盈亏、领取状态、备注；时间都是 Unix 秒。\n"
+                 "· 账本附加 .json：现在的参数、每次改参数、交易逻辑的每次更新、拒单记录。\n"
+                 "里面没有私钥、API Key 和钱包地址。要和交易所对账，再发 /export 成交 拿交易所那边的成交记录，按订单号对上。"
+                 + (f"\n⚠️ 记录太多，只发了最早的 {n} 条（每个文件最多 40 MB）：后面的用更短的时间再导，比如 /export 账本 7" if cut else ""),
+                 files=files)
+
+
+async def export_trades(engine: Engine, args: list[str]) -> Reply:
+    """/export 成交 [time]: this account's trades as the exchange lists them (every status, FAILED too), for an audit."""
+    if not getattr(engine.x, "live", False) or not hasattr(engine.x, "account_trades"):
+        return Reply("模拟盘没有交易所的成交记录（模拟的成交都在账本里：/export 账本）")
+    now = engine.now()
+    try:
+        span, label, rest = journal.span_args(args, now, engine.update_points())
+    except ValueError as error:
+        return Reply(f"{error}。{EXPORT_USAGE}")
+    if rest:
+        return Reply(f"看不懂：{' '.join(rest)}。{EXPORT_USAGE}")
+    lo, hi = span or (float("-inf"), float("inf"))
+    # the windows starting in the span were quoted up to the placement horizon before: their fills from then on
+    after = lo - engine.s.ahead_s - 600 if lo != float("-inf") else None
+    before = hi if hi != float("inf") else None
+    try:
+        rows = await engine.x.account_trades(after, before)
+    except Exception as error:
+        return Reply(f"读交易所的成交记录失败：{str(error)[:200]}，稍后再试")
+    parts, n, cut = xls.jsonl_gz(rows)
+    files = xls.named(parts, xls.file_name(label or "全部", now, "交易所成交", "jsonl.gz"))
+    statuses = collections.Counter(str(r.get("status") or "?") for r in rows)
+    return Reply(f"📤 {label or '全部'}的交易所成交记录：{n} 笔" + (f"（{'、'.join(f'{k} {v}' for k, v in statuses.most_common())}）" if rows else "")
+                 + "，文件马上发过来。\n· 解压后一行一笔成交，是交易所接口原样给的：成交号、状态（CONFIRMED 已上链；FAILED 链上失败，没拿到份额）、"
+                 "成交时间、价格、份数、手续费率、链上交易哈希；maker_orders 里的 order_id 就是账本里的订单号。\n"
+                 "· 按成交时间：包含这段时间开场的场次提前挂单时的成交。账户标识（API Key 编号、钱包地址，别人的也一样）都去掉了。"
+                 + (f"\n⚠️ 成交太多，只发了 {n} 笔：用更短的时间再导" if cut else ""), files=files)
 
 
 def commander(settings: config.Settings, engine: Engine, pub: PublicApi, console: Console | None = None):
@@ -208,6 +269,8 @@ def commander(settings: config.Settings, engine: Engine, pub: PublicApi, console
             except ValueError:
                 return "看不懂这个撤单时间"
             return await set_cancel(engine, console, seconds)
+        if (cmd == "/export" and args and args[0].strip().lower() in TRADE_WORDS) or cmd == "/exp_trades":
+            return await export_trades(engine, args[1:] if cmd == "/export" else [])   # the exchange, on the event loop
         if cmd == "/export":
             if not args:
                 return export(engine, args)   # the time buttons
