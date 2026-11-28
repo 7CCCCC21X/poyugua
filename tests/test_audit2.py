@@ -277,7 +277,7 @@ class FillTimesTest(unittest.TestCase):
         o.pop("fills_at")
         o.update(first_fill=T0 - 600, seen=[[T0 - 600, "1"], [T0 - 15, "29"]])
         events, exact = journal.fill_events(q)
-        self.assertEqual((events["up"], exact), ([(600, D(1)), (15, D(29))], False))   # was: all 30 at 600 s
+        self.assertEqual((events["up"], exact), ([(600, D(1)), (15, D(29))], journal.SEEN))   # was: all 30 at 600 s
         r300 = next(r for r in journal.cancel_review([q], T0 + 500, 300)["rows"] if r["cancel_s"] == 300)
         self.assertEqual(r300["shares"], 1.0)
 
@@ -342,6 +342,70 @@ class SplitTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(q["phase"], "closed")                     # not settled on prices that are no result
         self.assertIn("还没有结算结果", e.errors[-1][1])
         self.assertIn("还没有结算结果", e.check_text())
+
+
+class SecondReportTest(unittest.IsolatedAsyncioTestCase):
+    """The second report on 63a9c20 (the same day): two cases the first fixes did not close."""
+
+    async def test_fills_read_from_the_trades_alone_are_read_again_at_settlement(self):
+        """The order's record gone and the trades not listing its fill yet: ended at 0; the shares listed later were
+        never read (bought 100 at 47¢, won: +53 recorded as 0)."""
+        e, clock, pub, x = make_engine(settings(PREOPEN_SHARES="100"))
+        m = pub.list_window("btc", T0 + 1800)
+        await tick(e)
+        q = placed(e, x)
+        oid = q["orders"]["up"]["id"]
+        x.fill(oid, D("100"))                                      # eaten whole between two snapshots
+        listed = x.fill_log.pop(oid)                               # the account's trades not listing it yet
+
+        async def none(_):
+            return None
+
+        async def empty(_):
+            return {}
+        x.order, x.fills = none, empty
+        await tick(e, 6)
+        await tick(e, 6)
+        clock.t = T0 + 1800 - e.s.cancel_s
+        await tick(e)
+        await tick(e, 6)
+        o = q["orders"]["up"]
+        self.assertEqual((o["state"], o["filled"], o.get("by_trades")), ("final", "0", True))
+        del x.order, x.fills
+        x.fill_log[oid] = listed                                   # listed now
+        clock.t = T0 + 1800 + 400
+        pub.results[m["slug"]] = {**m, "closed": True, "outcomePrices": '["1", "0"]'}
+        await e.settle_pass()
+        self.assertEqual((o["filled"], q["phase"]), ("100", "settled"))
+        self.assertAlmostEqual(q["pnl"], 100 * (1 - float(q["price"])))   # was: 0.0, settled without a look
+
+    def test_windows_whose_fill_times_are_unknown_do_not_turn_the_recommendation(self):
+        """Fills whose times are not known, put at their first sighting, turned the recommended cancel time around
+        (the report: 30 s best on the full times, 900 s recommended once some were masked)."""
+        recs = []
+        for i in range(24):   # timed by the trades: an early fill that won, a late one that lost
+            recs.append(rec("btc", T0 + 300 * i, 0, "up", {"up": [(100, 10)], "down": [(20, 10)]}, cancel_lead=10.0))
+        for i in range(30):   # a late fill that lost, its time unknown: only first seen, long before
+            t = T0 + 300 * (24 + i)
+            q = rec("eth", t, 0, "up", {"down": [(20, 10)]}, cancel_lead=10.0)
+            q["orders"]["down"].pop("fills_at")
+            q["orders"]["down"]["first_fill"] = t - 1000
+            recs.append(q)
+        c = journal.cancel_review(recs, T0 + 300 * 60, current=10)
+        self.assertEqual((c["windows"], c["excluded"]), (24, 30))
+        self.assertEqual(c["recommend"], 30)                       # was: 1800
+        self.assertIn("30 场的成交时刻读不到", " ".join(c["confidence"]["notes"]))
+
+    def test_mostly_guessed_times_recommend_nothing(self):
+        recs = []
+        for i in range(24):
+            q = rec("btc", T0 + 300 * i, 0, "up", {"up": [(100, 10)], "down": [(20, 10)]}, cancel_lead=10.0)
+            for o in q["orders"].values():   # each fill seen by a snapshot (not the trades): approximate times
+                o["seen"] = o.pop("fills_at", [])
+            recs.append(q)
+        c = journal.cancel_review(recs, T0 + 300 * 30, current=10)
+        self.assertEqual((c["recommend"], c["confidence"]["level"]), (None, "低"))
+        self.assertIn("先不改撤单时间", c["advice"])
 
 
 if __name__ == "__main__":

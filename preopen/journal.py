@@ -52,6 +52,7 @@ DAYS_IN_TEXT = 7          # Telegram's review: this many days, and the markets t
 MARKETS_IN_TEXT = 3
 CANCEL_SAMPLE = 20        # filled windows before the review names a best cancel time
 END_SLACK_S = 2.0         # a cancel confirmed this much earlier than a candidate still counts as resting until it
+APPROX_MAX = 0.3          # fills timed by a snapshot above this share of the replay's: low confidence, no recommendation
 LAG_MAX_S = 30.0          # a window's cancel lag (decided to confirmed) above this is taken as this in the replay
 
 
@@ -834,7 +835,7 @@ def journal(records: Iterable[dict], now: float, current: int | None = None, spa
                 sb = by_speed[next((name for limit, name in SPEED if lag is not None and lag < limit), SPEED_LATE)]
                 sb["quotes"] += 1
             if start + 300 <= now:  # its story is over: the replay takes it, with its fill times
-                timed = fill_events(q) if any(f.values()) else ({}, True)
+                timed = fill_events(q) if any(f.values()) else ({}, EXACT)
                 w["recs"].append((q, f, timed))
         if not any(f.values()):
             return
@@ -1057,13 +1058,22 @@ def change_effects(read: Callable[[float, float], Iterable[dict]], now: float, l
     return out
 
 
-def fill_events(q: dict) -> tuple[dict[str, list[tuple[float, D]]], bool]:
-    """Each filled side's fills as (seconds before the start, shares), and whether the times are exact (the trades'
-    match times) rather than when a snapshot first saw them (up to ~10 s late, so on the safe side when replayed).
-    The shares always add up to what the record holds (filled): the review's totals and its replay are one basis
-    (audit 11-28: trade times listing more than that — a trade listed twice by an older version — counted it twice)."""
+EXACT, SEEN, LUMPED = "exact", "seen", "lumped"   # how a record's fill times are known (fill_events)
+QUALITY_CN = {EXACT: "是", SEEN: "否（快照看到的时间）", LUMPED: "否（只知道第一次看到成交的时间）"}
+
+
+def fill_events(q: dict) -> tuple[dict[str, list[tuple[float, D]]], str]:
+    """Each filled side's fills as (seconds before the start, shares), and how their times are known: EXACT (the
+    trades' match times), SEEN (when a snapshot saw each fill: up to ~10 s late) or LUMPED (shares whose time is not
+    known, put at the first fill seen: the replay cannot tell when they came, and leaves the window out — audit 11-28:
+    such windows turned the recommended cancel time around). The shares always add up to what the record holds
+    (filled): the review's totals and its replay are one basis (audit 11-28: trade times listing more than that — a
+    trade listed twice by an older version — counted it twice)."""
     out: dict[str, list[tuple[float, D]]] = {}
-    exact = True
+    quality = EXACT
+
+    def worse(a: str, b: str) -> str:
+        return a if (EXACT, SEEN, LUMPED).index(a) >= (EXACT, SEEN, LUMPED).index(b) else b
     for side, o in (q.get("orders") or {}).items():
         total = num(o.get("filled"))
         if total <= 0:
@@ -1071,19 +1081,20 @@ def fill_events(q: dict) -> tuple[dict[str, list[tuple[float, D]]], bool]:
         log = [(q["start"] - float(t), num(sh)) for t, sh in (o.get("fills_at") or [])]
         if not log:  # the trades unread: when the snapshots saw each fill, else when the first fill was seen
             log = [(q["start"] - float(t), num(sh)) for t, sh in (o.get("seen") or []) if num(sh) > 0]
-            exact = False
+            quality = worse(quality, SEEN)
             if not log:
                 first = o.get("first_fill") or o.get("gone")
                 log = [(q["start"] - float(first) if first else 0.0, total)]
+                quality = LUMPED
         got = sum((sh for _, sh in log), D(0))
-        if got < total:  # the times show less than the book did: the rest at the latest time seen
+        if got < total:  # the times show less than the book did: the rest, its time not known, at the latest seen
             log.append((min(lead for lead, _ in log), total - got))
-            exact = False
+            quality = LUMPED
         elif got > total:  # more: each scaled down to what was bought
             log = [(lead, sh * total / got) for lead, sh in log]
-            exact = False
+            quality = worse(quality, SEEN)
         out[side] = log
-    return out, exact
+    return out, quality
 
 
 def secs_label(seconds: int) -> str:
@@ -1123,8 +1134,8 @@ class Replay:
 
     def __init__(self, now: float, current: int | None) -> None:
         self.now, self.current = now, current
-        # (earliest cancel, fills, records timed by a snapshot, fills so timed, coin, cancel lag)
-        self.windows: list[tuple[float | None, list[tuple[float, str, D, D, bool]], int, int, str, float | None]] = []
+        # (earliest cancel, fills, records timed by a snapshot, fills so timed, coin, cancel lag, fills of unknown time)
+        self.windows: list[tuple[float | None, list[tuple[float, str, D, D, bool]], int, int, str, float | None, bool]] = []
         self.waiting = 0
         self.after_start = self.after_cancel = 0
 
@@ -1137,7 +1148,10 @@ class Replay:
         known = [e for e in ends if e is not None]
         events: list[tuple[float, str, D, D, bool]] = []
         approx_records = approx_events = 0
-        for (q, _, (timed, exact)), end in zip(recs, ends):
+        lumped = False
+        for (q, _, (timed, quality)), end in zip(recs, ends):
+            exact = quality == EXACT
+            lumped = lumped or (bool(timed) and quality == LUMPED)
             if timed and not exact:
                 approx_records += 1
             price, result = num(q["price"]), q.get("result")
@@ -1155,7 +1169,7 @@ class Replay:
                 if q.get("reason") == "到点撤单" and q.get("closing_at") and q.get("cancel_lead") is not None]
         lag = min(LAG_MAX_S, max(0.0, max(lags))) if lags else None
         self.windows.append((max(known) if known else None, events, approx_records, approx_events,
-                             mk.name_of(recs[0][0]["coin"]), lag))
+                             mk.name_of(recs[0][0]["coin"]), lag, lumped))
 
     def finish(self) -> dict[str, Any]:
         current = self.current
@@ -1170,7 +1184,9 @@ class Replay:
         ends = [w[0] for w in self.windows if w[0] is not None]
         base = next((c for c in CANCEL_CHOICES if sum(1 for e in ends if e <= c + END_SLACK_S) >= 0.8 * len(ends)),
                     CANCEL_CHOICES[-1]) if ends else CANCEL_CHOICES[0]
-        common = [w for w in self.windows if w[0] is None or w[0] <= base + END_SLACK_S]
+        early = sum(1 for w in self.windows if w[0] is not None and w[0] > base + END_SLACK_S)
+        lumped = sum(1 for w in self.windows if w[6] and not (w[0] is not None and w[0] > base + END_SLACK_S))
+        common = [w for w in self.windows if (w[0] is None or w[0] <= base + END_SLACK_S) and not w[6]]
         lags = sorted(w[5] for w in common if w[5] is not None)
         typical = lags[len(lags) // 2] if lags else 0.0   # for a window whose cancel was not the rule's
         cands = sorted({c for c in CANCEL_CHOICES if c >= base} | ({int(current)} if current is not None and current >= base else set()))
@@ -1183,7 +1199,7 @@ class Replay:
         approx = events_all = events_approx = 0
         times = {name: {"bucket": name, "shares": D(0), "cost": D(0), "won": D(0)} for _, name in FILL_TIMES}
         coins: dict[str, dict] = defaultdict(lambda: {"coin": "", "filled": 0, "cost": D(0), "won": D(0)})
-        for _, events, approx_records, approx_events, name, lag in common:  # the tables below: the same windows as actual
+        for _, events, approx_records, approx_events, name, lag, _ in common:  # the tables below: the same windows as actual
             approx += approx_records
             events_approx += approx_events
             lag = typical if lag is None else lag
@@ -1241,7 +1257,9 @@ class Replay:
             tied, key=lambda r: (abs(r["cancel_s"] - (current if current is not None else r["cancel_s"])), r["cancel_s"]))["cancel_s"]
         gain = by_c[best]["pnl"] - baseline["pnl"]
         filled_n = actual["filled"]
-        recommend = best if filled_n >= CANCEL_SAMPLE and best != current and gain > TIE_USD else None
+        share = events_approx / events_all if events_all else 0.0
+        # never on times mostly guessed: a change is recommended only from fills timed by the trades for the most part
+        recommend = best if filled_n >= CANCEL_SAMPLE and share <= APPROX_MAX and best != current and gain > TIE_USD else None
         for r in rows:
             r["delta"] = r["pnl"] - baseline["pnl"]
             r["best"] = r["cancel_s"] == best
@@ -1255,10 +1273,11 @@ class Replay:
                                **{x: r[x] for x in ("filled", "both", "shares", "cost", "pnl", "delta", "current", "best")}})
         by_time = [{**t, "win_rate": float(t["won"] / t["shares"]), "breakeven": float(t["cost"] / t["shares"]), "pnl": t["won"] - t["cost"]}
                    for t in times.values() if t["shares"] > 0]
-        share = events_approx / events_all if events_all else 0.0
         notes = [f"可比 {len(common)} 场，{filled_n} 场有成交"]
-        if len(self.windows) - len(common):
-            notes.append(f"{len(self.windows) - len(common)} 场当时撤得更早，整场没算")
+        if early:
+            notes.append(f"{early} 场当时撤得更早，整场没算")
+        if lumped:
+            notes.append(f"{lumped} 场的成交时刻读不到（只知道第一次看到成交的时间），整场没算")
         if self.waiting:
             notes.append(f"{self.waiting} 场有成交还没结算，整场没算")
         if events_approx:
@@ -1267,10 +1286,13 @@ class Replay:
             notes.append(f"按实测的撤单确认延迟回放（中位 {typical:.1f} 秒）")
         if self.after_cancel or self.after_start:
             notes.append(f"{self.after_start} 笔开场后成交、{self.after_cancel} 笔撤单确认后成交")
-        level = ("低" if filled_n < CANCEL_SAMPLE or share > 0.3 else
+        level = ("低" if filled_n < CANCEL_SAMPLE or share > APPROX_MAX else
                  "高" if filled_n >= 100 and share <= 0.1 and not self.after_cancel and not self.after_start else "中")
         if filled_n < CANCEL_SAMPLE:
             advice = f"样本还少（{len(common)} 场里只有 {filled_n} 场有成交），先别改，攒到 {CANCEL_SAMPLE} 场以上再看"
+        elif share > APPROX_MAX and best != current:
+            advice = (f"成交时刻有 {share:.0%} 是快照推算的，回放不够准，先不改撤单时间"
+                      f"（按推算的看，开场前 {secs_label(best)}撤单会多 {gain:.2f}）")
         elif recommend is not None:
             advice = (f"改成开场前 {secs_label(recommend)}撤单最好：这 {len(common)} 场会是 {by_c[recommend]['pnl']:+.2f} 美元，"
                       f"比{baseline['name']}（{baseline['pnl']:+.2f}）多 {gain:.2f}")
@@ -1306,7 +1328,7 @@ def cancel_review(records: Iterable[dict], now: float, current: int | None = Non
             continue  # never rested
         if q["start"] + 300 > now:
             continue  # its story is not over
-        groups[q["slug"]].append((q, f, fill_events(q) if any(f.values()) else ({}, True)))
+        groups[q["slug"]].append((q, f, fill_events(q) if any(f.values()) else ({}, EXACT)))
     replay = Replay(now, current)
     for recs in groups.values():
         replay.add(recs)
@@ -1384,7 +1406,7 @@ def detail_table(records: Iterable[dict], limit: int | None = None) -> list[list
         rows.append([d["when"], d["day"], d["coin"], d["level"], d["price"], d["shares"], d["attempt"], d["up"], d["down"],
                      round(d["cost"], 4), d["result"], None if d["pnl"] is None else round(float(d["pnl"]), 4), d["placed_lead_s"],
                      d["cancel_lead_s"], d["first_fill_lead_s"], d["up_times"], d["down_times"],
-                     "是" if d["exact"] else "否（快照看到的时间）", d["redeem"], d["check"]])
+                     QUALITY_CN.get(d["exact"], d["exact"]), d["redeem"], d["check"]])
     return rows
 
 

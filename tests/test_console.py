@@ -293,8 +293,13 @@ class CancelReviewTest(unittest.TestCase):
         q = settled("hype", T0, "up", {})
         q["orders"]["up"].update(filled="10", first_fill=T0 - 40)
         c = journal.cancel_review([q], self.now, current=15)
-        self.assertEqual(c["approx"], 1)
+        # 11-28 audit: when its shares came is not known (only the first fill seen): left out of the comparison, said
+        self.assertEqual((c["excluded"], c["windows"]), (1, 0))
+        self.assertIn("1 场的成交时刻读不到", " ".join(c["confidence"]["notes"]))
         self.assertEqual(journal.fill_times_text(q, "up"), "40.0:10")
+        q["orders"]["up"]["seen"] = [[T0 - 40, "10"]]   # seen by a snapshot: compared, flagged as approximate
+        c = journal.cancel_review([q], self.now, current=15)
+        self.assertEqual((c["excluded"], c["approx"]), (0, 1))
 
 
 class WindowCountTest(unittest.TestCase):

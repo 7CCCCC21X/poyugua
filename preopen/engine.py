@@ -1728,9 +1728,9 @@ class Engine:
             self.by_id[h] = (q["key"], side)
             self.learn_id_is_hash(True)
             self.note_fill(q, side, got, at=float(q["start"]) - self.s.expiry_s)  # at the latest: when it expired
-            o.update(state="final", final_at=now, note="状态不明，到期后按成交记录核实：有成交")
+            o.update(state="final", final_at=now, by_trades=True, note="状态不明，到期后按成交记录核实：有成交")
         elif self.id_is_hash:
-            o.update(state="not_found", note="状态不明，到期后按成交记录核实：没有成交")
+            o.update(state="not_found", by_trades=True, note="状态不明，到期后按成交记录核实：没有成交")
         else:  # whether the CLOB's id is the hash was never confirmed on this account: no trade under it proves little
             o.update(state="not_found", unverified=True, note="到期后按订单哈希没找到成交（订单号是否等于哈希还没确认），请核对")
             self.problem(f"{mk.window_name(q['coin'], q['start'])} {mk.SIDES_CN[side]}方的单状态不明，按哈希没找到成交，请到 Polymarket 核对",
@@ -1764,7 +1764,7 @@ class Engine:
                 self.save(q)
                 return
             self.note_fill(q, side, fills.get(o["id"], D(0)), at=float(o.get("gone") or self.now()))
-            o.update(state="final", final_at=self.now(), note=(o.get("note") or "") + "；最终记录读不到，按成交记录")
+            o.update(state="final", final_at=self.now(), by_trades=True, note=(o.get("note") or "") + "；最终记录读不到，按成交记录")
             self.save(q)
             return
         self.note_fill(q, side, row.matched, at=float(o.get("gone") or self.now()))
@@ -1909,9 +1909,11 @@ class Engine:
         return True
 
     def checkable(self, o: dict) -> bool:
-        """An order whose fills could not be verified, and that the account's trades can verify (its id, or its hash
-        while the id may be the hash)."""
-        return bool(o.get("unverified")) and bool(o.get("id") or (o.get("hash") and self.id_is_hash is not False))
+        """An order the account's trades are read for at settlement although nothing of it was recorded filled: one whose
+        fills could not be verified, or one whose fills were read from the trades alone (its own record gone): the trades
+        may have lagged then (audit 11-28: an empty trade list ended such an order at 0, and the 100 shares listed later
+        were never read). It needs an id the trades know (its id, or its hash while the id may be the hash)."""
+        return bool(o.get("unverified") or o.get("by_trades")) and bool(o.get("id") or (o.get("hash") and self.id_is_hash is not False))
 
     def check_fills(self, q: dict, side: str, log: dict[str, list[tuple[float, D]]], failed: dict[str, D]) -> None:
         """An order's fills against the account's trades, read at settlement anyway (audit 11-28: what the record held was
