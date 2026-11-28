@@ -440,6 +440,7 @@ a.mlink { color:inherit; text-decoration:none; border-bottom:1px dotted var(--mu
         <p class="muted small" style="margin:6px 0 0">按开场时间（北京时间）、币种和时段筛选：下面所有内容和导出的文件都只算这些场次；上面三张卡片是全部记录，不受影响。「上次更新起」= 最近一次改参数或交易逻辑更新到现在，想从更早的某一次看起就在「更新」里选。<span id="jBusy"></span></p>
       </section>
       <div id="jBody">
+      <p class="warn" id="jUnverified" hidden></p>
       <div class="cards" id="jRange"></div>
       <section id="jChartBox" hidden><h2>累计盈亏（已结算，按开场日）</h2><div id="jChart" class="chart" tabindex="0" aria-label="累计盈亏图，左右方向键看每一天"></div>
         <p class="muted small">每一天的数字在下面「按日期」表里。</p></section>
@@ -1016,7 +1017,12 @@ function renderReplay(C) {
 function renderJournal() {
   const d = state.journal, T = d.totals, R = T.range, names = {today: "今天", "7d": "近 7 天", all: "累计"};
   $("jTotals").innerHTML = Object.keys(names).map((k) => card(names[k], signed(T[k].pnl),
-    `成交 ${T[k].filled} 场 / 报价 ${T[k].quoted}（${pct(T[k].fill_rate)}）` + (T[k].upcoming ? `，还没开场 ${T[k].upcoming}` : "") + `；双边率 ${pct(T[k].both_rate)}；赢 ${T[k].wins} 输 ${T[k].losses}` + (T[k].open ? `，待结算 ${T[k].open}` : "") + `；成交额 ${money(T[k].volume)}，收益率 ${pct(T[k].roi)}`)).join("");
+    `成交 ${T[k].filled} 场 / 报价 ${T[k].quoted}（${pct(T[k].fill_rate)}）` + (T[k].upcoming ? `，还没开场 ${T[k].upcoming}` : "") + `；双边率 ${pct(T[k].both_rate)}；赢 ${T[k].wins} 输 ${T[k].losses}` + (T[k].evens ? ` 平 ${T[k].evens}` : "") + (T[k].open ? `，待结算 ${T[k].open}` : "") + `；成交额 ${money(T[k].volume)}，收益率 ${pct(T[k].roi)}`)).join("");
+  const U = d.unverified || {};   // fills that could not be verified: said above everything (audit 11-28)
+  $("jUnverified").hidden = !U.count;
+  $("jUnverified").textContent = U.count ? `⚠️ 有 ${U.count} 场的成交没能核实，按已知的记（可能少记或多记）：` +
+    (U.latest || []).slice(0, 5).map((x) => `${x.coin} ${x.when} 第${x.level}档${x.sides}方（记的 ${x.filled}）`).join("；") +
+    (U.count > 5 ? "…" : "") + "。请到 Polymarket 的成交记录核对；结算时能读到成交记录的会自动核实。" : "";
   const info = d.span || {range: "all", label: "全部"};
   renderFilters(info);
   const scope = info.label + (d.coins && d.coins.length ? " · " + d.coins.join("、") : "") +
@@ -1037,8 +1043,8 @@ function renderJournal() {
   for (const el of document.querySelectorAll("[data-price]")) el.onclick = () => openPrice(el.dataset.price);
   renderChanges(d.changes);
   const row = (label, x) => `<tr><td>${esc(label)}</td><td>${signed(x.pnl)}</td><td>${money(x.volume)}</td><td>${shares(x.shares)}</td><td>${x.filled}</td><td>${x.quoted ?? ""}${x.upcoming ? `<span class="muted">+${x.upcoming}</span>` : ""}</td>` +
-    `<td>${pct(x.fill_rate)}</td><td>${x.both}</td><td>${pct(x.both_rate)}</td><td>${x.wins}/${x.losses}</td><td>${x.avg_pnl == null ? "—" : signed(x.avg_pnl)}</td><td>${pct(x.roi)}</td></tr>`;
-  const head = ["盈亏", "成交额", "成交份数", "成交场次", "报价场次", "成交率", "双边", "双边率", "赢/输", "单场均", "收益率"];
+    `<td>${pct(x.fill_rate)}</td><td>${x.both}</td><td>${pct(x.both_rate)}</td><td>${x.wins}/${x.losses}${x.evens ? "/" + x.evens : ""}</td><td>${x.avg_pnl == null ? "—" : signed(x.avg_pnl)}</td><td>${pct(x.roi)}</td></tr>`;
+  const head = ["盈亏", "成交额", "成交份数", "成交场次", "报价场次", "成交率", "双边", "双边率", "赢/输（/平）", "单场均", "收益率"];
   const days = d.by_day.slice(0, 120);
   table("jDay", ["日期"].concat(head), days.map((x) => row(x.day + (x.weekday ? `（${x.weekday}）` : ""), x)));
   $("jDayNote").textContent = "成交额 = 买到的份数 × 买价（还没结算的也算）；盈亏、收益率、单场均盈亏只算已经结算的场次；成交率只算已经开场的场次（报价场次后面的 +N 是还没开场的）。" +

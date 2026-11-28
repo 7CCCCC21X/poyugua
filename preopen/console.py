@@ -90,7 +90,13 @@ class Console:
         afresh (today's windows are all in the working set: they are archived two days after)."""
         now = self.engine.now()
         today = journal.day_start(now)
-        key = (today, self.engine.ledger.archive_count())
+        # the days before today change only by the working set's records of those days (a window of 23:55 settled after
+        # midnight, a final fill read late) and by the archive: both in the key (audit 11-28: the cards stayed on the
+        # earlier figures up to CARDS_CACHE_S while the tables below had the new ones)
+        older_rows = hash(tuple(sorted((q["key"], q.get("phase"), q.get("pnl"), q.get("foreign"),
+                                        tuple(str(o.get("filled")) for o in (q.get("orders") or {}).values()))
+                                       for q in self.engine.ledger.rows.values() if q["start"] < today)))
+        key = (today, self.engine.ledger.archive_count(), older_rows)
 
         def older() -> dict:
             with journal.quiet_gc():

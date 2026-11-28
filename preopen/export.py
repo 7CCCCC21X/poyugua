@@ -50,6 +50,7 @@ def overview(review: dict[str, Any], label: str, now: float, mode: str, quotes: 
         ["成交份数", r["shares"]], ["成交额$（份数×买价，没结算的也算）", r["volume"]], ["赢的场次", r["wins"]], ["输的场次", r["losses"]],
         ["待结算场次", r["open"]], ["已结算成本$", r["cost"]], ["回款$", r["payout"]], ["盈亏$（已结算）", r["pnl"]], ["收益率%", r["roi"]], [],
         ["撤单时间", c["advice"]],
+        *([["成交未核实", line]] if (line := journal.unverified_text(review)) else []),
         ["可信度", f"{(c.get('confidence') or {}).get('level', '低')}：{'；'.join((c.get('confidence') or {}).get('notes') or [])}"],
     ]
     for r in (review.get("weekend") or {}).get("split", []):

@@ -170,8 +170,10 @@ class StateMachineTest(unittest.IsolatedAsyncioTestCase):
         await e2.ghost_pass(clock.t)
         self.assertEqual(e2.ghosts, {})
         self.assertEqual(json.loads(e2.ledger.get("ghosts")), {})
-        self.assertIn("成交 3 份，这部分没记进账本", e2.errors[-1][1])
+        self.assertIn("成交 3 份，已补进账本", e2.errors[-1][1])   # audit 11-28: back in the ledger (was: said only)
         self.assertIn(mk.window_name("btc", T0 + 1800) + " 涨方", e2.errors[-1][1])
+        (back,) = [q for q in e2.ledger.rows.values() if q["orders"]["up"].get("id") == h]
+        self.assertEqual((back["phase"], back["orders"]["up"]["filled"], back["orders"]["down"]["state"]), ("closed", "3", "not_sent"))
 
 
 class ExchangeAnswersTest(unittest.IsolatedAsyncioTestCase):

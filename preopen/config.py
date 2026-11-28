@@ -27,6 +27,8 @@ TRADING_VERSIONS: tuple[tuple[str, str], ...] = (
     ("2026-11-25 16:59", "吃满的单（MATCHED）按成交算，另一边照常挂着，不再误暂停"),
     ("2026-11-27 12:00", "按审计修复：改参数时有成交的场次另一边留着配对；撤单没成功继续撤；只有 CANCELED 算被别处撤单；"
                          "一次拒单只算一次；手续费没写清楚的市场先不挂；50/50 结算；账本写不进去时暂停新挂"),
+    ("2026-11-28 22:00", "按 11-28 审计修复：账本写不进去的单一张也不发；结算时按成交记录核实成交（漏记的补上、链上失败的去掉）；"
+                         "判为没发出但其实成交了的单补进账本；改绑后旧账户的归档不再计入、不再领取"),
 )
 GTD_MIN_AHEAD_S = 180    # the CLOB rejects a GTD expiration less than 3 minutes away
 GTD_THRESHOLD_S = 60     # ...and expires an order one minute before its stated expiration

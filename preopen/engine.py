@@ -84,6 +84,10 @@ UNKNOWN_GRACE_S = 30      # a resting record with an order still unknown this lo
 EXPIRED_MARGIN_S = 5      # past its stated expiration (and this) an order rests nowhere: its fills are final
 TRADES_TTL_S = 10         # the account's trades of a market, read once for every order that needs them this often
 UNVERIFIED_AFTER_S = 1800 # past the expiration, the trades unreadable this long: recorded unverified (and said so)
+SEEN_KEPT = 12   # fills of an order kept with the time a snapshot first saw each (the rest added to the last)
+FILLS_TOLERANCE = D("0.0001")   # the trades and an order's own record differing by more: one of them is corrected
+WRITE_RETRY_S = 30.0       # a failing ledger is tried again this often (retry_writes)
+RESULT_LATE_S = 6 * 3600   # a window still without its result this long after its end is said (and again as long after)
 SEEN_MARGIN_S = 3         # an order accepted this long before a snapshot began should be in it
 LEDGER_FREE_WARN = 500 * 2**20   # the check warns when the ledger's disk has less than this left
 CLOCK_EVERY_S = 3600      # the clock checked against the CLOB's this often
@@ -260,6 +264,9 @@ class Engine:
         self.ghost_at = 0.0
         self.hedges_kept = 0                  # half-filled records new settings left resting (their other side pairs)
         self.unsaved: dict[str, dict] = {}    # records a failed write did not keep: written with the next write
+        self.unsaved_kv: dict[str, str] = {}  # the same for the key-value notes (ghosts, the settings log, the pause)
+        self.undeleted: set[str] = set()      # records forgotten while the ledger could not be written: deleted then
+        self.write_retry_at = 0.0             # when a write is tried again while they fail (retry_writes)
         self.write_error = ""                 # why the last write failed ("" while writes work): no new order meanwhile
         self.clock_at = 0.0                   # when the clock was last checked against the CLOB's
         self.trades: dict[str, tuple[float, dict[str, D]]] = {}   # condition id -> (read at, order id -> shares bought)
@@ -317,31 +324,87 @@ class Engine:
         else:
             self.open_keys.discard(q["key"])
 
-    def save(self, *quotes: dict) -> None:
+    def save(self, *quotes: dict, strict: bool = False) -> None:
         """Records to the ledger. A write that fails (a full disk, a broken file) does not stop the loops, which go on
-        from the records in memory: the records are written with the next write that works, and until then nothing
-        new is placed (hold): an order the ledger cannot keep would be lost to a restart (audit 11-27)."""
+        from the records in memory: kept there all the same (audit 11-28: a new record was indexed but not kept, so no
+        cancel, withdrawal or money held saw its orders), written with the next write that works; until then nothing
+        new is placed (hold): an order the ledger cannot keep would be lost to a restart (audit 11-27). `strict`: the
+        write must have happened — an order about to be signed or sent — and its failure is raised (audit 11-28: the
+        failure was swallowed and the orders went out all the same, LiveExchange.place sending unless on_signed raises)."""
         batch = {q["key"]: q for q in (*self.unsaved.values(), *quotes)}
         try:
             self.ledger.save_many(list(batch.values()))
         except (sqlite3.Error, OSError) as error:
             self.unsaved.update(batch)
-            if not self.write_error:
-                LOG.error("账本写不进去：%s", error)
-            self.write_error = str(error)[:200] or type(error).__name__
-            self.problem(f"账本写不进去（{self.write_error}）：暂停新挂，撤单照常；磁盘满了就清理或扩容 /data", key="ledger-write")
+            for q in batch.values():
+                self.ledger.rows[q["key"]] = q
+            self.write_failed(error)
+            if strict:
+                raise
         else:
-            if self.write_error:
-                self.notify("✅ 账本又能写了，恢复新挂")
-            self.unsaved.clear()
-            self.write_error = ""
+            self.write_worked()
         self.version += 1
         for q in quotes:
             self._index(q)
 
+    def write_failed(self, error: BaseException) -> None:
+        if not self.write_error:
+            LOG.error("账本写不进去：%s", error)
+        self.write_error = str(error)[:200] or type(error).__name__
+        self.problem(f"账本写不进去（{self.write_error}）：暂停新挂，撤单照常；磁盘满了就清理或扩容 /data", key="ledger-write")
+
+    def write_worked(self) -> None:
+        """A write went through: what earlier failures left (records, notes, deletions) written now."""
+        self.unsaved.clear()
+        try:
+            for k, v in list(self.unsaved_kv.items()):
+                self.ledger.put(k, v)
+                del self.unsaved_kv[k]
+            for key in list(self.undeleted):
+                if key not in self.ledger.rows:
+                    self.ledger.delete(key)
+                self.undeleted.discard(key)
+        except (sqlite3.Error, OSError) as error:
+            self.write_failed(error)
+            return
+        if self.write_error:
+            self.notify("✅ 账本又能写了，恢复新挂")
+        self.write_error = ""
+
+    def retry_writes(self) -> None:
+        """While the ledger cannot be written, a write is tried every WRITE_RETRY_S (a probe, then what waits): the hold
+        lifts once the disk has room, not only when something else happens to be written (a send refused for want of
+        its write leaves nothing waiting)."""
+        now = self.now()
+        if not self.write_error or now < self.write_retry_at:
+            return
+        self.write_retry_at = now + WRITE_RETRY_S
+        try:
+            self.ledger.put("write_probe", str(round(now)))
+        except (sqlite3.Error, OSError) as error:
+            self.write_failed(error)
+            return
+        self.save()
+
+    def put(self, k: str, v: str) -> None:
+        """A key-value note to the ledger; a failed write is kept, written with the next write that works (as save)."""
+        try:
+            self.ledger.put(k, v)
+        except (sqlite3.Error, OSError) as error:
+            self.unsaved_kv[k] = v
+            self.write_failed(error)
+        else:
+            self.unsaved_kv.pop(k, None)
+
     def forget(self, q: dict) -> None:
-        """Drop a record that never placed anything."""
-        self.ledger.delete(q["key"])
+        """Drop a record that never placed anything (from memory at once; from the file when it can be written)."""
+        self.unsaved.pop(q["key"], None)
+        try:
+            self.ledger.delete(q["key"])
+        except (sqlite3.Error, OSError) as error:
+            self.ledger.rows.pop(q["key"], None)
+            self.undeleted.add(q["key"])
+            self.write_failed(error)
         self.version += 1
         self.by_slug[q["slug"]].discard(q["key"])
         self.open_keys.discard(q["key"])
@@ -357,7 +420,7 @@ class Engine:
         return {h: g for h, g in kept.items() if isinstance(g, dict) and g.get("start")} if isinstance(kept, dict) else {}
 
     def keep_ghosts(self) -> None:
-        self.ledger.put("ghosts", json.dumps(self.ghosts, separators=(",", ":")))
+        self.put("ghosts", json.dumps(self.ghosts, separators=(",", ":")))
 
     def ref_of(self, oid: str) -> tuple[str, str] | None:
         """The record and side of an order id (or of the hash of an order whose id is not known)."""
@@ -366,7 +429,7 @@ class Engine:
     def learn_id_is_hash(self, same: bool) -> None:
         if self.id_is_hash is None or self.id_is_hash != same:
             self.id_is_hash = same
-            self.ledger.put("id_is_hash", "1" if same else "0")
+            self.put("id_is_hash", "1" if same else "0")
             LOG.info("订单号%s订单哈希", "等于" if same else "不等于")
 
     def quotes_of(self, slug: str) -> list[dict]:
@@ -395,6 +458,8 @@ class Engine:
             return self.blocked
         if self.stopping:
             return f"正在撤单停止（{self.stopping}）"
+        if self.write_error:
+            self.retry_writes()
         if self.write_error:
             return f"账本写不进去（{self.write_error}），暂停新挂"
         if self.paused:
@@ -588,7 +653,7 @@ class Engine:
     def save_refusals(self) -> None:
         self.refusals_saved_at = self.now()
         try:
-            self.ledger.put("refusals", json.dumps(list(self.refusal_log)[-200:], ensure_ascii=False))
+            self.put("refusals", json.dumps(list(self.refusal_log)[-200:], ensure_ascii=False))
         except Exception as error:  # the log is a convenience
             LOG.debug("拒单记录保存失败：%s", error)
 
@@ -1056,7 +1121,15 @@ class Engine:
             for side in mk.SIDES:
                 specs.append(OrderSpec(ref=f"{q['key']}/{side}", asset=listing.asset(side), price=lv.price, size=lv.shares,
                                        expiration=q["expiration"], neg_risk=listing.neg_risk, market=listing.condition_id))
-        self.save(*quotes)  # durable before anything is signed
+        try:
+            self.save(*quotes, strict=True)  # durable before anything is signed: not written, nothing is sent
+        except (sqlite3.Error, OSError):
+            for q in quotes:  # never signed: dropped from memory too (kept, its "placing" orders would look sent)
+                self.unsaved.pop(q["key"], None)
+                self.ledger.rows.pop(q["key"], None)
+                self.by_slug[q["slug"]].discard(q["key"])
+                self.open_keys.discard(q["key"])
+            return Hold(f"账本写不进去（{self.write_error}），暂停新挂", HOLD_RETRY_S)
         self.attempted[listing.condition_id] = (slug, listing.start)
         self.x.prime(listing)
         refs = {f"{q['key']}/{side}": (q, side) for q in quotes for side in mk.SIDES}
@@ -1071,7 +1144,7 @@ class Engine:
                     q, side = refs[ref]
                     q["orders"][side].update(hash=h, salt=int(salt))
                     touched[q["key"]] = q
-            self.save(*touched.values())
+            self.save(*touched.values(), strict=True)  # raised when not written: place() then sends nothing
             written = True
         try:
             results = await self.x.place(specs, on_signed=on_signed)
@@ -1159,7 +1232,8 @@ class Engine:
                 for gside, o in q["orders"].items():
                     if o["state"] == "not_sent" and o.get("hash"):
                         self.ghosts[o["hash"]] = {"start": int(q["start"]), "slug": q["slug"], "side": gside,
-                                                  "price": str(q["price"]), "shares": str(q["shares"])}
+                                                  "price": str(q["price"]), "shares": str(q["shares"]),
+                                                  "record": json.loads(json.dumps(q))}  # restored if it filled after all
                         ghosted = True
                 if ghosted:
                     self.keep_ghosts()
@@ -1332,38 +1406,70 @@ class Engine:
             del self.ghosts[h]
         if expired:
             self.keep_ghosts()
+            self.problem(f"有 {len(expired)} 张判为没发出的单到开场还没确认（撤单一直没得到交易所答复，或成交读不到），"
+                         "请到 Polymarket 核对这几场有没有挂上或成交", key="ghost")
         if not self.ghosts or now < self.ghost_at:
             return
         self.ghost_at = now + SWEEP_EVERY_S
-        ids = list(self.ghosts)
-        try:
-            r = await self.x.cancel(ids)
-        except Throttled as t:
-            self.cancel_throttled(t.reason, t.seconds)
-            return
-        except Exception as error:
-            LOG.warning("按哈希撤被拒的单失败：%s", error)
-            return
-        if r.throttle:
-            self.cancel_throttled(*r.throttle)
-        rested = {h: self.ghosts[h] for h in ids if h in r.canceled and h in self.ghosts}
+        ids = [h for h, g in self.ghosts.items() if not g.get("answered")]   # an answered one waits for its read only
+        r = Cancelled(canceled=set(), not_canceled={})
+        if ids:
+            try:
+                r = await self.x.cancel(ids)
+            except Throttled as t:
+                self.cancel_throttled(t.reason, t.seconds)
+                return
+            except Exception as error:
+                LOG.warning("按哈希撤被拒的单失败：%s", error)
+                return
+            if r.throttle:
+                self.cancel_throttled(*r.throttle)
         for h in ids:  # answered (cancelled, not cancelled, or left out of an answered chunk: the CLOB has no such
-            if h not in r.unanswered:  # order); a chunk refused or failed is asked again (11-19 review)
-                self.ghosts.pop(h, None)
+            if h not in r.unanswered and h in self.ghosts:  # order); a chunk refused or failed is asked again (11-19)
+                self.ghosts[h]["answered"] = "canceled" if h in r.canceled else "not_canceled"
+        told = []
+        for h, g in [(h, g) for h, g in self.ghosts.items() if g.get("answered")]:
+            # every answered one is read (audit 11-28: one eaten whole before its cancel was answered "not cancelled",
+            # dropped unread, and its fill was in no record): no such order, it never rested; else what it bought
+            try:
+                row = await self.x.order(h)
+            except Exception as error:
+                LOG.debug("读被拒单 %s 失败：%s", h, error)
+                continue   # read again at the next pass (until its window starts)
+            del self.ghosts[h]
+            if row is None:
+                continue
+            coin, start = mk.parse_slug(str(g.get("slug") or "")) or ("", 0)
+            name = f"{mk.window_name(coin, start)} {mk.SIDES_CN.get(str(g.get('side')), '')}方" if coin else h[:12]
+            if row.matched > 0:
+                kept = self.restore_ghost(h, g, row)
+                told.append(f"{name}（成交 {mk.fmt(row.matched)} 份，" + ("已补进账本，照常结算和领取）" if kept else
+                                                                       "这部分没记进账本，请到 Polymarket 核对）"))
+            else:
+                told.append(f"{name}（没有成交）")
         self.keep_ghosts()
-        if rested:
-            told = []
-            for h, g in rested.items():
-                try:
-                    row = await self.x.order(h)
-                except Exception:
-                    row = None
-                coin, start = mk.parse_slug(str(g.get("slug") or "")) or ("", 0)
-                name = f"{mk.window_name(coin, start)} {mk.SIDES_CN.get(str(g.get('side')), '')}方" if coin else h[:12]
-                got = row.matched if row is not None else None
-                told.append(f"{name}（{'成交 ' + mk.fmt(got) + ' 份，这部分没记进账本' if got else '没有成交' if got is not None else '成交读不到'}）")
-            self.problem(f"有 {len(rested)} 张判为没发出的单其实挂上了，已按哈希撤掉：" + "；".join(told)
-                         + ("。有成交的请到 Polymarket 核对" if any("成交 " in t for t in told) else ""), key="ghost")
+        if told:
+            self.problem(f"有 {len(told)} 张判为没发出的单其实挂上了，已按哈希撤掉：" + "；".join(told), key="ghost")
+
+    def restore_ghost(self, h: str, g: dict, row: Row) -> bool:
+        """A send judged refused whose order rested and filled after all: its record (kept with the ghost) back in the
+        ledger, under a key of its own (the window may have been placed again since), with what it bought: settled,
+        reviewed and claimed like any other. False for a ghost an older version kept without its record."""
+        rec = g.get("record")
+        side = str(g.get("side") or "")
+        if not isinstance(rec, dict) or side not in (rec.get("orders") or {}):
+            return False
+        key = f"{rec['key']}~{h[2:10]}"
+        q = self.ledger.rows.get(key) or {**json.loads(json.dumps(rec)), "key": key}   # its other side may be back already
+        now = self.now()
+        q.update(phase="closed" if q.get("phase") != "settled" else "settled", closed_at=q.get("closed_at") or now,
+                 reason="判为没发出的单其实挂上了（按订单哈希找回）", placed=q.get("placed") or float(q.get("created") or now))
+        o = q["orders"][side]
+        o.update(state="final", id=row.id or h, hash=h, filled=str(row.matched), first_fill=now, gone=now, final_at=now,
+                 seen=[[round(now, 3), str(row.matched)]], note="判为没发出的单其实挂上了：按订单哈希找回成交")
+        self.by_id[o["id"]] = (key, side)
+        self.save(q)
+        return True
 
     async def cancel_orders(self, due: list[tuple[dict, str]]) -> None:
         """Cancel by id (an order of unknown state by its hash)."""
@@ -1722,8 +1828,14 @@ class Engine:
         before = dnum(o.get("filled"))
         if matched > before:
             o["filled"] = str(matched)
+            seen_at = at if at is not None else self.now()
             if before <= 0:
-                o["first_fill"] = at if at is not None else self.now()
+                o["first_fill"] = seen_at
+            seen = o.setdefault("seen", [])   # each fill as first seen: the replay's times when the trades are unread
+            if len(seen) < SEEN_KEPT:
+                seen.append([round(seen_at, 3), str(matched - before)])
+            else:
+                seen[-1] = [round(seen_at, 3), str(dnum(seen[-1][1]) + matched - before)]
             ahead = q["start"] - self.now()
             self.fills_pending.append(f"{mk.window_name(q['coin'], q['start'])} {mk.SIDES_CN[side]} +{mk.fmt(matched - before)} 份"
                                       f" @{mk.fmt(dnum(q['price']) * 100)}¢（开场前 {mk.span(ahead)}）")
@@ -1774,33 +1886,78 @@ class Engine:
     # ------------------------------------------------------------------ results
     async def log_fill_times(self, q: dict, cache: dict[str, Any]) -> bool:
         """Each filled side's fills with the moment they matched (the account's trades): the cancel-time review replays
-        the window from them. Seen-at times from the snapshots stand in when the trades cannot be read."""
+        the window from them. Seen-at times from the snapshots stand in when the trades cannot be read. The trades also
+        check what the record holds (check_fills)."""
         cid = q["condition_id"]
         if cid not in cache:
             try:
-                cache[cid] = await self.x.trade_log(cid)
+                log = await self.x.trade_log(cid)
+                cache[cid] = (log, self.x.failed_fills(cid) if hasattr(self.x, "failed_fills") else {})
             except Exception as error:
                 LOG.debug("成交时刻 %s：%s", q["slug"], error)
                 cache[cid] = None
-        log = cache[cid]
-        if log is None:
+        got = cache[cid]
+        if got is None:
             q["fill_log_tries"] = int(q.get("fill_log_tries") or 0) + 1
             return False
-        for o in q["orders"].values():
+        log, failed = got
+        for side, o in q["orders"].items():
+            self.check_fills(q, side, log, failed)
             if dnum(o.get("filled")) > 0 and o.get("id") in log:
                 o["fills_at"] = [[round(ts, 3), str(shares)] for ts, shares in sorted(log[o["id"]]) if ts > 0]
         q["fills_logged"] = True
         return True
 
+    def checkable(self, o: dict) -> bool:
+        """An order whose fills could not be verified, and that the account's trades can verify (its id, or its hash
+        while the id may be the hash)."""
+        return bool(o.get("unverified")) and bool(o.get("id") or (o.get("hash") and self.id_is_hash is not False))
+
+    def check_fills(self, q: dict, side: str, log: dict[str, list[tuple[float, D]]], failed: dict[str, D]) -> None:
+        """An order's fills against the account's trades, read at settlement anyway (audit 11-28: what the record held was
+        never checked). A fill the reads missed is added; shares the chain failed (FAILED trades: none came) are taken
+        out when the failed trades account for the difference; an order whose fills could not be verified is verified
+        by them, when they can tell (its id is known, or its hash is in them). Each change is said."""
+        o = q["orders"][side]
+        oid = o.get("id") or (o.get("hash") if o.get("hash") and self.id_is_hash is not False else "")
+        if not oid:
+            return
+        held = dnum(o.get("filled"))
+        mine = log.get(oid) or []
+        confirmed = sum((sh for _, sh in mine), D(0))
+        name = f"{mk.window_name(q['coin'], q['start'])} {mk.SIDES_CN[side]}方"
+        if mine and not o.get("id"):  # found under its hash: the hash is its id
+            o["id"] = oid
+            self.by_id[oid] = (q["key"], side)
+            self.learn_id_is_hash(True)
+        if confirmed - held > FILLS_TOLERANCE:
+            o["filled"] = str(confirmed)
+            if held <= 0:
+                o["first_fill"] = min((ts for ts, _ in mine if ts > 0), default=float(q["start"]))
+            o["note"] = (o.get("note") or "") + f"；结算时在成交记录里找到 {mk.fmt(confirmed)} 份（之前记的 {mk.fmt(held)} 份）"
+            self.problem(f"{name}结算时在成交记录里找到 {mk.fmt(confirmed)} 份成交，之前记的是 {mk.fmt(held)} 份：已按成交记录改正",
+                         key="fills-fixed")
+        elif held - confirmed > FILLS_TOLERANCE and failed.get(oid, D(0)) > 0 \
+                and confirmed + failed[oid] + FILLS_TOLERANCE >= held:
+            o["filled"] = str(confirmed)
+            o["note"] = (o.get("note") or "") + f"；{mk.fmt(held - confirmed)} 份成交在链上失败（FAILED），不算"
+            self.problem(f"{name}有 {mk.fmt(held - confirmed)} 份成交在链上失败了（FAILED，没拿到份额）：已从成交里去掉，"
+                         f"按 {mk.fmt(confirmed)} 份算", key="fills-fixed")
+        if o.get("unverified") and o.get("id"):   # its id known (or its hash found as one): the trades are its whole story
+            o["unverified"] = False
+            o["verified"] = f"结算时按成交记录核实：{mk.fmt(dnum(o.get('filled')))} 份"
+
+
     async def settle_pass(self) -> None:
         now = self.now()
         results: dict[str, str | None] = {}
+        prices: dict[str, str] = {}
         logs: dict[str, Any] = {}
         for q in self.open_quotes():
             if q["phase"] != "closed":
                 continue
             filled = {side: dnum(o.get("filled")) for side, o in q["orders"].items()}
-            if not any(filled.values()):
+            if not any(filled.values()) and not any(self.checkable(o) for o in q["orders"].values()):
                 q["phase"] = "settled"
                 q["pnl"] = 0.0
                 self.save(q)
@@ -1811,17 +1968,26 @@ class Engine:
                 if not await self.log_fill_times(q, logs):
                     self.save(q)
                     continue
+            filled = {side: dnum(o.get("filled")) for side, o in q["orders"].items()}   # as the trades checked them
             slug = q["slug"]
             if slug not in results:
                 try:
                     m = await self.pub.market(slug)
                     results[slug] = (mk.winner(m) or (mk.SPLIT if mk.split(m) else None)) if m else None
+                    prices[slug] = str((m or {}).get("outcomePrices") or "")
                 except Exception as error:
                     LOG.debug("结果 %s：%s", slug, error)
                     results[slug] = None
             win = results[slug]
             if win is None:
                 q["result_retry"] = now + RESULT_RETRY_S
+                if now >= q["start"] + mk.PERIOD_S + RESULT_LATE_S and now >= float(q.get("late_said") or 0) + RESULT_LATE_S:
+                    # a result is only a 1/0 or a 50/50 resolution: anything else (the last trades' prices while the
+                    # resolution is pending) is waited out, and a wait this long is said (audit 11-28), not settled on
+                    q["late_said"] = now
+                    self.problem(f"{mk.window_name(q['coin'], q['start'])} 结束 {mk.span(now - q['start'] - mk.PERIOD_S)}了还没有结算结果"
+                                 f"（Gamma 的价格 {prices.get(slug) or '读不到'}），它的持仓还算在风控里；请到 Polymarket 核对这一场",
+                                 key="result-late")
                 self.save(q)
                 continue
             price = dnum(q["price"])
@@ -1952,9 +2118,9 @@ class Engine:
             changes = [[k, str(before.get(k, "")), v] for k, v in values.items() if str(before.get(k, "")) != v]
             if changes:
                 self.settings_log.append({"at": round(self.now(), 1), "via": via, "changes": changes})
-                self.ledger.put("settings_log", json.dumps(list(self.settings_log), ensure_ascii=False))
+                self.put("settings_log", json.dumps(list(self.settings_log), ensure_ascii=False))
         if before != values:
-            self.ledger.put("settings_now", json.dumps(values, ensure_ascii=False))
+            self.put("settings_now", json.dumps(values, ensure_ascii=False))
 
     def read_versions(self) -> list[dict[str, Any]]:
         """The versions of the trading code (config.TRADING_VERSIONS) this ledger has run under, each with when it began
@@ -1975,7 +2141,7 @@ class Engine:
             first_seen = self.now() if begun and when == newest else went_out   # a new one, seen starting right now
             log.append({"id": when, "at": float(int(max(first_seen, went_out))), "note": note})
         log.sort(key=lambda e: float(e["at"]))
-        self.ledger.put("version_log", json.dumps(log, ensure_ascii=False))
+        self.put("version_log", json.dumps(log, ensure_ascii=False))
         return log
 
     def update_points(self, limit: int = 12) -> list[dict[str, Any]]:
@@ -2063,9 +2229,9 @@ class Engine:
         """Stop placing and withdraw everything; when and why kept (across a restart too) for 📊, 🩺 and the page."""
         self.drop_unsent("已暂停")
         self.paused = True
-        self.ledger.put("paused", "1")
+        self.put("paused", "1")
         self.pause_note = {"at": self.now(), "why": why, "detail": detail}
-        self.ledger.put("pause_note", json.dumps(self.pause_note, ensure_ascii=False))
+        self.put("pause_note", json.dumps(self.pause_note, ensure_ascii=False))
         LOG.warning("暂停：%s %s", why, detail)
         return self.close_all("暂停")
 
@@ -2119,9 +2285,9 @@ class Engine:
 
     def resume(self) -> None:
         self.paused = False
-        self.ledger.put("paused", "0")
+        self.put("paused", "0")
         self.pause_note = {}
-        self.ledger.put("pause_note", "")
+        self.put("pause_note", "")
         for slug in list(self.timers):
             self.timers.pop(slug).cancel()
             self.enqueue(slug)
@@ -2331,7 +2497,7 @@ class Engine:
         current = self.x.identity()
         saved = self.ledger.get("identity")
         if not saved:
-            self.ledger.put("identity", current)
+            self.put("identity", current)
             return ""
         if saved == current:
             return ""
@@ -2347,6 +2513,11 @@ class Engine:
         the other account: they expire on their own), the ledger is bound to this account, and the process restarts."""
         if not self.blocked:
             return "账本和当前账户一致，不用改绑"
+        try:  # the archive first: a failure leaves everything as it was
+            archived = self.ledger.mark_foreign()
+        except (sqlite3.Error, OSError) as error:
+            self.write_failed(error)
+            return f"改绑没完成：账本写不进去（{self.write_error}），什么都没改；腾出 /data 的空间后再点一次"
         now = self.now()
         old = self.open_quotes()
         for q in old:
@@ -2363,12 +2534,16 @@ class Engine:
             q["foreign"] = True
             if q.get("redeem") in ("pending", "retry", "failed", "manual"):
                 q["redeem"] = "none"   # its winnings are the other account's to claim
-        self.save(*everything)
-        self.ledger.put("identity", self.x.identity())
-        self.notify(f"🛠 账本已改绑当前账户：{n} 条旧账户的记录不再接管，程序正在重启")
+        try:
+            self.save(*everything, strict=True)
+            self.ledger.put("identity", self.x.identity())
+        except (sqlite3.Error, OSError) as error:
+            self.write_failed(error)
+            return f"改绑没完成：账本写不进去（{self.write_error}）；腾出 /data 的空间后再点一次"
+        self.notify(f"🛠 账本已改绑当前账户：{n} 条旧账户的记录不再接管（归档的 {archived} 条也不再计入复盘、不再领取），程序正在重启")
         self.restart = True
         self.stop.set()
-        return f"已改绑当前账户：{n} 条旧记录不再接管，程序正在重启"
+        return f"已改绑当前账户：{n} 条旧记录不再接管，归档的 {archived} 条不再计入，程序正在重启"
 
     async def run(self) -> None:
         await self.x.start()
@@ -2605,7 +2780,8 @@ class Engine:
             "up_filled": f(q["orders"]["up"].get("filled")), "down_filled": f(q["orders"]["down"].get("filled")),
         } for q in active[:40]]
         filled = self.per_version("filled", lambda: heapq.nlargest(
-            30, (q for q in self.ledger.rows.values() if any(dnum(o.get("filled")) > 0 for o in q["orders"].values())),
+            30, (q for q in self.ledger.rows.values()   # this account's (another one's records, after 改绑, are not)
+                 if not q.get("foreign") and any(dnum(o.get("filled")) > 0 for o in q["orders"].values())),
             key=lambda q: q["start"]))
         fills = [{
             "coin": mk.name_of(q["coin"]), "start": q["start"], "when": mk.hm(q["start"]), "level": int(q["level"]),
@@ -2792,9 +2968,11 @@ class Engine:
                          + (f"；更早的 {older} 场已归档，配好后重启会自动补领（网页上领过的会跳过）" if older else "")
                          + "。polymarket.com → Settings → API Keys → Relayer API Keys 建一个，填到 Railway 的 "
                          "POLY_RELAYER_API_KEY / POLY_RELAYER_API_KEY_ADDRESS")
-        else:
-            lines.append(("⚠️" if by_hand else "✅") + " 领取：会自动领取" + (f"；{queued} 场排着" if queued else "")
-                         + (f"；{by_hand} 场领取失败，要到网页上领" if by_hand else ""))
+        else:  # the archived claims too (audit 11-28: with the key configured they were not said)
+            older = self.ledger.unclaimed_count()
+            lines.append(("⚠️" if by_hand or older else "✅") + " 领取：会自动领取" + (f"；{queued} 场排着" if queued else "")
+                         + (f"；{by_hand} 场领取失败，要到网页上领" if by_hand else "")
+                         + (f"；更早的 {older} 场领取失败已归档，重启会再领一次（网页上领过的会跳过）" if older else ""))
         worst, risk = self.exposure(), self.risk_hold()
         lines.append(("⛔" if risk else "✅") + f" 风控：未结算持仓最坏亏损 ${worst:.2f}"
                      + (f"（上限 ${self.s.max_exposure_usd}）" if self.s.max_exposure_usd else "（未设上限）")
@@ -2815,6 +2993,17 @@ class Engine:
                          f"读一次 {self.snapshot_took:.1f} 秒）")
         if self.write_error:
             lines.append(f"⛔ 账本：写不进去（{self.write_error}），暂停新挂；{len(self.unsaved)} 条记录等着写")
+        doubt = sorted((q for q in self.ledger.rows.values()
+                        if not q.get("foreign") and any(o.get("unverified") for o in q["orders"].values())), key=lambda q: q["start"])
+        if doubt:  # audit 11-28: said once when it happened, then nowhere
+            lines.append(f"⚠️ 成交未核实：最近两天 {len(doubt)} 场（" + "、".join(mk.window_name(q["coin"], q["start"]) for q in doubt[-3:])
+                         + "），按已知的记；结算时读得到成交记录的会自动核实，核实不了的请到 Polymarket 核对（更早的在复盘里列着）")
+        late = [q for q in self.ledger.rows.values() if q["phase"] == "closed" and not q.get("foreign")
+                and now >= q["start"] + mk.PERIOD_S + RESULT_LATE_S]
+        if late:
+            lines.append(f"⚠️ 结算：{len(late)} 场结束 {RESULT_LATE_S // 3600} 小时以上还没有结算结果（最早 "
+                         f"{mk.window_name(min(late, key=lambda q: q['start'])['coin'], min(q['start'] for q in late))}），"
+                         "它们的持仓还算在风控里；请到 Polymarket 核对")
         size = self.ledger.size()
         if size is not None:  # audit 11-27: the ledger grows a few MB a day and nothing said when the disk ran low
             used, free = size

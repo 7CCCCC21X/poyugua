@@ -126,6 +126,17 @@ class Ledger:
                 return
             key, at = rows[-1][0], rows[-1][1]
 
+    def mark_foreign(self) -> int:
+        """改绑: every archived record is the other account's — counted nowhere in this one's review, claimed nowhere
+        from here — and nothing archived is left to claim (audit 11-28: only the working set was marked; the archive
+        kept counting, and an archived claim was restored and claimed by the new account). One transaction."""
+        with self.lock, self.conn:
+            n = self.conn.execute("UPDATE archive SET data = json_set(data, '$.foreign', json('true'))").rowcount
+            self.conn.execute("UPDATE archive SET data = json_set(data, '$.redeem', 'none') "
+                              "WHERE json_extract(data, '$.redeem') IN ('pending', 'retry', 'failed', 'manual')")
+            self.conn.execute("DELETE FROM unclaimed")
+        return int(n)
+
     def unclaimed_count(self) -> int:
         with self.lock:
             return int(self.conn.execute("SELECT COUNT(*) FROM unclaimed").fetchone()[0])

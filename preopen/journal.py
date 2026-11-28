@@ -52,6 +52,7 @@ DAYS_IN_TEXT = 7          # Telegram's review: this many days, and the markets t
 MARKETS_IN_TEXT = 3
 CANCEL_SAMPLE = 20        # filled windows before the review names a best cancel time
 END_SLACK_S = 2.0         # a cancel confirmed this much earlier than a candidate still counts as resting until it
+LAG_MAX_S = 30.0          # a window's cancel lag (decided to confirmed) above this is taken as this in the replay
 
 
 def num(value: Any) -> D:
@@ -328,7 +329,7 @@ def orders(records: Iterable[dict], tab: str, coin: str, now: float, limit: int 
     kept: collections.deque = collections.deque(maxlen=limit)
     soonest: list[dict] = []
     for q in by_start(records):
-        if coin and q["coin"] != coin:
+        if (coin and q["coin"] != coin) or q.get("foreign"):
             continue
         is_open, has_fill = q["phase"] in ("active", "closing"), any(filled(q).values())
         tabs = ["all", "open" if is_open else "filled" if has_fill else "closed"] + (["filled"] if is_open and has_fill else [])
@@ -400,10 +401,38 @@ def _count(b: dict[str, Any], w: dict[str, Any]) -> None:
         b["open"] += 1
 
 
-def _add(w: dict[str, Any], q: dict, f: dict[str, D], price: D) -> tuple[D, D, bool, str]:
-    """A record's fills into its window; returns (its cost, its payout, settled, the result)."""
+UNVERIFIED_SHOWN = 20   # the latest records whose fills could not be verified, listed (all of them counted)
+
+
+def unverified_row(q: dict) -> dict[str, Any]:
+    """A record with an order whose fills could not be verified: which, and what was recorded for it."""
+    sides = [side for side, o in (q.get("orders") or {}).items() if o.get("unverified")]
+    return {"coin": mk.name_of(q["coin"]), "when": mk.hm(q["start"]), "start": q["start"], "slug": q["slug"],
+            "level": int(q.get("level") or 0) + 1, "sides": "、".join(mk.SIDES_CN.get(s, s) for s in sides),
+            "filled": "、".join(f"{mk.SIDES_CN.get(s, s)} {mk.fmt(num(q['orders'][s].get('filled')))} 份" for s in sides),
+            "note": next((str(q["orders"][s].get("note") or "")[-120:] for s in sides), "")}
+
+
+def unverified_text(j: dict[str, Any]) -> str:
+    """The orders whose fills could not be verified, said wherever the review is (audit 11-28: they were in no review,
+    export or check, and counted as what was known of them)."""
+    u = j.get("unverified") or {}
+    if not u.get("count"):
+        return ""
+    which = "；".join(f"{x['coin']} {x['when']} 第{x['level']}档{x['sides']}方（记的 {x['filled']}）" for x in u["latest"][:3])
+    return (f"⚠️ 有 {u['count']} 场的成交没能核实，按已知的记（可能少记或多记）：{which}"
+            + ("…" if u["count"] > 3 else "") + "。请到 Polymarket 的成交记录核对；结算时能读到成交记录的会自动核实")
+
+
+def settled_record(q: dict) -> bool:
+    return q.get("phase") == "settled" and q.get("result") in RESULTS
+
+
+def _add(w: dict[str, Any], q: dict, f: dict[str, D], price: D, whole: bool = True) -> tuple[D, D, bool, str]:
+    """A record's fills into its window; returns (its cost, its payout, settled, the result). `whole`: every filled
+    record of the window is settled (one that is not leaves the whole window waiting)."""
     result = q.get("result")
-    settled = q.get("phase") == "settled" and result in RESULTS
+    settled = whole and settled_record(q)
     cost = sum((v * price for v in f.values()), D(0))
     payout = sum((v * mk.paid(result, side) for side, v in f.items()), D(0)) if settled else D(0)
     w["sides"] |= {side for side, v in f.items() if v > 0}
@@ -499,6 +528,8 @@ class Model:
                 continue
             up, down, cost = float(w["shares"].get("up", 0)), float(w["shares"].get("down", 0)), float(w["cost"])
             ev, pnl, net = 0.5 * (up + down) - cost, float(w["payout"]) - cost, up - down
+            if w.get("result") == mk.SPLIT:  # resolved 50/50: paid exactly what the plan expects, no luck in it
+                net = 0.0
             c = self.coins.setdefault(mk.name_of(w["q"]["coin"]), [0, 0.0, 0.0, 0.0, 0.0, 0.0])
             c[0] += 1
             for i, v in enumerate((up + down, cost, ev, pnl, 0.25 * net * net), 1):
@@ -737,6 +768,8 @@ def journal(records: Iterable[dict], now: float, current: int | None = None, spa
     markets: list[tuple] = []   # compact (market_tuple): months of windows are many
     detail: collections.deque = collections.deque(maxlen=DETAIL_SHOWN)
     detail_n = 0
+    unverified: collections.deque = collections.deque(maxlen=UNVERIFIED_SHOWN)   # fills that could not be verified
+    unverified_n = 0
     windows: dict[str, dict[str, Any]] = {}
     at: float | None = None
     day = ""
@@ -758,17 +791,13 @@ def journal(records: Iterable[dict], now: float, current: int | None = None, spa
                 if w["recs"]:
                     replay.add(w["recs"])
         windows.clear()
-    for q in stream:
-        if q.get("foreign"):
-            continue
-        f = filled(q)
-        if not q.get("placed") and not any(f.values()):
-            continue  # never rested: not a quote
+    pending: list[tuple[dict, dict[str, D]]] = []   # the records of the start at hand
+
+    def take(q: dict, f: dict[str, D], whole: bool) -> None:
+        """One record into its window and the tables. `whole`: every filled record of its window is settled, so its
+        money counts (a window settled level by level counts once, whole: audit 11-28)."""
+        nonlocal detail_n
         start = q["start"]
-        if start != at:
-            close()
-            at = start
-            day, hour = day_of(start), hour_of(start)
         scoped = lo <= start < hi and (wanted is None or q["coin"] in wanted)   # the time and coins asked
         inside = scoped and day_ok(start, day_type)                             # ...and the days
         started = start <= now
@@ -808,10 +837,10 @@ def journal(records: Iterable[dict], now: float, current: int | None = None, spa
                 timed = fill_events(q) if any(f.values()) else ({}, True)
                 w["recs"].append((q, f, timed))
         if not any(f.values()):
-            continue
-        cost, payout, settled, result = _add(w, q, f, price)
+            return
+        cost, payout, settled, result = _add(w, q, f, price, whole)
         if not inside:
-            continue
+            return
         shares = sum(f.values(), D(0))
         pb["filled"] += 1
         pb["filled_started"] += 1 if started else 0
@@ -843,7 +872,32 @@ def journal(records: Iterable[dict], now: float, current: int | None = None, spa
                     lead["won"] += sh * mk.paid(result, side)
         detail.append(detail_row(q))
         detail_n += 1
-    close()
+
+    def flush() -> None:
+        """The records of one start, each window taken whole (audit 11-28: a window settled level by level counted the
+        settled level's money in the totals while the side split, the model and the market list waited for the
+        window, so the tables disagreed), then closed."""
+        open_slugs = {q["slug"] for q, f in pending if any(f.values()) and not settled_record(q)}
+        for q, f in pending:
+            take(q, f, q["slug"] not in open_slugs)
+        pending.clear()
+        close()
+    for q in stream:
+        if q.get("foreign"):
+            continue
+        f = filled(q)
+        if any(o.get("unverified") for o in (q.get("orders") or {}).values()) and lo <= q["start"] < hi \
+                and (wanted is None or q["coin"] in wanted) and day_ok(q["start"], day_type):
+            unverified_n += 1
+            unverified.append(q)
+        if not q.get("placed") and not any(f.values()):
+            continue  # never rested: not a quote
+        if q["start"] != at:
+            flush()
+            at = q["start"]
+            day, hour = day_of(at), hour_of(at)
+        pending.append((q, f))
+    flush()
 
     def money(x: dict) -> dict:
         return {**x, **{k: float(round(v, 4)) for k, v in x.items() if isinstance(v, D)},
@@ -878,6 +932,7 @@ def journal(records: Iterable[dict], now: float, current: int | None = None, spa
         "model": model.finish(),
         "day_type": day_type,
         "weekend": weekend.finish(),
+        "unverified": {"count": unverified_n, "latest": [unverified_row(q) for q in reversed(unverified)]},
         "detail_more": max(0, detail_n - DETAIL_SHOWN),
     }
 
@@ -1004,7 +1059,9 @@ def change_effects(read: Callable[[float, float], Iterable[dict]], now: float, l
 
 def fill_events(q: dict) -> tuple[dict[str, list[tuple[float, D]]], bool]:
     """Each filled side's fills as (seconds before the start, shares), and whether the times are exact (the trades'
-    match times) rather than when a snapshot first saw them (up to ~10 s late, so on the safe side when replayed)."""
+    match times) rather than when a snapshot first saw them (up to ~10 s late, so on the safe side when replayed).
+    The shares always add up to what the record holds (filled): the review's totals and its replay are one basis
+    (audit 11-28: trade times listing more than that — a trade listed twice by an older version — counted it twice)."""
     out: dict[str, list[tuple[float, D]]] = {}
     exact = True
     for side, o in (q.get("orders") or {}).items():
@@ -1012,12 +1069,18 @@ def fill_events(q: dict) -> tuple[dict[str, list[tuple[float, D]]], bool]:
         if total <= 0:
             continue
         log = [(q["start"] - float(t), num(sh)) for t, sh in (o.get("fills_at") or [])]
+        if not log:  # the trades unread: when the snapshots saw each fill, else when the first fill was seen
+            log = [(q["start"] - float(t), num(sh)) for t, sh in (o.get("seen") or []) if num(sh) > 0]
+            exact = False
+            if not log:
+                first = o.get("first_fill") or o.get("gone")
+                log = [(q["start"] - float(first) if first else 0.0, total)]
         got = sum((sh for _, sh in log), D(0))
-        if not log:
-            seen = o.get("first_fill") or o.get("gone")
-            log, exact = [(q["start"] - float(seen) if seen else 0.0, total)], False
-        elif got < total:  # the trades show less than the book did: the rest at the latest time seen
+        if got < total:  # the times show less than the book did: the rest at the latest time seen
             log.append((min(lead for lead, _ in log), total - got))
+            exact = False
+        elif got > total:  # more: each scaled down to what was bought
+            log = [(lead, sh * total / got) for lead, sh in log]
             exact = False
         out[side] = log
     return out, exact
@@ -1060,10 +1123,9 @@ class Replay:
 
     def __init__(self, now: float, current: int | None) -> None:
         self.now, self.current = now, current
-        self.windows: list[tuple[float | None, list[tuple[float, str, D, D, bool]], int, int]] = []
+        # (earliest cancel, fills, records timed by a snapshot, fills so timed, coin, cancel lag)
+        self.windows: list[tuple[float | None, list[tuple[float, str, D, D, bool]], int, int, str, float | None]] = []
         self.waiting = 0
-        self.times = {name: {"bucket": name, "shares": D(0), "cost": D(0), "won": D(0)} for _, name in FILL_TIMES}
-        self.coins: dict[str, dict] = defaultdict(lambda: {"coin": "", "filled": 0, "cost": D(0), "won": D(0)})
         self.after_start = self.after_cancel = 0
 
     def add(self, recs: list[tuple[dict, dict[str, D], tuple[dict, bool]]]) -> None:
@@ -1075,9 +1137,6 @@ class Replay:
         known = [e for e in ends if e is not None]
         events: list[tuple[float, str, D, D, bool]] = []
         approx_records = approx_events = 0
-        name = mk.name_of(recs[0][0]["coin"])
-        coin = self.coins[name]
-        coin["coin"] = name
         for (q, _, (timed, exact)), end in zip(recs, ends):
             if timed and not exact:
                 approx_records += 1
@@ -1087,16 +1146,16 @@ class Replay:
                     won = mk.paid(result, side)   # what a share paid: 1, 0, or 0.5 on a 50/50 market
                     events.append((lead, side, sh, price, won))
                     approx_events += 0 if exact else 1
-                    t = self.times[next(n for limit, n in FILL_TIMES if lead < limit)]
-                    t["shares"] += sh
-                    t["cost"] += sh * price
-                    t["won"] += sh * won
-                    coin["cost"] += sh * price
-                    coin["won"] += sh * won
                     self.after_start += 1 if lead < 0 else 0
                     self.after_cancel += 1 if end is not None and lead < end - END_SLACK_S else 0
-        coin["filled"] += 1 if events else 0
-        self.windows.append((max(known) if known else None, events, approx_records, approx_events))
+        # how long the cancel rule's cancels took to be confirmed in this window (decided at start - closing_at,
+        # confirmed at cancel_lead): a candidate's cancel takes as long (audit 11-28: replayed as instant, the current
+        # setting's row left out the fills that came while its cancel was on the way)
+        lags = [q["start"] - float(q["closing_at"]) - float(q["cancel_lead"]) for q, _, _ in recs
+                if q.get("reason") == "到点撤单" and q.get("closing_at") and q.get("cancel_lead") is not None]
+        lag = min(LAG_MAX_S, max(0.0, max(lags))) if lags else None
+        self.windows.append((max(known) if known else None, events, approx_records, approx_events,
+                             mk.name_of(recs[0][0]["coin"]), lag))
 
     def finish(self) -> dict[str, Any]:
         current = self.current
@@ -1108,10 +1167,12 @@ class Replay:
         if not self.windows:
             out["advice"] = "还没有结束的场次可以复盘"
             return out
-        ends = [e for e, _, _, _ in self.windows if e is not None]
+        ends = [w[0] for w in self.windows if w[0] is not None]
         base = next((c for c in CANCEL_CHOICES if sum(1 for e in ends if e <= c + END_SLACK_S) >= 0.8 * len(ends)),
                     CANCEL_CHOICES[-1]) if ends else CANCEL_CHOICES[0]
         common = [w for w in self.windows if w[0] is None or w[0] <= base + END_SLACK_S]
+        lags = sorted(w[5] for w in common if w[5] is not None)
+        typical = lags[len(lags) // 2] if lags else 0.0   # for a window whose cancel was not the rule's
         cands = sorted({c for c in CANCEL_CHOICES if c >= base} | ({int(current)} if current is not None and current >= base else set()))
         k = len(cands)
         # one pass over the fills: a fill `lead` seconds before the start stays for every candidate up to it (the first
@@ -1120,9 +1181,15 @@ class Replay:
         d_filled, d_both = [0] * (k + 1), [0] * (k + 1)
         actual = {"windows": len(common), "filled": 0, "both": 0, "shares": D(0), "cost": D(0), "payout": D(0)}
         approx = events_all = events_approx = 0
-        for _, events, approx_records, approx_events in common:
+        times = {name: {"bucket": name, "shares": D(0), "cost": D(0), "won": D(0)} for _, name in FILL_TIMES}
+        coins: dict[str, dict] = defaultdict(lambda: {"coin": "", "filled": 0, "cost": D(0), "won": D(0)})
+        for _, events, approx_records, approx_events, name, lag in common:  # the tables below: the same windows as actual
             approx += approx_records
             events_approx += approx_events
+            lag = typical if lag is None else lag
+            coin = coins[name]
+            coin["coin"] = name
+            coin["filled"] += 1 if events else 0
             latest: dict[str, float] = {}
             for lead, side, sh, price, won in events:
                 events_all += 1
@@ -1130,7 +1197,13 @@ class Replay:
                 actual["shares"] += sh
                 actual["cost"] += cost
                 actual["payout"] += pay
-                n = bisect_right(cands, lead)
+                t = times[next(n for limit, n in FILL_TIMES if lead < limit)]
+                t["shares"] += sh
+                t["cost"] += cost
+                t["won"] += pay
+                coin["cost"] += cost
+                coin["won"] += pay
+                n = bisect_right(cands, lead + lag)   # a candidate's cancel confirmed `lag` seconds after it was due
                 if n:
                     d_sh[0] += sh
                     d_sh[n] -= sh
@@ -1142,7 +1215,7 @@ class Replay:
             if latest:
                 actual["filled"] += 1
                 actual["both"] += 1 if len(latest) == len(mk.SIDES) else 0
-                reach = [bisect_right(cands, x) for x in latest.values()]
+                reach = [bisect_right(cands, x + lag) for x in latest.values()]
                 top, both = max(reach), (min(reach) if len(latest) == len(mk.SIDES) else 0)
                 if top:
                     d_filled[0] += 1
@@ -1181,7 +1254,7 @@ class Replay:
                 merged.append({"from": r["cancel_s"], "to": r["cancel_s"],
                                **{x: r[x] for x in ("filled", "both", "shares", "cost", "pnl", "delta", "current", "best")}})
         by_time = [{**t, "win_rate": float(t["won"] / t["shares"]), "breakeven": float(t["cost"] / t["shares"]), "pnl": t["won"] - t["cost"]}
-                   for t in self.times.values() if t["shares"] > 0]
+                   for t in times.values() if t["shares"] > 0]
         share = events_approx / events_all if events_all else 0.0
         notes = [f"可比 {len(common)} 场，{filled_n} 场有成交"]
         if len(self.windows) - len(common):
@@ -1190,6 +1263,8 @@ class Replay:
             notes.append(f"{self.waiting} 场有成交还没结算，整场没算")
         if events_approx:
             notes.append(f"{share:.0%} 的成交时刻是快照推算的（偏晚几秒）")
+        if typical > 0:
+            notes.append(f"按实测的撤单确认延迟回放（中位 {typical:.1f} 秒）")
         if self.after_cancel or self.after_start:
             notes.append(f"{self.after_start} 笔开场后成交、{self.after_cancel} 笔撤单确认后成交")
         level = ("低" if filled_n < CANCEL_SAMPLE or share > 0.3 else
@@ -1213,7 +1288,7 @@ class Replay:
                    approx_share=round(share, 3), filled=filled_n, best=best, recommend=recommend, advice=advice,
                    after_start=self.after_start, after_cancel=self.after_cancel, by_fill_time=by_time_f,
                    losses=sorted((t for t in by_time_f if t["pnl"] < 0), key=lambda t: t["pnl"])[:3],
-                   by_coin=[floats(c) for c in sorted(({**c, "pnl": c["won"] - c["cost"]} for c in self.coins.values() if c["filled"]),
+                   by_coin=[floats(c) for c in sorted(({**c, "pnl": c["won"] - c["cost"]} for c in coins.values() if c["filled"]),
                                                       key=lambda c: c["pnl"])],
                    confidence={"level": level, "notes": notes}, rows=[floats(r) for r in rows],
                    groups=[floats(g) for g in merged], actual=floats(actual), baseline=floats(baseline))
@@ -1258,8 +1333,16 @@ def detail_row(q: dict) -> dict[str, Any]:
         "first_fill_lead_s": round(q["start"] - min(firsts)) if firsts else None,
         "redeem": q.get("redeem") or "",
         "up_times": fill_times_text(q, "up"), "down_times": fill_times_text(q, "down"),
-        "exact": fill_events(q)[1],
+        "exact": fill_events(q)[1], "check": check_text(q),
     }
+
+
+def check_text(q: dict) -> str:
+    """Whether a record's fills were verified: 未核实 (said, and listed), how the trades corrected them, or nothing."""
+    unverified = [mk.SIDES_CN.get(s, s) for s, o in (q.get("orders") or {}).items() if o.get("unverified")]
+    if unverified:
+        return f"未核实（{'、'.join(unverified)}方）：请到 Polymarket 核对"
+    return "；".join(f"{mk.SIDES_CN.get(s, s)}方{o['verified']}" for s, o in (q.get("orders") or {}).items() if o.get("verified"))
 
 
 def to_csv(rows: list[list[Any]]) -> str:
@@ -1291,9 +1374,9 @@ def detail_table(records: Iterable[dict], limit: int | None = None) -> list[list
     """Every level of a window that filled, the latest first (the latest `limit` of them)."""
     rows = [["场次（北京时间）", "日期", "币种", "档", "价格¢", "份数", "第几次报价", "涨成交", "跌成交", "成本$", "结果", "盈亏$",
              "挂上时距开场(秒)", "撤单确认距开场(秒)", "首次成交距开场(秒)", "涨成交时刻(开场前秒:份)", "跌成交时刻(开场前秒:份)",
-             "成交时刻精确", "领取"]]
+             "成交时刻精确", "领取", "成交核实"]]
     for q in newest_first(records):
-        if not any(filled(q).values()):
+        if q.get("foreign") or not any(filled(q).values()):  # another account's (改绑): in no total, so in no list
             continue
         if limit is not None and len(rows) > limit:
             break
@@ -1301,11 +1384,11 @@ def detail_table(records: Iterable[dict], limit: int | None = None) -> list[list
         rows.append([d["when"], d["day"], d["coin"], d["level"], d["price"], d["shares"], d["attempt"], d["up"], d["down"],
                      round(d["cost"], 4), d["result"], None if d["pnl"] is None else round(float(d["pnl"]), 4), d["placed_lead_s"],
                      d["cancel_lead_s"], d["first_fill_lead_s"], d["up_times"], d["down_times"],
-                     "是" if d["exact"] else "否（快照看到的时间）", d["redeem"]])
+                     "是" if d["exact"] else "否（快照看到的时间）", d["redeem"], d["check"]])
     return rows
 
 
-GROUP_HEAD = ["报价场次（已开场）", "还没开场", "成交场次", "成交率%", "双边成交", "双边率%", "成交份数", "成交额$", "赢", "输", "待结算",
+GROUP_HEAD = ["报价场次（已开场）", "还没开场", "成交场次", "成交率%", "双边成交", "双边率%", "成交份数", "成交额$", "赢", "输", "平", "待结算",
               "已结算成本$", "回款$", "盈亏$", "单场均盈亏$", "收益率%"]
 
 
@@ -1313,7 +1396,7 @@ def group_table(first: str, groups: list[dict], key: str, label=lambda v: v) -> 
     """Windows grouped (by day, coin, hour): counted as windows (the fill rate over those started), the money record
     by record."""
     return [[first, *GROUP_HEAD]] + [[label(d[key]), d["quoted"], d["upcoming"], d["filled"], d["fill_rate"], d["both"], d["both_rate"],
-                                      d["shares"], d["volume"], d["wins"], d["losses"], d["open"], d["cost"], d["payout"], d["pnl"],
+                                      d["shares"], d["volume"], d["wins"], d["losses"], d["evens"], d["open"], d["cost"], d["payout"], d["pnl"],
                                       d["avg_pnl"], d["roi"]] for d in groups]
 
 
@@ -1441,11 +1524,12 @@ def quotes_rows(records: Iterable[dict], limit: int | None = None) -> tuple[list
     total = 0
     rows = [["场次（北京时间）", "日期", "币种", "档", "第几次报价", "价格¢", "份数", "状态", "结束原因", "挂上时距开场(秒)",
              "上架后几秒挂上", "开放下单后几秒挂上", "撤单确认距开场(秒)", "涨成交", "跌成交", "涨成交时刻(开场前秒:份)",
-             "跌成交时刻(开场前秒:份)", "结果", "盈亏$"]]
+             "跌成交时刻(开场前秒:份)", "结果", "盈亏$", "成交核实"]]
     for q in newest_first(records):
         f = filled(q)
-        if not q.get("placed") and not any(f.values()):
-            continue
+        if q.get("foreign") or (not q.get("placed") and not any(f.values())
+                                and not any(o.get("unverified") for o in q["orders"].values())):
+            continue  # never rested (one that may have, unverified, is listed)
         total += 1
         if limit is not None and len(rows) > limit:
             continue  # counted, not listed
@@ -1457,7 +1541,7 @@ def quotes_rows(records: Iterable[dict], limit: int | None = None) -> tuple[list
                      round(placed - float(q["opened"]), 2) if placed and q.get("opened") else None,
                      q.get("cancel_lead"), float(f.get("up", 0)), float(f.get("down", 0)),
                      fill_times_text(q, "up"), fill_times_text(q, "down"), mk.RESULT_CN.get(str(q.get("result") or ""), ""),
-                     None if q.get("pnl") is None else round(float(q["pnl"]), 4)])
+                     None if q.get("pnl") is None else round(float(q["pnl"]), 4), check_text(q)])
     return rows, total
 
 
@@ -1576,6 +1660,8 @@ def review_text(records: list[dict], now: float, current: int | None = None, sco
                                  f"{c['after_cancel']} 笔在撤单确认后成交" if c["after_cancel"] else "") if x)
     if late:
         lines.append(f"⚠️ 有 {late}：撤单或到期没及时生效（比如那段时间撤单被交易所拒了），看「最近的问题」")
+    if line := unverified_text(j):
+        lines.append(line)
     today, alltime = j["totals"]["today"], j["totals"]["all"]
     if daily_limit <= 0 and today["pnl"] < 0:
         lines.append(f"⚠️ 今天已亏 {-today['pnl']:.2f} 美元，没设日亏损上限（网页「参数」→ 资金 → 日亏损上限）")
@@ -1597,8 +1683,9 @@ def review_text(records: list[dict], now: float, current: int | None = None, sco
             mark = "✅" if t["win_rate"] >= t["breakeven"] else "⚠️"
             lines.append(f"  {mark} {t['bucket']}：{mk.fmt(D(str(round(t['shares']))))} 份，赢 {t['win_rate'] * 100:.0f}%"
                          f"（保本 {t['breakeven'] * 100:.0f}%），盈亏 {t['pnl']:+.2f}")
-    if c["by_coin"]:
-        lines += ["", "【按币种】" + "，".join(f"{x['coin']} {x['pnl']:+.2f}（{x['filled']} 场成交）" for x in c["by_coin"])]
+    if any(x["filled"] for x in j["by_coin"]):
+        lines += ["", "【按币种】" + "，".join(f"{x['coin']} {x['pnl']:+.2f}（{x['filled']} 场成交）"
+                                            for x in sorted((x for x in j["by_coin"] if x["filled"]), key=lambda x: x["pnl"]))]
     lines += weekend_text(j)
     if j["by_day"]:
         lines += ["", "【每日】成交额 = 买到的份数 × 买价；盈亏只算已结算的"]
@@ -1625,14 +1712,14 @@ def review_text(records: list[dict], now: float, current: int | None = None, sco
     if scope:  # the records were chosen by the caller: their whole is the selection, narrowed to the days asked
         t = j["totals"]["range"]
         lines.append(f"合计（{scope}）：报价 {t['quoted']} 场，成交 {t['filled']} 场（双边 {t['both']}），成交额 ${t['volume']:.2f}，"
-                     f"赢 {t['wins']} 输 {t['losses']}" + (f"，待结算 {t['open']}" if t["open"] else "") + f"，盈亏 {t['pnl']:+.2f} 美元")
+                     f"赢 {t['wins']} 输 {t['losses']}" + (f" 平 {t['evens']}" if t["evens"] else "") + (f"，待结算 {t['open']}" if t["open"] else "") + f"，盈亏 {t['pnl']:+.2f} 美元")
         return "\n".join(lines)
     for k, name in (("today", "今天"), ("7d", "近 7 天"), ("all", "累计")):
         t = j["totals"][k]
         if k != "today" and (t["quoted"], t["pnl"]) == (today["quoted"], today["pnl"]):
             continue  # nothing before today
         lines.append(f"{name}：报价 {t['quoted']} 场，成交 {t['filled']} 场（双边 {t['both']}），成交额 ${t['volume']:.2f}，"
-                     f"赢 {t['wins']} 输 {t['losses']}" + (f"，待结算 {t['open']}" if t["open"] else "") + f"，盈亏 {t['pnl']:+.2f} 美元")
+                     f"赢 {t['wins']} 输 {t['losses']}" + (f" 平 {t['evens']}" if t["evens"] else "") + (f"，待结算 {t['open']}" if t["open"] else "") + f"，盈亏 {t['pnl']:+.2f} 美元")
     if (alltime["quoted"], alltime["pnl"]) == (today["quoted"], today["pnl"]):
         lines[-1] += "（全部记录都在今天）"
     return "\n".join(lines)

@@ -196,6 +196,8 @@ class Exchange(Protocol):
     async def order(self, order_id: str) -> Row | None: ...
     async def fills(self, condition_id: str) -> dict[str, D]: ...       # order id -> shares bought, from the trades
     async def trade_log(self, condition_id: str) -> dict[str, list[tuple[float, D]]]: ...  # order id -> [(matched at, shares)]
+    def failed_fills(self, condition_id: str) -> dict[str, D]: ...     # order id -> shares of the trades the chain failed,
+                                                                        # as the last trade_log of the market saw them
     async def balance(self) -> D: ...
     async def redeem(self, condition_id: str) -> str: ...
     def redeem_problem(self) -> str: ...                                  # why winnings cannot be claimed from here ("")
@@ -367,6 +369,7 @@ class LiveExchange:
         self.wallet = ""
         self.wallet_type = ""
         self.v2_allowance: D | None = None   # what ExchangeV3 may spend (None: the CLOB does not say), read with the balance
+        self.failed_seen: dict[str, dict[str, D]] = {}   # market -> the FAILED trades' shares by order (trade_log)
         self.signing: tuple[str, float] = ("", 0.0)   # the ECDSA backend and the ms an order takes to sign (start())
         self.tier = ""
         self.rate_warning = False
@@ -794,21 +797,31 @@ class LiveExchange:
         """Each fill of this account's orders on a market with the moment it matched (order id -> [(epoch s, shares)]):
         the bot's orders are post-only, so they are the maker orders of the trades. A trade without a time has 0."""
         out: dict[str, list[tuple[float, D]]] = {}
+        failed: dict[str, D] = {}
         seen: set[str] = set()
         async for page in self.client.list_account_trades(market=condition_id):
             for t in page.items:
-                if str(getattr(t, "status", "")).upper() == "FAILED":
-                    continue  # never settled on chain: no shares came of it
                 tid = str(getattr(t, "id", "") or "")
                 if tid:  # a trade listed twice (pages that shifted while new trades came in) counts once
                     if tid in seen:
                         continue
                     seen.add(tid)
+                if str(getattr(t, "status", "")).upper() == "FAILED":  # never settled on chain: no shares came of it
+                    for m in t.maker_orders:   # kept apart: a fill counted from the order's own record is taken out
+                        failed[str(m.order_id)] = failed.get(str(m.order_id), D(0)) + D(str(m.matched_amount))
+                    continue
                 at = getattr(t, "matched_at", None)
                 ts = at.timestamp() if hasattr(at, "timestamp") else 0.0
                 for m in t.maker_orders:
                     out.setdefault(str(m.order_id), []).append((ts, D(str(m.matched_amount))))
+        self.failed_seen[condition_id] = failed
+        while len(self.failed_seen) > 200:
+            self.failed_seen.pop(next(iter(self.failed_seen)))
         return out
+
+    def failed_fills(self, condition_id: str) -> dict[str, D]:
+        """The FAILED trades' shares by order id, as the last trade_log of this market saw them."""
+        return self.failed_seen.pop(condition_id, {})
 
     def identity(self) -> str:
         """The account the orders and records belong to: the wallet (the funds) and the signer (the API key's owner,
@@ -882,6 +895,7 @@ class PaperExchange:
         self.fail_balance: Exception | None = None   # set: every balance() raises it (tests)
         self.markets: dict[str, str] = {}      # asset -> condition id (rows of the paper book carry it)
         self.fill_log: dict[str, list[tuple[float, D]]] = {}   # order id -> [(when, shares)] of fill() (tests)
+        self.failed_log: dict[str, D] = {}   # order id -> shares of trades the chain failed (tests: fill(), then this)
         self.left: dict[str, D] = {}           # order id -> what is left of it as the CLOB counts (after its first fill)
         self.v2_allowance: D | None = None   # V2 approvals do not exist on paper; a test sets D(0) to play them missing
 
@@ -975,6 +989,10 @@ class PaperExchange:
             raise self.fail_read
         rows = {**self.gone, **self.book}
         return {oid: list(log) for oid, log in self.fill_log.items() if oid in rows and rows[oid].market == condition_id}
+
+    def failed_fills(self, condition_id: str) -> dict[str, D]:
+        rows = {**self.gone, **self.book}
+        return {oid: sh for oid, sh in self.failed_log.items() if oid in rows and rows[oid].market == condition_id}
 
     async def balance(self) -> D:
         if self.fail_balance is not None:
