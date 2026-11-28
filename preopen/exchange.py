@@ -692,8 +692,11 @@ class LiveExchange:
             self._timeouts = 0
             for (spec, o, h), r in zip(batch, responses):
                 if getattr(r, "ok", False):
+                    # filled at placement (a post-only order is not; said for completeness): what it took, never more than
+                    # its size (audit 11-28: should the amount ever come in other units, the snapshots read the true one)
+                    took = D(str(getattr(r, "taking_amount", 0) or 0)) if str(r.status or "").lower() == "matched" else D(0)
                     out[spec.ref] = Placed(spec.ref, "open", order_id=str(r.order_id), hash=h, salt=int(o.salt),
-                                           matched=D(str(getattr(r, "taking_amount", 0) or 0)) if str(r.status or "").lower() == "matched" else D(0))
+                                           matched=took if took <= D(str(spec.size)) else D(0))
                 else:
                     message = str(getattr(r, "message", ""))
                     code = str(getattr(r, "code", "unknown"))

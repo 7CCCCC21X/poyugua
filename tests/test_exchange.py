@@ -66,6 +66,16 @@ def accepted(oid: str) -> AcceptedOrder:
 
 
 class LiveExchangeTest(unittest.IsolatedAsyncioTestCase):
+    async def test_a_fill_at_placement_is_never_more_than_the_order(self):
+        """Audit 11-28: an amount in other units (10**6 a share) must not become a fill a million times the order."""
+        x, c = live()
+        c.answers = [[AcceptedOrder(order_id="0x" + "01" * 32, status="matched", making_amount=D("4.9"), taking_amount=D("10"),
+                                    trade_ids=(), transactions_hashes=()),
+                      AcceptedOrder(order_id="0x" + "02" * 32, status="matched", making_amount=D("4.9"), taking_amount=D("10000000"),
+                                    trade_ids=(), transactions_hashes=())]]
+        out = await x.place(specs(2))
+        self.assertEqual({p.ref: p.matched for p in out}, {"q0/up": D("10"), "q1/down": D(0)})
+
     async def test_post_only_gtd_buy_and_mapping(self):
         x, c = live()
         c.answers = [[accepted("0x" + "01" * 32), RejectedOrder(code="post_only_would_cross", message="invalid post-only order: order crosses book")]]
