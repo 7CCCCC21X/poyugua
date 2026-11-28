@@ -141,6 +141,12 @@ class Ledger:
         with self.lock:
             return int(self.conn.execute("SELECT COUNT(*) FROM unclaimed").fetchone()[0])
 
+    def unclaimed_records(self) -> list[dict]:
+        """The archived records with winnings still to claim (left where they are)."""
+        with self.lock:
+            rows = self.conn.execute("SELECT a.data FROM unclaimed u JOIN archive a ON a.key = u.key").fetchall()
+        return [json.loads(data) for (data,) in rows]
+
     def restore_unclaimed(self) -> list[dict]:
         """The archived records with winnings still to claim, back in the working set (the bot can claim them now)."""
         with self.lock, self.conn:

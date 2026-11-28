@@ -87,6 +87,7 @@ UNVERIFIED_AFTER_S = 1800 # past the expiration, the trades unreadable this long
 SEEN_KEPT = 12   # fills of an order kept with the time a snapshot first saw each (the rest added to the last)
 FILLS_TOLERANCE = D("0.0001")   # the trades and an order's own record differing by more: one of them is corrected
 WRITE_RETRY_S = 30.0       # a failing ledger is tried again this often (retry_writes)
+BALANCE_LOG_KEPT = 1100    # the daily balance records kept (three years)
 RESULT_LATE_S = 6 * 3600   # a window still without its result this long after its end is said (and again as long after)
 SEEN_MARGIN_S = 3         # an order accepted this long before a snapshot began should be in it
 LEDGER_FREE_WARN = 500 * 2**20   # the check warns when the ledger's disk has less than this left
@@ -286,6 +287,7 @@ class Engine:
             pass
         self.note_settings(settings, "重启后（Railway 变量或网页设置）")
         self.version_log: list[dict[str, Any]] = self.read_versions()
+        self.balance_log: list[dict[str, Any]] = self.read_balance_log()   # 每天自动记余额 (note_balance)
         for q in ledger.rows.values():
             self._index(q)
 
@@ -1853,9 +1855,71 @@ class Engine:
         if held_v2 and hasattr(self.x, "refresh_allowance"):  # an approval made on the website: the CLOB reads it afresh
             self.v2_refreshed = self.now()
             await self.x.refresh_allowance()
-        if self.now() - self.balance_at >= BALANCE_EVERY_S or self.balance is None or held_v2:
+        due = self.balance_due()
+        if self.now() - self.balance_at >= BALANCE_EVERY_S or self.balance is None or held_v2 or (due and self.now() - self.balance_at > 2):
             self.balance = await self.x.balance()
             self.balance_at = self.now()
+        if due:
+            self.note_balance()
+
+    # ------------------------------------------------------------------ 每天自动记余额
+    def read_balance_log(self) -> list[dict[str, Any]]:
+        try:
+            kept = json.loads(self.ledger.get("balance_log") or "[]")
+        except ValueError:
+            kept = []
+        return [b for b in kept if isinstance(b, dict) and b.get("day")] if isinstance(kept, list) else []
+
+    def balance_due(self) -> bool:
+        """The day's record not taken yet (the first account pass of each Beijing day; at the very first start too)."""
+        return not self.blocked and (not self.balance_log or self.balance_log[-1]["day"] != self.day().isoformat())
+
+    def holdings(self) -> dict[str, float]:
+        """What the account holds besides its cash, by this bot's records: the fills still waiting for their result (at
+        what they cost) and the winnings settled but not claimed yet (what they pay; archived ones too). Winnings claimed
+        on the website by hand are not known here: they stay counted until the bot's own record says otherwise."""
+        unsettled = unclaimed = D(0)
+        working = self.ledger.rows
+        for q in [*working.values(), *(q for q in self.ledger.unclaimed_records() if q["key"] not in working)]:
+            if q.get("foreign"):
+                continue
+            f = {side: dnum(o.get("filled")) for side, o in (q.get("orders") or {}).items()}
+            if not any(f.values()):
+                continue
+            if q.get("phase") != "settled":
+                unsettled += sum(f.values(), D(0)) * dnum(q["price"])
+            elif q.get("redeem") in ("pending", "retry", "failed", "manual"):
+                unclaimed += sum((v * mk.paid(q.get("result"), side) for side, v in f.items()), D(0))
+        return {"unsettled": float(round(unsettled, 6)), "unclaimed": float(round(unclaimed, 6))}
+
+    def note_balance(self) -> None:
+        """每天自动记余额: at the first account pass of each Beijing day (00:00, or the first after it when the bot was
+        down; at the very first start too), the account as it stands: the cash (pUSD, read moments ago), the open
+        orders' money (part of the cash) and their count, the fills still waiting for their result at cost, the
+        winnings settled but not claimed yet, their total (the cash, what waits, what is owed), and the day before's
+        settled P&L as known then. Kept in the ledger (BALANCE_LOG_KEPT days), said on Telegram, in the check, and
+        exported (the workbook's 余额 sheet, the raw export's notes): the start and the end of any span, for an audit."""
+        if self.balance is None:
+            return
+        now, day = self.now(), self.day()
+        held = self.holdings()
+        cash = float(self.balance)
+        total = round(cash + held["unsettled"] + held["unclaimed"], 6)
+        before = day - mk.dt.timedelta(days=1)
+        pnl = float(sum((D(str(q["pnl"])) for q in self.ledger.rows.values()
+                         if q.get("phase") == "settled" and q.get("pnl") is not None and not q.get("foreign")
+                         and mk.dt.datetime.fromtimestamp(q["start"], mk.BEIJING).date() == before), D(0)))
+        prev = self.balance_log[-1] if self.balance_log else None
+        entry = {"day": day.isoformat(), "at": round(now, 1), "mode": self.s.mode(), "cash": round(cash, 6),
+                 "reserved": float(round(D(str(self.reserved())), 6)), "open_orders": int(self.counts().get("resting") or 0),
+                 **held, "total": total, "pnl_day_before": round(pnl, 6)}
+        self.balance_log.append(entry)
+        del self.balance_log[:-BALANCE_LOG_KEPT]
+        self.put("balance_log", json.dumps(self.balance_log, ensure_ascii=False, separators=(",", ":")))
+        self.notify(f"📒 {day:%m-%d} 记账（{mk.hm(now)}）：现金 ${cash:.2f}，未结算持仓 ${held['unsettled']:.2f}（按成本），"
+                    f"待领取 ${held['unclaimed']:.2f}，合计 ${total:.2f}"
+                    + (f"；比上次（{prev['day'][5:]}）{total - float(prev['total']):+.2f}，{before:%m-%d} 已结算盈亏 {pnl:+.2f}" if prev else "")
+                    + "。每天北京时间 0 点自动记一次，导出时一起带上", key="balance-log")
 
     def apply_snapshot(self, rows: list[Row], began: float) -> None:
         self.snapshot = {r.id: r for r in rows}
@@ -2956,6 +3020,10 @@ class Engine:
         else:
             lines.append(f"✅ 余额：${self.balance:.2f}（{now - self.balance_at:.0f} 秒前读到），每场 ${self.s.window_usd:.2f}，"
                          f"成交缓冲 ${self.balance - self.s.window_usd:.2f}")
+        if self.balance_log:
+            b = self.balance_log[-1]
+            lines.append(f"ℹ️ 记账：{b['day'][5:]} {mk.hm(float(b['at']))[6:]} 记的合计 ${float(b['total']):.2f}（现金 ${float(b['cash']):.2f}"
+                         f" + 未结算 ${float(b['unsettled']):.2f} + 待领取 ${float(b['unclaimed']):.2f}），每天北京时间 0 点自动记一次")
         lines.append(f"ℹ️ 挂单合计：${self.reserved():.2f}" + (f"（上限 ${self.s.max_open_usd}）" if self.s.max_open_usd else "")
                      + (f"；账户里另有 {len(self.unmanaged)} 张别的挂单 ${self.unmanaged_usd():.2f}" if self.unmanaged else ""))
         claims = collections.Counter(str(q.get("redeem") or "") for q in self.ledger.rows.values())

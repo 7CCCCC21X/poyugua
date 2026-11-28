@@ -21,6 +21,8 @@ FILLS_KEPT = 50_000       # the 成交明细 sheet: the latest this many filled 
 
 GUIDE: tuple[tuple[str, str], ...] = (
     ("每日", "每天的成交量（份数、成交额）和盈亏：变好还是变坏；改参数前后对比（改的时间在「参数」表）"),
+    ("余额", "每天北京时间 0 点自动记的账户：现金、挂单占用、未结算持仓（按成本）、待领取、合计。「比上一次」和前一天的已结算盈亏放在一起，"
+             "差额是机器人账本以外的钱（充值提现、奖励返佣、手续费、跨零点结算的场次）：对账时的期初、期末"),
     ("模型EV", "实际盈亏和模型预期（每边按 50% 胜率）的差，够不够得上「不是运气」：z 值低于 −2 说明买到的那一边赢得比五五开少；"
                "下面是曲线的每个点（累计实际、累计模型、运气范围）"),
     ("周末", "周末（北京时间周六 0 点～周一 8 点）和工作日并排比；周末再拆成四段、按每个周末列：周末是不是在亏、亏在哪一段、"
@@ -162,9 +164,37 @@ def settings_sheet(values: dict[str, str], log: list[dict], versions: list[dict]
     return Sheet("参数", rows, bold=bold)
 
 
+BALANCE_HEAD = ["日期", "记下的时刻（北京时间）", "模式", "现金 pUSD$", "挂单占用$（含在现金里）", "挂单张数", "未结算持仓$（按成本）", "待领取$",
+                "合计$（现金+未结算+待领取）", "比上一次$", "前一天已结算盈亏$", "差额$（充值提现、奖励、费用、跨零点结算）"]
+
+
+def balance_table(balances: list[dict], review: dict[str, Any], span: tuple[float, float] | None) -> list[list[Any]]:
+    """The daily records (Engine.note_balance) in the span and the one just after it (the span's end): each beside the
+    one before it, and the day before's settled P&L (the review's, else as known at the time): the difference is money
+    the ledger does not hold."""
+    lo, hi = span or (float("-inf"), float("inf"))
+    by_day = {d["day"]: d["pnl"] for d in review.get("by_day") or []}
+    rows: list[list[Any]] = [BALANCE_HEAD]
+    prev = None
+    for b in balances:
+        at = float(b.get("at") or 0)
+        if lo <= at < hi + 86400:
+            change = round(float(b["total"]) - float(prev["total"]), 4) if prev else None
+            before = (mk.dt.date.fromisoformat(b["day"]) - mk.dt.timedelta(days=1)).isoformat()
+            pnl = by_day.get(before, b.get("pnl_day_before"))
+            rows.append([b["day"], mk.hm(at), b.get("mode", ""), b.get("cash"), b.get("reserved"), b.get("open_orders"),
+                         b.get("unsettled"), b.get("unclaimed"), b.get("total"), change, pnl,
+                         round(change - float(pnl), 4) if change is not None and pnl is not None else None])
+        prev = b
+    if len(rows) == 1:
+        rows.append(["这段时间还没有记录：每天北京时间 0 点自动记一次（11-28 加上的，从那以后才有）"])
+    return rows
+
+
 def build(records: Any, now: float, current: int | None, span: tuple[float, float] | None, label: str, *,
           refusal_log: list[dict], settings: dict[str, str], settings_log: list[dict], mode: str,
-          coins: list[str] | None = None, versions: list[dict] | None = None, day_type: str = "all") -> tuple[bytes, dict[str, Any]]:
+          coins: list[str] | None = None, versions: list[dict] | None = None, day_type: str = "all",
+          balances: list[dict] | None = None) -> tuple[bytes, dict[str, Any]]:
     """The workbook of the windows starting within `span` (all of them for None) of the coins named, and their totals.
     `records`: a list, or the engine's reader read(lo, hi, newest_first) (each part reads what it needs: the review in
     start order, the latest quotes and fills the newest first; the ledger never sits in memory whole)."""
@@ -188,6 +218,7 @@ def build(records: Any, now: float, current: int | None, span: tuple[float, floa
     return workbook([
         overview(review, label, now, mode, len(quotes) - 1, quotes_all, len(fills) - 1),
         Sheet("每日", journal.daily_table(review)),
+        Sheet("余额", balance_table(list(balances or []), review, span)),
         Sheet("模型EV", model_rows, header=False, bold=model_bold),
         Sheet("周末", weekend_rows, header=False, bold=weekend_bold),
         Sheet("市场盈亏", journal.markets_table(review)),
@@ -213,5 +244,6 @@ def from_engine(engine: Any, span: tuple[float, float] | None, label: str, read:
     now = engine.now()
     data, totals = build(read, now, engine.s.cancel_s, span, label, refusal_log=list(engine.refusal_log),
                          settings=config.current_values(engine.s), settings_log=list(engine.settings_log), mode=engine.s.mode(),
-                         coins=coins, versions=list(getattr(engine, "version_log", [])), day_type=day_type)
+                         coins=coins, versions=list(getattr(engine, "version_log", [])), day_type=day_type,
+                         balances=list(getattr(engine, "balance_log", [])))
     return file_name(label, now), data, totals

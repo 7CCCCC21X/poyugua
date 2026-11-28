@@ -198,13 +198,14 @@ def export_raw(engine: Engine, args: list[str], read: Any = None) -> Reply:
     if rest:
         return Reply(f"看不懂：{' '.join(rest)}。{EXPORT_USAGE}")
     notes = {"settings": config.current_values(engine.s), "settings_log": list(engine.settings_log),
-             "trading_versions": list(getattr(engine, "version_log", [])), "refusals": list(engine.refusal_log)}
+             "trading_versions": list(getattr(engine, "version_log", [])), "refusals": list(engine.refusal_log),
+             "balance_log": list(getattr(engine, "balance_log", []))}
     files, n, cut = xls.raw_ledger(read or engine.review_reader(), span, label or "全部", now, notes)
     parts = len(files) - 1
     return Reply(f"📤 {label or '全部'}的账本原始记录：{n} 条记录" + (f"，分 {parts} 个文件" if parts > 1 else "") + "，文件马上发过来。\n"
                  "· .jsonl.gz：解压后一行一条记录（一个币一个 5 分钟的一档、一次报价），和数据库里存的一模一样：订单号（就是订单哈希）、"
                  "每一笔成交的时刻和份数、怎么结束的、结果、盈亏、领取状态、备注；时间都是 Unix 秒。\n"
-                 "· 账本附加 .json：现在的参数、每次改参数、交易逻辑的每次更新、拒单记录。\n"
+                 "· 账本附加 .json：现在的参数、每次改参数、交易逻辑的每次更新、拒单记录、每天 0 点记的余额（balance_log）。\n"
                  "里面没有私钥、API Key 和钱包地址。要和交易所对账，再发 /export 成交 拿交易所那边的成交记录，按订单号对上。"
                  + (f"\n⚠️ 记录太多，只发了最早的 {n} 条（每个文件最多 40 MB）：后面的用更短的时间再导，比如 /export 账本 7" if cut else ""),
                  files=files)

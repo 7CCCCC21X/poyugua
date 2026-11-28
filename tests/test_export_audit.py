@@ -48,7 +48,7 @@ class RawLedgerTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(got[-1]["foreign"])
         self.assertIn("5 条记录", reply.text)
         kept = json.loads(notes.decode("utf-8"))
-        self.assertEqual(set(kept), {"settings", "settings_log", "trading_versions", "refusals"})
+        self.assertEqual(set(kept), {"settings", "settings_log", "trading_versions", "refusals", "balance_log"})
         self.assertNotIn("0xwallet", notes.decode("utf-8") + gzip.decompress(data).decode("utf-8"))
         self.assertTrue(notes_name.startswith("账本附加_"))
 
